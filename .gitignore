@@ -1,0 +1,33 @@
+.DS_Store
+*.log
+*.sqlite
+*.sqlite-*
+
+# Local OpenClaw runtime config and backups may contain API keys or app secrets.
+openclaw.json
+openclaw.json.bak*
+update-check.json
+
+# Local state, memories, queues, auth material, and runtime logs.
+agents/
+.planning/
+memory/
+logs/
+cron/
+delivery-queue/
+devices/
+identity/
+workspace/.openclaw/
+workspace/USER.md
+workspace/MEMORY.md
+workspace/memory/
+
+# Dependencies and build output.
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Local tool/project metadata.
+.serena/
+**/.serena/

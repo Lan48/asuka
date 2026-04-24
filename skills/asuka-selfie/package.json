@@ -1,0 +1,43 @@
+{
+  "name": "asuka",
+  "version": "1.1.1",
+  "description": "Add selfie superpowers to your OpenClaw agent using Alibaba Cloud Bailian / DashScope wan2.6-image",
+  "bin": {
+    "asuka": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "skill/",
+    "templates/",
+    "SKILL.md",
+    "scripts/",
+    "assets/"
+  ],
+  "keywords": [
+    "openclaw",
+    "dashscope",
+    "bailian",
+    "wan2.6-image",
+    "selfie",
+    "ai-agent",
+    "image-generation",
+    "messaging"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SumeLabs/asuka"
+  },
+  "homepage": "https://github.com/SumeLabs/asuka#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@fal-ai/client": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}
