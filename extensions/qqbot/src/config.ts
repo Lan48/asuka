@@ -5,10 +5,12 @@ import type { ResolvedQQBotAccount, QQBotAccountConfig, SceneInferenceConfig } f
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
 export const DEFAULT_ACCOUNT_ID = "default";
-const FALLBACK_CRON_MODEL = "deepseek/deepseek-chat";
+const FALLBACK_CRON_MODEL = "deepseek/deepseek-v4-flash";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LIGHTWEIGHT_MODEL_HINT_RE = /(mini|small|lite|flash|nano|tiny)/i;
 let localOpenClawConfigCache: any | undefined;
+
+export type QQBotDeepSeekThinkingLevel = "off" | "high";
 
 interface OpenAICompletionsModelConfig {
   baseUrl: string;
@@ -90,6 +92,27 @@ export function getQQBotLocalPrimaryModel(): string {
   } catch {
     return FALLBACK_CRON_MODEL;
   }
+}
+
+export function getOpenAICompletionsThinkingParams(
+  modelId: string,
+  level: QQBotDeepSeekThinkingLevel
+): Record<string, unknown> {
+  const normalizedModel = modelId.trim().toLowerCase();
+  if (!normalizedModel.startsWith("deepseek-v4-")) {
+    return {};
+  }
+
+  if (level === "high") {
+    return {
+      thinking: { type: "enabled" },
+      reasoning_effort: "high",
+    };
+  }
+
+  return {
+    thinking: { type: "disabled" },
+  };
 }
 
 function getQQBotChannelConfigFromRoot(root: any): QQBotChannelConfig | undefined {

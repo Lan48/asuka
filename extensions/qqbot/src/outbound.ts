@@ -33,7 +33,7 @@ import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
-import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
 import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
@@ -1317,6 +1317,7 @@ async function renderDeliveryTextFromSharedSession(
       },
       body: JSON.stringify({
         model: generationConfig.model,
+        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
         temperature: 0.55,
         max_tokens: 160,
         messages: [
@@ -1385,6 +1386,7 @@ async function renderPromiseDeliveryText(
       },
       body: JSON.stringify({
         model: generationConfig.model,
+        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
         temperature: 0.55,
         max_tokens: 160,
         messages: [

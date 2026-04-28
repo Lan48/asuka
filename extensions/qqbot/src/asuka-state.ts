@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { resolveQQBotSceneInferenceConfig } from "./config.js";
+import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig } from "./config.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 import type { ParsedPromise, ParsedPromiseSchedule, PromiseTriggerKind } from "./promise-parser.js";
@@ -24,6 +24,9 @@ export type AsukaPromiseState =
   | "delivery_failed"
   | "replied"
   | "cancelled";
+
+export type AsukaPromiseDeliveryFailureKind = "text" | "selfie" | "media";
+export type AsukaPromiseFallbackState = "sent" | "skipped" | "failed";
 
 export interface AsukaPromiseAction {
   kind: "send_selfie" | "send_message" | "send_greeting" | "continue_chat" | "reach_out";
@@ -91,19 +94,30 @@ export interface AsukaPromise {
   action: AsukaPromiseAction;
   time: AsukaPromiseTime;
   createdAt: number;
+  updatedAt?: number;
   state: AsukaPromiseState;
   status?: AsukaPromiseState;
   schedule?: ParsedPromiseSchedule;
   followUpIntent: string;
   cronJobId?: string;
   followUpJobIds?: string[];
+  scheduledAt?: number;
   deliveredAt?: number;
+  scheduleFailedAt?: number;
+  deliveryFailedAt?: number;
   repliedAt?: number;
   cancelledAt?: number;
   cancelReason?: string;
   followUpCount?: number;
   lastFollowUpAt?: number;
+  duplicateCount?: number;
+  lastDuplicateAt?: number;
   lastError?: string;
+  deliveryFailureKind?: AsukaPromiseDeliveryFailureKind;
+  lastFallbackState?: AsukaPromiseFallbackState;
+  lastFallbackAt?: number;
+  lastFallbackError?: string;
+  lastFallbackSkipReason?: string;
 }
 
 interface AsukaRelationshipState {
@@ -206,6 +220,7 @@ const INTERNAL_SUMMARY_RE = /(任务完成总结[:：]|已成功处理\s*QQBot\s
 const USER_REPLY_SKIP_GRACE_MS = 10 * 60 * 1000;
 const PROMISE_TEXT_DEDUP_WINDOW_MS = 12 * 60 * 60 * 1000;
 const PROMISE_SEMANTIC_DEDUP_WINDOW_MS = 48 * 60 * 60 * 1000;
+const PROMISE_FOLLOW_UP_LIMIT = 3;
 const AMBIENT_STYLE_VERSION = 2;
 const PROACTIVE_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_LOCK_TIMEOUT_MS = 45 * 1000;
@@ -468,23 +483,27 @@ function normalizePromiseSemanticText(text: string): string {
   const compact = stripStageDirections(sanitizeAssistantStateText(text))
     .replace(/\s+/g, "")
     .replace(/[，。！？!?、…·~～“”"'‘’`：:；;,.，]/g, "");
-  if (!compact) return "empty";
-  if (/(明天早上|明天早晨|明天上午|明早).*(叫你|喊你|叫醒你|叫你起|喊你起|起床|起来|醒)/.test(compact)) {
+  const core = compact.replace(/^(?:嗯嗯?|好呀?|好的|好|行|那就)?(?:拉钩|约定|约好了|发誓)/, "");
+  if (!core) return "empty";
+  if (/(明天早上|明天早晨|明天上午|明早).*(叫你|喊你|叫醒你|叫你起|喊你起|起床|起来|醒)/.test(core)) {
     return "tomorrow_morning_wake";
   }
-  if (/(叫你|喊你|叫醒你|叫你起|喊你起).*(起床|起来|醒).*(明天早上|明天早晨|明天上午|明早)/.test(compact)) {
+  if (/(叫你|喊你|叫醒你|叫你起|喊你起).*(起床|起来|醒).*(明天早上|明天早晨|明天上午|明早)/.test(core)) {
     return "tomorrow_morning_wake";
   }
-  if (/(早安|早上好).*(自拍|照片|图片)|(自拍|照片|图片).*(早安|早上好)/.test(compact)) {
+  if (/(早安|早上好).*(自拍|照片|图片)|(自拍|照片|图片).*(早安|早上好)/.test(core)) {
     return "morning_selfie";
   }
-  if (/晚安/.test(compact)) {
+  if (/早安|早上好/.test(core)) {
+    return "good_morning";
+  }
+  if (/晚安/.test(core)) {
     return "goodnight";
   }
-  if (/(继续聊|接着聊|续上|接上)/.test(compact)) {
+  if (/(继续聊|接着聊|续上|接上)/.test(core)) {
     return "continue_chat";
   }
-  return compact.slice(0, 120);
+  return core.slice(0, 120);
 }
 
 function buildPromiseSemanticKey(input: {
@@ -506,6 +525,8 @@ function buildPromiseSemanticKey(input: {
 function hydratePromiseRecord(promise: AsukaPromise): void {
   promise.sourceAssistantText = sanitizeAssistantStateText(promise.sourceAssistantText) || promise.promiseText;
   promise.originalText = promise.originalText || promise.promiseText;
+  promise.updatedAt = promise.updatedAt ?? promise.createdAt;
+  promise.duplicateCount = promise.duplicateCount ?? 0;
   promise.action = promise.action ?? buildPromiseActionRecord({
     promiseText: promise.originalText,
     deliveryKind: promise.deliveryKind,
@@ -550,7 +571,7 @@ function parseCancellationTargets(userText: string): {
   keywords: string[];
 } | null {
   const normalized = normalizeCancellationText(userText);
-  if (!/(取消|别发了|不用发了|不用了|先别发|算了|停掉|停了|别来了|不要了)/.test(normalized)) {
+  if (!/(取消|别发了|别发|不用发了|不用发|不用了|先别发|算了|停掉|停了|别来了|不要了)/.test(normalized)) {
     return null;
   }
   const actionKinds = new Set<AsukaPromiseAction["kind"]>();
@@ -977,6 +998,7 @@ async function inferSceneCandidateWithModel(
       signal: controller.signal,
       body: JSON.stringify({
         model: modelConfig.model,
+        ...getOpenAICompletionsThinkingParams(modelConfig.model, "off"),
         temperature: 0.1,
         max_tokens: 120,
         messages: [
@@ -1683,7 +1705,20 @@ export function recordAssistantReply(
       }
       return item.semanticKey === semanticKey && at - item.createdAt < PROMISE_SEMANTIC_DEDUP_WINDOW_MS;
     });
-    if (duplicate) continue;
+    if (duplicate) {
+      duplicate.updatedAt = at;
+      duplicate.lastDuplicateAt = at;
+      duplicate.duplicateCount = (duplicate.duplicateCount ?? 0) + 1;
+      duplicate.sourceAssistantText = summarizeText(sanitizedAssistantText, 120) ?? sanitizedAssistantText.slice(0, 120);
+      if (getPromiseState(duplicate) === "logged") {
+        duplicate.lastError = undefined;
+      }
+      peer.relationship.recentPromiseIds = [
+        duplicate.id,
+        ...peer.relationship.recentPromiseIds.filter((id) => id !== duplicate.id),
+      ].slice(0, 12);
+      continue;
+    }
 
     const promise: AsukaPromise = {
       id: randomUUID(),
@@ -1707,9 +1742,11 @@ export function recordAssistantReply(
       action,
       time,
       createdAt: at,
+      updatedAt: at,
       state: "logged",
       schedule: parsed.schedule,
       followUpIntent: parsed.followUpIntent,
+      duplicateCount: 0,
     };
 
     state.promises[promise.id] = promise;
@@ -1722,12 +1759,15 @@ export function recordAssistantReply(
   return created;
 }
 
-export function markPromiseScheduled(promiseId: string, jobId: string): void {
+export function markPromiseScheduled(promiseId: string, jobId: string, at = Date.now()): void {
   const state = loadState();
   const promise = state.promises[promiseId];
   if (!promise) return;
+  if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
   setPromiseState(promise, "scheduled");
   promise.cronJobId = jobId;
+  promise.scheduledAt = at;
+  promise.updatedAt = at;
   promise.lastError = undefined;
   saveState();
 }
@@ -1736,7 +1776,9 @@ export function appendPromiseFollowUpJob(promiseId: string, jobId: string): void
   const state = loadState();
   const promise = state.promises[promiseId];
   if (!promise) return;
+  if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
   promise.followUpJobIds = [...(promise.followUpJobIds ?? []), jobId];
+  promise.updatedAt = Date.now();
   saveState();
 }
 
@@ -1777,6 +1819,29 @@ export function prepareAmbientLifePayload(context: AsukaPeerContext, guardNoRepl
   const state = loadState();
   const disposition = deriveAmbientDisposition(peer, state, guardNoReplySince);
   const scene = peer.scene ?? buildDefaultSceneState(peer, state, guardNoReplySince);
+  const repair = prepareRepairDelivery(context, guardNoReplySince);
+  if (repair) {
+    return {
+      mode: "repair",
+      content: repair.content,
+      threadId: repair.threadId,
+      stage: repair.stage,
+      nextThreadId: repair.threadId,
+      nextStage: repair.stage,
+      mood: disposition.mood,
+      attention: "repair",
+      presence: repair.presenceOverride,
+      relationshipPhase: disposition.relationshipPhase,
+      firstDelayHours: disposition.firstDelayHours,
+      secondDelayHours: disposition.secondDelayHours,
+      promiseId: repair.promiseId,
+      advancePolicy: repair.advancePolicy,
+      selfiePrompt: repair.selfiePrompt,
+      selfieCaption: repair.selfieCaption,
+      sceneVersion: repair.sceneVersion,
+      sceneSnapshotLabel: repair.sceneSnapshotLabel,
+    };
+  }
   return {
     mode: "ambient",
     // Let outbound generation derive the actual wording from the latest normal
@@ -2002,13 +2067,15 @@ export function shouldSendAmbient(peerKey: string, guardNoReplySince?: number, n
   return !shouldSkipForRecentUserReply(peer.relationship.lastUserMessageAt, guardNoReplySince, now);
 }
 
-export function markPromiseScheduleFailed(promiseId: string, error: string): void {
+export function markPromiseScheduleFailed(promiseId: string, error: string, at = Date.now()): void {
   const state = loadState();
   const promise = state.promises[promiseId];
   if (!promise) return;
   if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
   setPromiseState(promise, "schedule_failed");
   promise.lastError = error;
+  promise.scheduleFailedAt = at;
+  promise.updatedAt = at;
   saveState();
 }
 
@@ -2020,6 +2087,7 @@ export function markPromiseDelivered(promiseId: string, options?: { at?: number;
   const at = options?.at ?? Date.now();
   setPromiseState(promise, "delivered");
   promise.deliveredAt = at;
+  promise.updatedAt = at;
   promise.lastError = undefined;
   const peer = state.peers[promise.peerKey];
   if (peer) {
@@ -2037,13 +2105,43 @@ export function markPromiseDelivered(promiseId: string, options?: { at?: number;
   saveState();
 }
 
-export function markPromiseDeliveryFailed(promiseId: string, error: string): void {
+export function markPromiseDeliveryFailed(
+  promiseId: string,
+  error: string,
+  at = Date.now(),
+  options?: { failureKind?: AsukaPromiseDeliveryFailureKind }
+): void {
   const state = loadState();
   const promise = state.promises[promiseId];
   if (!promise) return;
   if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
   setPromiseState(promise, "delivery_failed");
   promise.lastError = error;
+  promise.deliveryFailureKind = options?.failureKind;
+  promise.deliveryFailedAt = at;
+  promise.updatedAt = at;
+  saveState();
+}
+
+export function markPromiseDeliveryFallback(
+  promiseId: string,
+  fallback: {
+    state: AsukaPromiseFallbackState;
+    at?: number;
+    error?: string;
+    skipReason?: string;
+  }
+): void {
+  const state = loadState();
+  const promise = state.promises[promiseId];
+  if (!promise) return;
+  if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
+  const at = fallback.at ?? Date.now();
+  promise.lastFallbackState = fallback.state;
+  promise.lastFallbackAt = at;
+  promise.lastFallbackError = fallback.error;
+  promise.lastFallbackSkipReason = fallback.skipReason;
+  promise.updatedAt = at;
   saveState();
 }
 
@@ -2060,7 +2158,9 @@ export function shouldSendPromiseDelivery(
   if (!promise) return false;
   const promiseState = getPromiseState(promise);
   if (promiseState === "cancelled" || promiseState === "replied") return false;
+  if (promiseState === "delivered" && !options?.followUp) return false;
   if (!options?.followUp) return true;
+  if ((promise.followUpCount ?? 0) >= PROMISE_FOLLOW_UP_LIMIT) return false;
   if (options.guardNoReplySince === undefined) return true;
   const peer = state.peers[promise.peerKey];
   if (hasUserRepliedAfterGuard(peer?.relationship.lastUserMessageAt, options.guardNoReplySince)) return false;

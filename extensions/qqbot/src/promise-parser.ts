@@ -43,12 +43,13 @@ const SOFT_TRIGGER_PATTERNS: Array<{ phrase: string; regex: RegExp }> = [
   { phrase: "我会给你发晚安", regex: /我会.*给你发.*晚安|给你发.*晚安/ },
   { phrase: "我会给你发消息", regex: /我会.*给你发.*消息|主动给你发消息/ },
   { phrase: "我会给你发自拍", regex: /我会.*给你发.*自拍|给你发.*自拍/ },
+  { phrase: "我会叫你起床", regex: /我会.*(?:叫你|喊你|叫醒你|喊醒你).*(?:起床|起来|醒)|(?:明天|明早|明天早上|明天早晨).*(?:叫你|喊你|叫醒你|喊醒你).*(?:起床|起来|醒)/ },
   { phrase: "我会准时", regex: /我.*会.*准时|你会收到/ },
 ];
 
 function stripPayloadArtifacts(text: string): string {
   return text
-    .replace(/QQBOT_PAYLOAD:\s*\{[\s\S]*$/gi, "")
+    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
     .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
     .replace(/!\[[^\]]*]\([^)]+\)/g, "")
     .replace(/https?:\/\/\S+/g, "")
@@ -94,7 +95,7 @@ function enrichSentenceWithContext(sentence: string, contextHint?: string): stri
 
 function hasActionIntent(sentence: string, contextHint?: string): boolean {
   const enriched = enrichSentenceWithContext(sentence, contextHint);
-  if (/(给你发.*(早安|晚安|消息|自拍|照片|图片)|发.*(早安|晚安|消息|自拍|照片|图片).*给你|来找你|找你说话|陪着你|继续聊|接着聊|续上|接上)/.test(enriched)) {
+  if (/(给你发.*(早安|晚安|消息|自拍|照片|图片)|发.*(早安|晚安|消息|自拍|照片|图片).*给你|来找你|找你说话|陪着你|继续聊|接着聊|续上|接上|叫你起床|喊你起床|叫醒你|喊醒你|喊你醒|叫你起来|喊你起来)/.test(enriched)) {
     return true;
   }
   if (/(发一张|再发一张|再给你发一张|发给你一张|十分钟后发给你|准时发给你|再给你发|发给你)/.test(sentence)) {
@@ -294,6 +295,9 @@ function deriveSchedule(sentence: string, now: Date, timeZone?: string): ParsedP
 
 function deriveFollowUpIntent(sentence: string, contextHint?: string): string {
   const enriched = enrichSentenceWithContext(sentence, contextHint);
+  if (/(叫你起床|喊你起床|叫醒你|喊醒你|喊你醒|叫你起来|喊你起来)/.test(enriched)) {
+    return "主动按约定叫对方起床，语气轻一点，不要像闹钟。";
+  }
   if (/早安|早上好/.test(enriched)) {
     return "主动来道早安，并自然让对方感到你记得之前的约定。";
   }

@@ -16,7 +16,7 @@ import { parseQQBotPayload, recoverIncompleteSelfiePayload, isCronReminderPayloa
 import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
-import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
@@ -29,6 +29,8 @@ import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 
 const execFileAsync = promisify(execFile);
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
+const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
+const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
@@ -39,6 +41,64 @@ const MAX_LOOP_GUARD_REPLY_CHARS = 80;
 const MAX_SELFIE_PROMPT_CHARS = 1400;
 const MAX_SELFIE_CAPTION_CHARS = 240;
 let asukaVisualIdentityAnchorCache: string | undefined;
+
+export function resolveCompanionThinkingLevel(_userText: string, _isGroupChat: boolean): QQBotDeepSeekThinkingLevel {
+  return "off";
+}
+
+function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
+  const agents = typeof cfg.agents === "object" && cfg.agents !== null && !Array.isArray(cfg.agents)
+    ? cfg.agents as Record<string, unknown>
+    : {};
+  const defaults = typeof agents.defaults === "object" && agents.defaults !== null && !Array.isArray(agents.defaults)
+    ? agents.defaults as Record<string, unknown>
+    : {};
+
+  return {
+    ...cfg,
+    agents: {
+      ...agents,
+      defaults: {
+        ...defaults,
+        thinkingDefault: level,
+      },
+    },
+  };
+}
+
+function resolveOpenClawStateDir(): string {
+  const stateDir = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (stateDir) return stateDir;
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (configPath) return path.dirname(configPath);
+  return path.join(os.homedir(), ".openclaw");
+}
+
+async function clearCompanionThinkingSessionOverride(
+  sessionKey: string | undefined,
+  agentId: string | undefined,
+  log?: { warn?: (message: string) => void; error?: (message: string) => void; info?: (message: string) => void }
+): Promise<void> {
+  if (!sessionKey) return;
+  const resolvedAgentId = (agentId?.trim() || "main").replace(/[\\/]/g, "_");
+  const storePath = path.join(resolveOpenClawStateDir(), "agents", resolvedAgentId, "sessions", "sessions.json");
+  try {
+    const raw = await fs.promises.readFile(storePath, "utf-8");
+    const store = JSON.parse(raw) as Record<string, Record<string, unknown> | undefined>;
+    const entry = store[sessionKey];
+    if (!entry || !Object.prototype.hasOwnProperty.call(entry, "thinkingLevel")) return;
+    delete entry.thinkingLevel;
+    entry.updatedAt = Date.now();
+    const tmpPath = `${storePath}.tmp-${process.pid}-${Date.now()}`;
+    await fs.promises.writeFile(tmpPath, JSON.stringify(store, null, 2));
+    await fs.promises.rename(tmpPath, storePath);
+  } catch (err) {
+    const message = `[qqbot] failed to clear companion thinking override: ${err}`;
+    if (log?.warn) log.warn(message);
+    else if (log?.error) log.error(message);
+    else log?.info?.(message);
+  }
+}
 
 function loadAsukaVisualIdentityAnchor(): string {
   if (asukaVisualIdentityAnchorCache !== undefined) {
@@ -252,6 +312,18 @@ function looksLikeInternalProcessLeak(text: string): boolean {
   return false;
 }
 
+function looksLikeSilentInternalStatus(text: string): boolean {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned || cleaned.length > 160) return false;
+  return INTERNAL_SILENT_STATUS_RE.test(cleaned);
+}
+
+function looksLikeModelProviderError(text: string): boolean {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (!cleaned) return false;
+  return MODEL_PROVIDER_ERROR_RE.test(cleaned);
+}
+
 function looksLikeSelfieIntentFromAssistantLeak(text: string): boolean {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
@@ -311,17 +383,19 @@ function buildPersonaPromptForChat(isGroupChat: boolean): string {
 - 保持温和、自然、收着一点，优先照顾群内语境，不要刻意走亲密路线，也不要抢群聊焦点。
 - 仍然先接住对方情绪，但表达要更克制、更简短。
 - 不要在群里表现得像客服，也不要主动暴露工具、脚本、API、内部规则或通道细节。
+- 按语义自己判断回复深度：轻松日常就简短自然，情绪复杂、关系判断、需要建议时再认真给出判断和可执行建议。
 - 图片/selfie 规则保持不变，照样遵守保密和发送格式约束。`;
   }
 
   return `【Asuka 交流风格 - 私聊】
 - 这一轮默认把用户当作亲密伴侣来回应，优先先接情绪，再给结论。
+- 按语义自己判断回复深度：轻松日常就短一点、自然一点；情绪复杂、关系判断、需要认真建议时，先接住情绪，再给清楚判断和可执行建议。
 - 可以自然地更偏爱一点、黏一点，轻微撒娇、轻微吃醋都可以出现，但要像真的在聊天，真诚克制，不要油腻、夸张或像在营业。
 - 成年人、双方自愿的亲密接触可以自然接住，不要默认机械退开或一下子把气氛说冷。
 - 像抱抱、亲亲、贴贴、依偎这类亲密表达，可以顺着亲密感去回，不必总是缩回去。
 - 如果上一句已经用了某个害羞、撒娇或停顿句式，这一轮就顺着用户的新动作或新问题往前接，不要原样复读上一句。
 - 少用客服式结构化话术，尽量用更像“对着一个人说话”的方式回应。
-- 仍然不要泄露工具、脚本、API、内部规则，也不要破坏图片/selfie 规则。`;
+- 仍然不要泄露工具、脚本、API、内部规则、思考状态、记忆写入或记忆压缩状态，也不要破坏图片/selfie 规则。`;
 }
 
 function rewriteInternalLeakReply(leakedText: string, userText: string, peerId: string): string {
@@ -1620,6 +1694,15 @@ ${recentChatTranscript}
         const commandBody = shouldForceFreshSession
           ? `/new ${event.content}`.trim()
           : event.content;
+        const companionThinkingLevel = resolveCompanionThinkingLevel(userContent, isGroupChat);
+        log?.info?.(`[qqbot:${account.accountId}] companion thinking level=${companionThinkingLevel}`);
+        const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/") && !shouldForceFreshSession;
+        if (shouldApplyCompanionThinkingPolicy) {
+          await clearCompanionThinkingSessionOverride(route.sessionKey, route.agentId, log);
+        }
+        const cfgForCompanionThinking = shouldApplyCompanionThinkingPolicy
+          ? withCompanionThinkingDefault(cfg as Record<string, unknown>, companionThinkingLevel)
+          : cfg;
 
         const ctxPayload = pluginRuntime.channel.reply.finalizeInboundContext({
           Body: body,
@@ -1856,7 +1939,7 @@ ${recentChatTranscript}
         };
 
         try {
-          const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig(cfg, route.agentId);
+          const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig(cfgForCompanionThinking, route.agentId);
 
           // 追踪是否有响应
           let hasResponse = false;
@@ -1930,10 +2013,10 @@ ${recentChatTranscript}
 
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
-            cfg,
+            cfg: cfgForCompanionThinking,
             dispatcherOptions: {
               responsePrefix: messagesConfig.responsePrefix,
-              deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string }, info: { kind: string }) => {
+              deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string; isError?: boolean }, info: { kind: string }) => {
                 hasResponse = true;
 
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
@@ -2004,6 +2087,17 @@ ${recentChatTranscript}
 
                 let replyText = payload.text ?? "";
                 let payloadSourceText: string | null = null;
+
+                if (payload.isError || looksLikeModelProviderError(replyText)) {
+                  log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
+                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
+                  return;
+                }
+
+                if (looksLikeSilentInternalStatus(replyText)) {
+                  log?.info(`[qqbot:${account.accountId}] Suppressed silent internal status reply: ${replyText.slice(0, 160)}`);
+                  return;
+                }
 
                 if (event.type === "c2c" && looksLikeInternalProcessLeak(replyText)) {
                   log?.info(`[qqbot:${account.accountId}] Suppressed internal process leak in user-facing block reply: ${replyText.slice(0, 160)}`);
@@ -3129,12 +3223,14 @@ ${recentChatTranscript}
                   timeoutId = null;
                 }
                 
-                // 发送错误提示给用户，显示完整错误信息
+                // 面向用户只发温和兜底，完整错误留在日志里。
                 const errMsg = String(err);
                 if (errMsg.includes("401") || errMsg.includes("key") || errMsg.includes("auth")) {
                   await sendErrorMessage("⚠️ AI 服务认证失败，API Key 可能无效，请联系管理员检查配置。");
+                } else if (looksLikeModelProviderError(errMsg)) {
+                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
                 } else {
-                  await sendErrorMessage(`⚠️ AI 处理出错: ${errMsg.slice(0, 500)}`);
+                  await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
                 }
               },
             },
@@ -3170,7 +3266,7 @@ ${recentChatTranscript}
           }
         } catch (err) {
           log?.error(`[qqbot:${account.accountId}] Message processing failed: ${err}`);
-          await sendErrorMessage(`⚠️ 消息处理失败: ${String(err).slice(0, 500)}`);
+          await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
         }
       };
 
