@@ -19,6 +19,7 @@ import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileS
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
@@ -2483,11 +2484,8 @@ ${recentChatTranscript}
                         recoveredVisibleText,
                         event.senderId,
                       );
-                      const mergedCaption = [recoveredVisibleText, recoveredSelfie.payload.caption]
-                        .filter((part): part is string => Boolean(part && part.trim()))
-                        .join("\n\n")
-                        .trim();
-                      const sent = await runDirectSelfieFlow(selfiePrompt, mergedCaption || undefined, { background: true });
+                      const selfieCaption = dedupeCaptionAgainstVisibleText(recoveredVisibleText, recoveredSelfie.payload.caption);
+                      const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
                       if (!sent) {
                         await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
                       }
@@ -2599,11 +2597,8 @@ ${recentChatTranscript}
                         visiblePayloadText,
                         event.senderId,
                       );
-                      const mergedCaption = [visiblePayloadText, parsedPayload.caption]
-                        .filter((part): part is string => Boolean(part && part.trim()))
-                        .join("\n\n")
-                        .trim();
-                      const sent = await runDirectSelfieFlow(selfiePrompt, mergedCaption || undefined, { background: true });
+                      const selfieCaption = dedupeCaptionAgainstVisibleText(visiblePayloadText, parsedPayload.caption);
+                      const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
                       if (!sent) {
                         await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
                       }
@@ -2616,10 +2611,7 @@ ${recentChatTranscript}
                     } else if (isMediaPayload(parsedPayload)) {
                       // ============ 媒体消息载荷处理 ============
                       log?.info(`[qqbot:${account.accountId}] Processing media payload, mediaType: ${parsedPayload.mediaType}`);
-                      const mergedCaption = [visiblePayloadText, parsedPayload.caption]
-                        .filter((part): part is string => Boolean(part && part.trim()))
-                        .join("\n\n")
-                        .trim();
+                      const mergedCaption = mergeVisibleTextAndCaption(visiblePayloadText, parsedPayload.caption);
                       
                       if (parsedPayload.mediaType === "image") {
                         // 处理图片发送（展开 ~ 路径）
