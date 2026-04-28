@@ -28,13 +28,15 @@ import { isAudioFile, audioFileToSilkBase64, waitForFile } from "./utils/audio-c
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName } from "./utils/platform.js";
-import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, getPromiseRenderContext, markPromiseDelivered, markPromiseDeliveryFailed, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext } from "./asuka-state.js";
+import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, getPromiseRenderContext, markPromiseDelivered, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext } from "./asuka-state.js";
+import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
 import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
+import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -339,6 +341,38 @@ function buildPeerContextFromCronPayload(account: ResolvedQQBotAccount, payload:
   };
 }
 
+function buildProactiveMemoryCue(
+  payload: DecodedCronPayload,
+  renderContext?: ReturnType<typeof getPromiseRenderContext> | null,
+): string {
+  const parts = [
+    payload.mode,
+    payload.content,
+    payload.selfieCaption,
+    renderContext?.promise.originalText,
+    renderContext?.promise.sourceAssistantText,
+    renderContext?.promise.relationNote,
+    renderContext?.peer?.lastUserText,
+    renderContext?.peer?.lastAssistantText,
+    renderContext?.peer?.lastTopicPreview,
+  ];
+  return parts
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .join("\n")
+    .slice(0, 800);
+}
+
+function buildProactiveMemoryPrompt(
+  peerContext: AsukaPeerContext | null,
+  payload: DecodedCronPayload,
+  renderContext?: ReturnType<typeof getPromiseRenderContext> | null,
+): string {
+  if (!peerContext || peerContext.peerKind !== "direct" || payload.targetType !== "c2c") {
+    return "";
+  }
+  return buildAsukaProactiveMemoryPrompt(peerContext, buildProactiveMemoryCue(payload, renderContext));
+}
+
 function normalizeQuietHour(value: number | undefined): number | null {
   if (!Number.isInteger(value) || value === undefined) return null;
   if (value < 0 || value > 23) return null;
@@ -535,7 +569,7 @@ async function maybeSendRepairBeforeProactive(
     const repairResult = await runDirectSelfieFlowForCron(account, repairPayload, deliveredRepairText);
     if (repairResult.error) {
       console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${repairResult.error}`);
-      markPromiseDeliveryFailed(repair.promiseId, repairResult.error);
+      markPromiseDeliveryFailed(repair.promiseId, repairResult.error, Date.now(), { failureKind: "selfie" });
       return;
     }
   } else {
@@ -1077,6 +1111,7 @@ function buildPromiseDeliveryPrompt(
   }
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
   const recentContext = buildRecentConversationTranscript(payload.targetAddress, renderContext.peer?.lastUserText);
   const modeLabel = payload.mode === "repair"
     ? "补做之前没接住的约定"
@@ -1107,6 +1142,7 @@ function buildPromiseDeliveryPrompt(
     "",
     buildPersonaPromptForPromiseDelivery(isGroupChat),
     statePrompt,
+    proactiveMemoryPrompt,
     "",
     "【生成任务】",
     "你现在不是在写提醒模板，而是在当前对话上下文里，以 Asuka 的口吻顺着前文自然发出这一句。",
@@ -1147,6 +1183,7 @@ function buildSharedSessionDeliveryPrompt(
   const statePrompt = buildAsukaStatePrompt(peerContext);
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(payload.targetAddress);
   const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
   const promptTimeZone = getPromptTimeZone(account);
   const currentLocalTime = formatZonedDateTimeForPrompt(Date.now(), promptTimeZone);
   const sharedRules = [
@@ -1172,6 +1209,7 @@ function buildSharedSessionDeliveryPrompt(
       "你正在通过 QQ 与用户对话。",
       buildPersonaPromptForPromiseDelivery(false),
       statePrompt,
+      proactiveMemoryPrompt,
       sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
       ...sharedRules,
       payload.mode === "followup" ? "这是追发，只轻轻碰一下门，不要催，不要解释流程。" : "",
@@ -1199,6 +1237,7 @@ function buildSharedSessionDeliveryPrompt(
     "你正在通过 QQ 与用户对话。",
     buildPersonaPromptForPromiseDelivery(false),
     statePrompt,
+    proactiveMemoryPrompt,
     sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
     ...sharedRules,
     payload.mode === "ambient" ? "这次是你主动去碰一下门，要像顺着心里那点惦记自然冒出来，不要像定时问候。" : "",
@@ -1617,27 +1656,26 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
     for (const item of sendQueue) {
       try {
         if (item.type === "text") {
-          // 发送文本
-          if (replyToId) {
-            // 被动回复
-            if (target.type === "c2c") {
-              const result = await sendC2CMessage(accessToken, target.id, item.content, replyToId);
-              recordMessageReply(replyToId);
-              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
-            } else if (target.type === "group") {
-              const result = await sendGroupMessage(accessToken, target.id, item.content, replyToId);
-              recordMessageReply(replyToId);
-              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+          for (const segment of splitAsukaNarrationSegments(item.content)) {
+            if (replyToId) {
+              if (target.type === "c2c") {
+                const result = await sendC2CMessage(accessToken, target.id, segment, replyToId);
+                recordMessageReply(replyToId);
+                lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+              } else if (target.type === "group") {
+                const result = await sendGroupMessage(accessToken, target.id, segment, replyToId);
+                recordMessageReply(replyToId);
+                lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+              } else {
+                const result = await sendChannelMessage(accessToken, target.id, segment, replyToId);
+                recordMessageReply(replyToId);
+                lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+              }
             } else {
-              const result = await sendChannelMessage(accessToken, target.id, item.content, replyToId);
-              recordMessageReply(replyToId);
-              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+              lastResult = await sendProactiveMessage(account, to, segment);
             }
-          } else {
-            // 主动消息
-            lastResult = await sendProactiveMessage(account, to, item.content);
+            console.log(`[qqbot] sendText: Sent text part: ${segment.slice(0, 30)}...`);
           }
-          console.log(`[qqbot] sendText: Sent text part: ${item.content.slice(0, 30)}...`);
         } else if (item.type === "image") {
           if (!replyToId) {
             lastResult = await sendMedia({ to, text: "", replyToId: undefined, account, mediaUrl: item.content });
@@ -1904,6 +1942,27 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
     const target = parseTarget(to);
     console.log("[qqbot] sendText target:", JSON.stringify(target));
 
+    const textSegments = splitAsukaNarrationSegments(text);
+    if (textSegments.length > 1) {
+      let lastResult: OutboundResult = { channel: "qqbot" };
+      for (const segment of textSegments) {
+        if (target.type === "c2c") {
+          const result = await sendC2CMessage(accessToken, target.id, segment, replyToId);
+          recordMessageReply(replyToId);
+          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+        } else if (target.type === "group") {
+          const result = await sendGroupMessage(accessToken, target.id, segment, replyToId);
+          recordMessageReply(replyToId);
+          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+        } else {
+          const result = await sendChannelMessage(accessToken, target.id, segment, replyToId);
+          recordMessageReply(replyToId);
+          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+        }
+      }
+      return lastResult;
+    }
+
     // 有 replyToId，使用被动回复接口
     if (target.type === "c2c") {
       const result = await sendC2CMessage(accessToken, target.id, text, replyToId);
@@ -1951,6 +2010,17 @@ export async function sendProactiveMessage(
   if (quietHoursError) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: ${quietHoursError}, to=${to}`);
     return { channel: "qqbot", error: quietHoursError };
+  }
+
+  const textSegments = splitAsukaNarrationSegments(text);
+  if (textSegments.length > 1) {
+    let lastResult: OutboundResult = { channel: "qqbot" };
+    for (const segment of textSegments) {
+      const result = await sendProactiveMessage(account, to, segment);
+      if (result.error || result.skipped) return result;
+      lastResult = result;
+    }
+    return lastResult;
   }
 
   console.log(`[${timestamp}] [qqbot] sendProactiveMessage: starting, to=${to}, text length=${text.length}, accountId=${account.accountId}`);
@@ -2640,14 +2710,25 @@ export async function sendCronMessage(
         if (result.error) {
           console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${result.error}`);
           if (payload.promiseId) {
-            markPromiseDeliveryFailed(payload.promiseId, result.error);
+            markPromiseDeliveryFailed(payload.promiseId, result.error, Date.now(), { failureKind: "selfie" });
           }
           const fallbackResult = await sendProactiveMessage(account, targetTo, "这张照片刚刚没有顺利送到你面前。我不想拿别的东西敷衍你，等我重新整理好再带给你。");
           if (fallbackResult.skipped) {
+            if (payload.promiseId) {
+              markPromiseDeliveryFallback(payload.promiseId, {
+                state: "skipped",
+                skipReason: fallbackResult.skipReason ?? "duplicate",
+              });
+            }
             console.log(
               `[${timestamp}] [qqbot] sendCronMessage: selfie fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
             );
             return fallbackResult;
+          }
+          if (payload.promiseId) {
+            markPromiseDeliveryFallback(payload.promiseId, fallbackResult.error
+              ? { state: "failed", error: fallbackResult.error }
+              : { state: "sent" });
           }
           return fallbackResult.error ? result : fallbackResult;
         }

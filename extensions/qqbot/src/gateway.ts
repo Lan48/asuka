@@ -18,8 +18,10 @@ import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
+import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
+import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
@@ -1343,6 +1345,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         };
 
         recordInboundInteraction(asukaPeerContext, userContent);
+        const memoryControl = handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
+        if (!memoryControl.handled) {
+          recordAsukaLongTermMemoryFromUserMessage(asukaPeerContext, userContent);
+        }
         const cancelledPromises = cancelPromisesFromUserMessage(asukaPeerContext, userContent);
         if (cancelledPromises.cancelledPromises.length > 0) {
           log?.info(
@@ -1468,6 +1474,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           });
         }
         const asukaStatePrompt = shouldForceFreshSession ? "" : buildAsukaStatePrompt(asukaPeerContext);
+        const asukaMemoryPrompt = shouldForceFreshSession ? "" : buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
         const recentChatTranscript = shouldForceFreshSession
           ? ""
           : buildRecentConversationTranscript(asukaPeerContext.peerId, userContent);
@@ -1481,6 +1488,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
         if (asukaStatePrompt) {
           systemPrompts.push(asukaStatePrompt);
+        }
+        if (asukaMemoryPrompt) {
+          systemPrompts.push(asukaMemoryPrompt);
         }
         systemPrompts.push(buildPersonaPromptForChat(isGroupChat));
 
@@ -1701,22 +1711,31 @@ ${recentChatTranscript}
             return false;
           }
           try {
-            await sendWithTokenRetry(async (token) => {
-              if (event.type === "c2c") {
-                await sendC2CMessage(token, event.senderId, visibleText, event.messageId);
-              } else if (event.type === "group" && event.groupOpenid) {
-                await sendGroupMessage(token, event.groupOpenid, visibleText, event.messageId);
-              } else if (event.channelId) {
-                await sendChannelMessage(token, event.channelId, visibleText, event.messageId);
-              }
-            });
-            log?.info(`[qqbot:${account.accountId}] Sent visible reply text before structured follow-up: ${visibleText.slice(0, 80)}`);
+            const visibleSegments = splitAsukaNarrationSegments(visibleText);
+            for (const segment of visibleSegments) {
+              await sendWithTokenRetry(async (token) => {
+                if (event.type === "c2c") {
+                  await sendC2CMessage(token, event.senderId, segment, event.messageId);
+                } else if (event.type === "group" && event.groupOpenid) {
+                  await sendGroupMessage(token, event.groupOpenid, segment, event.messageId);
+                } else if (event.channelId) {
+                  await sendChannelMessage(token, event.channelId, segment, event.messageId);
+                }
+              });
+            }
+            log?.info(`[qqbot:${account.accountId}] Sent visible reply text before structured follow-up: ${visibleText.slice(0, 80)}, segments=${visibleSegments.length}`);
             return true;
           } catch (err) {
             log?.error(`[qqbot:${account.accountId}] Failed to send visible reply text: ${err}`);
             return false;
           }
         };
+
+        if (memoryControl.handled) {
+          await sendVisibleReplyText(memoryControl.replyText ?? "我处理好了。");
+          log?.info(`[qqbot:${account.accountId}] Handled Asuka memory control action: ${memoryControl.action ?? "unknown"}, changed=${memoryControl.changed ?? 0}`);
+          return;
+        }
 
         const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
           const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
@@ -1892,6 +1911,21 @@ ${recentChatTranscript}
             }
             return undefined;
           };
+          const sendReplyTextSegments = async (text: string): Promise<void> => {
+            const segments = splitAsukaNarrationSegments(text);
+            for (const segment of segments) {
+              await sendWithTokenRetry(async (token) => {
+                const ref = consumeQuoteRef();
+                if (event.type === "c2c") {
+                  await sendC2CMessage(token, event.senderId, segment, event.messageId, ref);
+                } else if (event.type === "group" && event.groupOpenid) {
+                  await sendGroupMessage(token, event.groupOpenid, segment, event.messageId, ref);
+                } else if (event.channelId) {
+                  await sendChannelMessage(token, event.channelId, segment, event.messageId, ref);
+                }
+              });
+            }
+          };
 
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
@@ -2004,6 +2038,7 @@ ${recentChatTranscript}
                   userText: userContent,
                 });
                 const loggedPromises = recordAssistantReply(asukaPeerContext, replyText, parsedPromises);
+                recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, replyText);
                 await refreshSceneState(asukaPeerContext, {
                   trigger: "assistant",
                   text: replyText,
@@ -2139,23 +2174,14 @@ ${recentChatTranscript}
                   
                   // 按顺序发送
                   for (const item of sendQueue) {
-                    if (item.type === "text") {
-                      // 发送文本
-                      try {
-                        await sendWithTokenRetry(async (token) => {
-                          const ref = consumeQuoteRef();
-                          if (event.type === "c2c") {
-                            await sendC2CMessage(token, event.senderId, item.content, event.messageId, ref);
-                          } else if (event.type === "group" && event.groupOpenid) {
-                            await sendGroupMessage(token, event.groupOpenid, item.content, event.messageId, ref);
-                          } else if (event.channelId) {
-                            await sendChannelMessage(token, event.channelId, item.content, event.messageId, ref);
-                          }
-                        });
-                        log?.info(`[qqbot:${account.accountId}] Sent text: ${item.content.slice(0, 50)}...`);
-                      } catch (err) {
-                        log?.error(`[qqbot:${account.accountId}] Failed to send text: ${err}`);
-                      }
+	                    if (item.type === "text") {
+	                      // 发送文本
+	                      try {
+	                        await sendReplyTextSegments(item.content);
+	                        log?.info(`[qqbot:${account.accountId}] Sent text: ${item.content.slice(0, 50)}...`);
+	                      } catch (err) {
+	                        log?.error(`[qqbot:${account.accountId}] Failed to send text: ${err}`);
+	                      }
                     } else if (item.type === "image") {
                       // 发送图片（展开 ~ 路径）
                       const imagePath = normalizePath(item.content);
@@ -3046,16 +3072,7 @@ ${recentChatTranscript}
                   // 🔹 第三步：发送带公网图片的 markdown 消息
                   if (textWithoutImages.trim()) {
                     try {
-                      await sendWithTokenRetry(async (token) => {
-                        const ref = consumeQuoteRef();
-                        if (event.type === "c2c") {
-                          await sendC2CMessage(token, event.senderId, textWithoutImages, event.messageId, ref);
-                        } else if (event.type === "group" && event.groupOpenid) {
-                          await sendGroupMessage(token, event.groupOpenid, textWithoutImages, event.messageId, ref);
-                        } else if (event.channelId) {
-                          await sendChannelMessage(token, event.channelId, textWithoutImages, event.messageId, ref);
-                        }
-                      });
+                      await sendReplyTextSegments(textWithoutImages);
                       log?.info(`[qqbot:${account.accountId}] Sent markdown message with ${httpImageUrls.length} HTTP images (${event.type})`);
                     } catch (err) {
                       log?.error(`[qqbot:${account.accountId}] Failed to send markdown message: ${err}`);
@@ -3098,16 +3115,7 @@ ${recentChatTranscript}
 
                     // 发送文本消息
                     if (textWithoutImages.trim()) {
-                      await sendWithTokenRetry(async (token) => {
-                        const ref = consumeQuoteRef();
-                        if (event.type === "c2c") {
-                          await sendC2CMessage(token, event.senderId, textWithoutImages, event.messageId, ref);
-                        } else if (event.type === "group" && event.groupOpenid) {
-                          await sendGroupMessage(token, event.groupOpenid, textWithoutImages, event.messageId, ref);
-                        } else if (event.channelId) {
-                          await sendChannelMessage(token, event.channelId, textWithoutImages, event.messageId, ref);
-                        }
-                      });
+                      await sendReplyTextSegments(textWithoutImages);
                       log?.info(`[qqbot:${account.accountId}] Sent text reply (${event.type})`);
                     }
                   } catch (err) {
