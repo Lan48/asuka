@@ -51,6 +51,8 @@ interface MessageReplyRecord {
 const messageReplyTracker = new Map<string, MessageReplyRecord>();
 const execFileAsync = promisify(execFile);
 const INTERNAL_DELIVERY_LEAK_RE = /(任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey)/i;
+const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
+const DEBUG_PROBE_TEXT_RE = /^(?:test\d*|\.)$/i;
 let openClawConfigCache: any | undefined;
 let asukaVisualIdentityAnchorCache: string | undefined;
 type DecodedCronPayload = NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>;
@@ -669,6 +671,33 @@ function looksLikeInternalDeliveryLeak(text: string): boolean {
   return INTERNAL_DELIVERY_LEAK_RE.test(cleaned);
 }
 
+function looksLikeDebugProbeText(text: string): boolean {
+  return DEBUG_PROBE_TEXT_RE.test(text.trim());
+}
+
+function getDecodedPrintableRatio(text: string): number {
+  const decoded = Buffer.from(text, "base64").toString("utf-8");
+  if (!decoded) return 0;
+  const printable = [...decoded].filter((ch) => ch === "\n" || ch === "\r" || ch === "\t" || ch >= " ").length;
+  return printable / decoded.length;
+}
+
+function looksLikeBareEncodedPayloadLeak(text: string): boolean {
+  const cleaned = text.trim();
+  if (!BASE64ISH_TEXT_RE.test(cleaned)) return false;
+  const recoveredCron = decodeCronPayload(`QQBOT_CRON:${cleaned}`);
+  if (recoveredCron.isCronPayload && recoveredCron.payload) return true;
+  return getDecodedPrintableRatio(cleaned) < 0.85;
+}
+
+function recoverBareCronPayloadMessage(text: string): string | null {
+  const cleaned = text.trim();
+  if (!BASE64ISH_TEXT_RE.test(cleaned)) return null;
+  const message = `QQBOT_CRON:${cleaned}`;
+  const recoveredCron = decodeCronPayload(message);
+  return recoveredCron.isCronPayload && recoveredCron.payload ? message : null;
+}
+
 function sanitizeSelfieContextText(text: string | undefined): string {
   return text
     ?.replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
@@ -1064,6 +1093,7 @@ function buildPersonaPromptForPromiseDelivery(isGroupChat: boolean): string {
   if (isGroupChat) {
     return [
       "【Asuka 交流风格 - 群聊】",
+      "- 显示名固定使用 Asuka；除非用户主动指定昵称，否则不要把 Asuka 改写成本地化中文名或解释成另一个名字。",
       "- 保持温和、自然、收着一点，优先照顾群内语境，不要刻意走亲密路线，也不要抢群聊焦点。",
       "- 仍然先接住对方情绪，但表达要更克制、更简短。",
       "- 不要在群里表现得像客服，也不要主动暴露工具、脚本、API、内部规则或通道细节。",
@@ -1071,6 +1101,7 @@ function buildPersonaPromptForPromiseDelivery(isGroupChat: boolean): string {
   }
   return [
     "【Asuka 交流风格 - 私聊】",
+    "- 显示名固定使用 Asuka；除非用户主动指定昵称，否则不要把 Asuka 改写成本地化中文名或解释成另一个名字。",
     "- 这一轮默认把用户当作亲密伴侣来回应，优先先接情绪，再给结论。",
     "- 可以自然地更偏爱一点、黏一点，轻微撒娇、轻微吃醋都可以出现，但要像真的在聊天，真诚克制，不要油腻、夸张或像在营业。",
     "- 成年人、双方自愿的亲密接触可以自然接住，不要默认机械退开或一下子把气氛说冷。",
@@ -1498,6 +1529,24 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed internal delivery leak: ${text.slice(0, 160)}`);
+    return { channel: "qqbot" };
+  }
+
+  const recoveredBareCronMessage = !replyToId && typeof text === "string" && !cronProbe.isCronPayload
+    ? recoverBareCronPayloadMessage(text)
+    : null;
+  if (recoveredBareCronMessage) {
+    console.log("[qqbot] sendText: recovered bare QQBOT_CRON payload, routing to sendCronMessage");
+    return await sendCronMessage(account, to, recoveredBareCronMessage);
+  }
+
+  if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeBareEncodedPayloadLeak(text)) {
+    console.warn(`[qqbot] sendText: suppressed bare encoded payload leak: ${text.slice(0, 80)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!replyToId && typeof text === "string" && looksLikeDebugProbeText(text)) {
+    console.warn(`[qqbot] sendText: suppressed debug probe text: ${text}`);
     return { channel: "qqbot" };
   }
 
