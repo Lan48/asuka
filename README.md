@@ -111,6 +111,11 @@ Selfhood and memory steering state lives in the QQBot local memory file:
 `data/asuka-memory/memory.json` via `getQQBotDataDir()`. Useful fields when
 debugging continuity are:
 
+Deterministic memory management controls are operator commands and require a
+leading `sudo` prefix, such as `sudo 你都记得我什么`,
+`sudo 忘记关于热美式的记忆`, or `sudo 把乌龙茶标为重要`. Without the prefix,
+the same wording is treated as ordinary direct-chat conversation.
+
 - `type` (`asuka_self_thread`, `asuka_self_signal`, `preference`, `active_thread`, etc.)
 - `freshnessUntil`
 - `lifeEventKind`

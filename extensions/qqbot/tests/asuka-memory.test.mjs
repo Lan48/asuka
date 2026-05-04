@@ -75,7 +75,12 @@ try {
     "secret-like text should not appear in prompts",
   );
 
-  const listReply = handleAsukaMemoryControlMessage(direct, "你都记得我什么", base + 4_000);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "你都记得我什么", base + 4_000).handled,
+    false,
+    "bare memory list wording should stay ordinary chat without sudo",
+  );
+  const listReply = handleAsukaMemoryControlMessage(direct, "sudo 你都记得我什么", base + 4_100);
   assert.equal(listReply.handled, true, "memory list command should be handled");
   assert.equal(listReply.action, "list", "memory list command should report list action");
   assertIncludes(listReply.replyText ?? "", "热美式", "memory list should show captured preference");
@@ -90,8 +95,32 @@ try {
     false,
     "plain user narration with 忘了 should not trigger forget control",
   );
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "这你怎么忍心删掉？", base + 6_500).handled,
+    false,
+    "daily chat with 删除-like wording should not trigger memory control without sudo",
+  );
+  const sudoDailyDeleteReply = handleAsukaMemoryControlMessage(direct, "sudo 这你怎么忍心删掉？", base + 6_600);
+  assert.equal(sudoDailyDeleteReply.handled, true, "sudo should opt into memory control parsing");
+  assert.equal(sudoDailyDeleteReply.action, "forget", "sudo delete-like wording should report forget action");
+  assert.equal(sudoDailyDeleteReply.changed, 0, "unmatched sudo delete-like wording should not change memory");
+  assertIncludes(
+    sudoDailyDeleteReply.replyText ?? "",
+    "这你怎么忍心",
+    "sudo delete-like fallback should use the stripped command query",
+  );
+  assertIncludes(
+    buildAsukaLongTermMemoryPrompt(direct, "", base + 6_700),
+    "热美式",
+    "unmatched sudo delete-like wording should not delete unrelated memory",
+  );
 
-  const forgetReply = handleAsukaMemoryControlMessage(direct, "忘记关于热美式的记忆", base + 7_000);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "忘记关于热美式的记忆", base + 7_000).handled,
+    false,
+    "bare forget command should stay ordinary chat without sudo",
+  );
+  const forgetReply = handleAsukaMemoryControlMessage(direct, "sudo 忘记关于热美式的记忆", base + 7_100);
   assert.equal(forgetReply.handled, true, "specific forget command should be handled");
   assert.equal(forgetReply.action, "forget", "specific forget command should report forget action");
   assert.ok((forgetReply.changed ?? 0) > 0, "specific forget command should delete at least one memory");
@@ -107,13 +136,23 @@ try {
   assertIncludes(locationPrompt, "上海", "newer location should be recalled");
   assertExcludes(locationPrompt, "杭州", "superseded location should not be recalled");
 
-  const categoryReply = handleAsukaMemoryControlMessage(direct, "看看记忆分类", base + 11_200);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "看看记忆分类", base + 11_200).handled,
+    false,
+    "bare memory category command should stay ordinary chat without sudo",
+  );
+  const categoryReply = handleAsukaMemoryControlMessage(direct, "sudo 看看记忆分类", base + 11_300);
   assert.equal(categoryReply.handled, true, "memory category command should be handled");
   assert.equal(categoryReply.action, "list", "memory category command should report list action");
   assertIncludes(categoryReply.replyText ?? "", "关于你|偏好和边界|我们聊过的事", "memory category reply should stay user-facing");
 
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢晚上喝乌龙茶。", base + 11_400), true);
-  const importantReply = handleAsukaMemoryControlMessage(direct, "把乌龙茶标为重要", base + 11_600);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "把乌龙茶标为重要", base + 11_600).handled,
+    false,
+    "bare important marker should stay ordinary chat without sudo",
+  );
+  const importantReply = handleAsukaMemoryControlMessage(direct, "sudo 把乌龙茶标为重要", base + 11_700);
   assert.equal(importantReply.handled, true, "important marker should be handled");
   assert.equal(importantReply.action, "mark_important", "important marker should report action");
   assert.ok((importantReply.changed ?? 0) > 0, "important marker should update at least one memory");
@@ -122,10 +161,15 @@ try {
   assert.ok(teaMemory, "important memory target should exist");
   assert.equal(teaMemory.importance, "important", "important marker should persist");
   assert.ok(teaMemory.salience >= 10, "important marker should raise salience");
-  const importantListReply = handleAsukaMemoryControlMessage(direct, "你都记得我什么", base + 11_800);
+  const importantListReply = handleAsukaMemoryControlMessage(direct, "sudo 你都记得我什么", base + 11_800);
   assertIncludes(importantListReply.replyText ?? "", "乌龙茶.*重要", "list reply should show important flag naturally");
 
-  const clearImportantReply = handleAsukaMemoryControlMessage(direct, "乌龙茶不重要了", base + 12_000);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "乌龙茶不重要了", base + 12_000).handled,
+    false,
+    "bare clear-important marker should stay ordinary chat without sudo",
+  );
+  const clearImportantReply = handleAsukaMemoryControlMessage(direct, "sudo 乌龙茶不重要了", base + 12_100);
   assert.equal(clearImportantReply.handled, true, "clear importance command should be handled");
   assert.equal(clearImportantReply.action, "clear_importance", "clear importance should report action");
   const normalState = readMemoryState();
@@ -133,14 +177,19 @@ try {
   assert.equal(normalTeaMemory.importance, "normal", "clear importance should persist normal importance");
 
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "今天准备整理签证材料", base + 12_200), true);
-  const temporaryReply = handleAsukaMemoryControlMessage(direct, "把签证材料标为临时", base + 12_400);
+  assert.equal(
+    handleAsukaMemoryControlMessage(direct, "把签证材料标为临时", base + 12_400).handled,
+    false,
+    "bare temporary marker should stay ordinary chat without sudo",
+  );
+  const temporaryReply = handleAsukaMemoryControlMessage(direct, "sudo 把签证材料标为临时", base + 12_500);
   assert.equal(temporaryReply.handled, true, "temporary marker should be handled");
   assert.equal(temporaryReply.action, "mark_temporary", "temporary marker should report action");
   assert.ok((temporaryReply.changed ?? 0) > 0, "temporary marker should update at least one memory");
   const temporaryState = readMemoryState();
   const visaMemory = Object.values(temporaryState.memories).find((item) => item.text.includes("签证材料"));
   assert.equal(visaMemory.temporary, true, "temporary marker should persist");
-  assert.ok(visaMemory.expiresAt <= base + 12_400 + 8 * dayMs, "temporary marker should bound expiry");
+  assert.ok(visaMemory.expiresAt <= base + 12_500 + 8 * dayMs, "temporary marker should bound expiry");
   assertIncludes(
     buildAsukaLongTermMemoryPrompt(direct, "签证材料", base + 12_500),
     "签证材料",
