@@ -26,12 +26,22 @@ import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, record
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
 
 const execFileAsync = promisify(execFile);
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
+
+type ReplyDeliverPayload = {
+  text?: string;
+  mediaUrls?: string[];
+  mediaUrl?: string;
+  isError?: boolean;
+  isReasoning?: boolean;
+  isCompactionNotice?: boolean;
+};
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
@@ -159,7 +169,7 @@ async function removeCronJobs(jobIds: string[], accountId: string, log?: { info?
   const uniqueJobIds = [...new Set(jobIds.filter(Boolean))];
   for (const jobId of uniqueJobIds) {
     try {
-      const { stdout, stderr } = await execFileAsync("openclaw", ["cron", "rm", jobId], {
+      const { stdout, stderr } = await execOpenClaw(["cron", "rm", jobId], {
         env: getQQBotLocalOpenClawEnv(),
         maxBuffer: 1024 * 1024,
       });
@@ -345,6 +355,14 @@ function looksLikeSilentInternalStatus(text: string): boolean {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned || cleaned.length > 160) return false;
   return INTERNAL_SILENT_STATUS_RE.test(cleaned);
+}
+
+function looksLikeInternalOnlyDeliver(payload: ReplyDeliverPayload): boolean {
+  if (payload.isReasoning || payload.isCompactionNotice) return true;
+  const cleaned = (payload.text ?? "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return false;
+  if (/^(?:🤖\s*)?(?:auto-)?compacting context\b/i.test(cleaned)) return true;
+  return /^reasoning\s*:/i.test(cleaned);
 }
 
 function looksLikeModelProviderError(text: string): boolean {
@@ -2218,10 +2236,15 @@ ${recentChatTranscript}
             cfg: cfgForCompanionThinking,
             dispatcherOptions: {
               responsePrefix: messagesConfig.responsePrefix,
-              deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string; isError?: boolean }, info: { kind: string }) => {
-                hasResponse = true;
-
+              deliver: async (payload: ReplyDeliverPayload, info: { kind: string }) => {
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
+
+                if (looksLikeInternalOnlyDeliver(payload)) {
+                  log?.info(`[qqbot:${account.accountId}] Suppressed internal-only deliver: ${Object.keys(payload).join(", ")}`);
+                  return;
+                }
+
+                hasResponse = true;
 
                 // ============ 跳过工具调用的中间结果（带兜底保护） ============
                 if (info.kind === "tool") {
@@ -2846,7 +2869,7 @@ ${recentChatTranscript}
                       if (parsedPayload.at || parsedPayload.cron) {
                         try {
                           cronArgs.push("--model", getQQBotLocalPrimaryModel());
-                          const { stdout, stderr } = await execFileAsync("openclaw", cronArgs, {
+                          const { stdout, stderr } = await execOpenClaw(cronArgs, {
                             env: getQQBotLocalOpenClawEnv(),
                             maxBuffer: 1024 * 1024,
                           });

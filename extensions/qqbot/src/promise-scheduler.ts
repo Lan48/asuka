@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { AsukaPromise } from "./asuka-state.js";
 import { getSceneSnapshotByPeerKey } from "./asuka-state.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, type CronReminderPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
-
-const execFileAsync = promisify(execFile);
 
 interface LoggerLike {
   info?: (msg: string) => void;
@@ -162,7 +159,7 @@ function nextDayLateMorning(source: Date): Date {
 
 async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: string } | { error: string }> {
   try {
-    const { stdout, stderr } = await execFileAsync("openclaw", args, {
+    const { stdout, stderr } = await execOpenClaw(args, {
       env: getQQBotLocalOpenClawEnv(),
       maxBuffer: 1024 * 1024,
     });

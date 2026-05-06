@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { markAmbientScheduled, prepareAmbientLifePayload, shouldScheduleAmbientForPeer } from "./asuka-state.js";
-
-const execFileAsync = promisify(execFile);
 
 interface LoggerLike {
   info?: (msg: string) => void;
@@ -21,7 +18,7 @@ function plusHours(source: Date, hours: number): Date {
 
 async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string | null> {
   try {
-    const { stdout, stderr } = await execFileAsync("openclaw", args, {
+    const { stdout, stderr } = await execOpenClaw(args, {
       env: getQQBotLocalOpenClawEnv(),
       maxBuffer: 1024 * 1024,
     });
