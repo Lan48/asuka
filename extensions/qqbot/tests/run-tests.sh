@@ -26,3 +26,4 @@ node tests/asuka-promise.test.mjs
 node tests/asuka-scheduling.test.mjs
 node tests/asuka-repair.test.mjs
 node tests/asuka-runtime.test.mjs
+node tests/ref-index-store.test.mjs
