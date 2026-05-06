@@ -37,6 +37,7 @@ import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotL
 import type { QQBotProactiveQuietHours } from "./types.js";
 import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -514,7 +515,7 @@ async function deferCronMessageUntilQuietEnds(
   ];
 
   try {
-    const { stdout, stderr } = await execFileAsync("openclaw", args, {
+    const { stdout, stderr } = await execOpenClaw(args, {
       env: getQQBotLocalOpenClawEnv(),
       maxBuffer: 1024 * 1024,
     });
