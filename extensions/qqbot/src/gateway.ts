@@ -640,6 +640,10 @@ const IMAGE_SERVER_DIR = process.env.QQBOT_IMAGE_SERVER_DIR || getQQBotDataDir("
 const MESSAGE_QUEUE_SIZE = 1000; // 最大队列长度（全局总量）
 const PER_USER_QUEUE_SIZE = 20; // 单用户最大排队数
 const MAX_CONCURRENT_USERS = 10; // 最大同时处理的用户数
+const DEFAULT_MESSAGE_BUFFER_MS = 4_000; // 普通消息防抖合并窗口
+const DEFAULT_MESSAGE_BUFFER_MAX_MS = 15_000; // 连续输入时最长等待时间
+const MESSAGE_BUFFER_MAX_MESSAGES = 20; // 单次合并最多消息数
+const MESSAGE_BUFFER_MAX_CONTENT_CHARS = 12_000; // 单次合并最多原始文本长度
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过1小时需降级为主动消息
@@ -786,7 +790,18 @@ export interface GatewayContext {
 /**
  * 消息队列项类型（用于异步处理消息，防止阻塞心跳）
  */
-interface QueuedMessage {
+interface BufferedSourceMessage {
+  senderId: string;
+  senderName?: string;
+  content: string;
+  messageId: string;
+  timestamp: string;
+  attachments?: Array<{ content_type: string; url: string; filename?: string; voice_wav_url?: string; asr_refer_text?: string }>;
+  refMsgIdx?: string;
+  msgIdx?: string;
+}
+
+export interface QueuedMessage {
   type: "c2c" | "guild" | "dm" | "group";
   senderId: string;
   senderName?: string;
@@ -801,6 +816,8 @@ interface QueuedMessage {
   refMsgIdx?: string;
   /** 当前消息自身的 refIdx（供将来被引用） */
   msgIdx?: string;
+  /** 缓冲合并前的原始消息列表，供引用索引和日志保留每条消息的信息 */
+  bufferedMessages?: BufferedSourceMessage[];
 }
 
 /**
@@ -819,6 +836,64 @@ function parseRefIndices(ext?: string[]): { refMsgIdx?: string; msgIdx?: string 
     }
   }
   return { refMsgIdx, msgIdx };
+}
+
+function parseNonNegativeMs(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+function resolveMessageBufferConfig(accountConfig: ResolvedQQBotAccount["config"]): { bufferMs: number; maxMs: number } {
+  const bufferMs = parseNonNegativeMs(
+    process.env.QQBOT_MESSAGE_BUFFER_MS ?? accountConfig.messageBufferMs,
+    DEFAULT_MESSAGE_BUFFER_MS,
+  );
+  const configuredMaxMs = parseNonNegativeMs(
+    process.env.QQBOT_MESSAGE_BUFFER_MAX_MS ?? accountConfig.messageBufferMaxMs,
+    DEFAULT_MESSAGE_BUFFER_MAX_MS,
+  );
+  const maxMs = Math.max(bufferMs, configuredMaxMs);
+  return { bufferMs, maxMs };
+}
+
+function toBufferedSourceMessage(msg: QueuedMessage): BufferedSourceMessage {
+  return {
+    senderId: msg.senderId,
+    ...(msg.senderName !== undefined ? { senderName: msg.senderName } : {}),
+    content: msg.content,
+    messageId: msg.messageId,
+    timestamp: msg.timestamp,
+    ...(msg.attachments !== undefined ? { attachments: msg.attachments } : {}),
+    ...(msg.refMsgIdx !== undefined ? { refMsgIdx: msg.refMsgIdx } : {}),
+    ...(msg.msgIdx !== undefined ? { msgIdx: msg.msgIdx } : {}),
+  };
+}
+
+export function mergeBufferedQueuedMessages(messages: QueuedMessage[]): QueuedMessage {
+  if (messages.length === 0) {
+    throw new Error("Cannot merge an empty message buffer");
+  }
+
+  const latest = messages[messages.length - 1]!;
+  const sourceMessages = messages.flatMap((msg) => msg.bufferedMessages?.length ? msg.bufferedMessages : [toBufferedSourceMessage(msg)]);
+  const contentParts = sourceMessages
+    .map((msg) => (msg.content ?? "").trim())
+    .filter(Boolean);
+  const attachments = sourceMessages.flatMap((msg) => msg.attachments ?? []);
+  const latestQuoted = [...sourceMessages].reverse().find((msg) => msg.refMsgIdx);
+  const latestIndexed = [...sourceMessages].reverse().find((msg) => msg.msgIdx);
+
+  return {
+    ...latest,
+    content: contentParts.join("\n"),
+    messageId: latest.messageId,
+    timestamp: latest.timestamp,
+    ...(attachments.length > 0 ? { attachments } : { attachments: undefined }),
+    ...(latestQuoted?.refMsgIdx ? { refMsgIdx: latestQuoted.refMsgIdx } : { refMsgIdx: undefined }),
+    ...(latestIndexed?.msgIdx ? { msgIdx: latestIndexed.msgIdx } : { msgIdx: undefined }),
+    bufferedMessages: sourceMessages,
+  };
 }
 
 /**
@@ -985,6 +1060,13 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   
   const userQueues = new Map<string, QueuedMessage[]>(); // peerId → 消息队列
   const activeUsers = new Set<string>(); // 正在处理中的用户
+  const messageBuffers = new Map<string, {
+    messages: QueuedMessage[];
+    firstReceivedAt: number;
+    idleTimer: ReturnType<typeof setTimeout> | null;
+    maxTimer: ReturnType<typeof setTimeout> | null;
+  }>();
+  const messageBufferConfig = resolveMessageBufferConfig(account.config);
   let messagesProcessed = 0;
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
@@ -996,34 +1078,26 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     return `dm:${msg.senderId}`;
   };
 
-  const enqueueMessage = (msg: QueuedMessage): void => {
-    const peerId = getMessagePeerId(msg);
-    const content = (msg.content ?? "").trim().toLowerCase();
-    
-    // 检测是否为紧急命令
-    const isUrgentCommand = URGENT_COMMANDS.some(cmd => content.startsWith(cmd.toLowerCase()));
-    
-    if (isUrgentCommand) {
-      log?.info(`[qqbot:${account.accountId}] Urgent command detected: ${content.slice(0, 20)}, executing immediately`);
-      
-      // 清空该用户队列中所有待处理消息
-      const queue = userQueues.get(peerId);
-      if (queue) {
-        const droppedCount = queue.length;
-        queue.length = 0; // 清空队列
-        totalEnqueued = Math.max(0, totalEnqueued - droppedCount);
-        log?.info(`[qqbot:${account.accountId}] Dropped ${droppedCount} queued messages for ${peerId} due to urgent command`);
-      }
-      
-      // 立即异步执行紧急命令，不等待
-      if (handleMessageFnRef) {
-        handleMessageFnRef(msg).catch(err => {
-          log?.error(`[qqbot:${account.accountId}] Urgent command error: ${err}`);
-        });
-      }
-      return;
+  const getMessageBufferKey = (msg: QueuedMessage): string => {
+    if (msg.type === "guild") return `guild:${msg.channelId ?? "unknown"}:sender:${msg.senderId}`;
+    if (msg.type === "group") return `group:${msg.groupOpenid ?? "unknown"}:sender:${msg.senderId}`;
+    return `dm:${msg.senderId}`;
+  };
+
+  const clearBufferedBatchTimers = (batch: { idleTimer: ReturnType<typeof setTimeout> | null; maxTimer: ReturnType<typeof setTimeout> | null }): void => {
+    if (batch.idleTimer) {
+      clearTimeout(batch.idleTimer);
+      batch.idleTimer = null;
     }
-    
+    if (batch.maxTimer) {
+      clearTimeout(batch.maxTimer);
+      batch.maxTimer = null;
+    }
+  };
+
+  const enqueueMessageForProcessing = (msg: QueuedMessage): void => {
+    const peerId = getMessagePeerId(msg);
+
     let queue = userQueues.get(peerId);
     if (!queue) {
       queue = [];
@@ -1047,6 +1121,99 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
     // 如果该用户没有正在处理的消息，立即启动处理
     drainUserQueue(peerId);
+  };
+
+  const flushBufferedMessage = (bufferKey: string, reason: string): void => {
+    const batch = messageBuffers.get(bufferKey);
+    if (!batch) return;
+    clearBufferedBatchTimers(batch);
+    messageBuffers.delete(bufferKey);
+    const merged = mergeBufferedQueuedMessages(batch.messages);
+    if (batch.messages.length > 1) {
+      log?.info(`[qqbot:${account.accountId}] Buffered ${batch.messages.length} messages for ${bufferKey}, merged as ${merged.messageId} (${reason})`);
+    }
+    enqueueMessageForProcessing(merged);
+  };
+
+  const dropBufferedMessagesForPeer = (peerId: string, reason: string): number => {
+    let dropped = 0;
+    for (const [bufferKey, batch] of [...messageBuffers.entries()]) {
+      const firstMessage = batch.messages[0];
+      if (!firstMessage || getMessagePeerId(firstMessage) !== peerId) continue;
+      clearBufferedBatchTimers(batch);
+      messageBuffers.delete(bufferKey);
+      dropped += batch.messages.length;
+      log?.info(`[qqbot:${account.accountId}] Dropped ${batch.messages.length} buffered messages for ${bufferKey} (${reason})`);
+    }
+    return dropped;
+  };
+
+  const enqueueMessage = (msg: QueuedMessage): void => {
+    const peerId = getMessagePeerId(msg);
+    const bufferKey = getMessageBufferKey(msg);
+    const trimmedContent = (msg.content ?? "").trim();
+    const lowerContent = trimmedContent.toLowerCase();
+
+    // 检测是否为紧急命令
+    const isUrgentCommand = URGENT_COMMANDS.some(cmd => lowerContent.startsWith(cmd.toLowerCase()));
+
+    if (isUrgentCommand) {
+      log?.info(`[qqbot:${account.accountId}] Urgent command detected: ${lowerContent.slice(0, 20)}, executing immediately`);
+
+      dropBufferedMessagesForPeer(peerId, "urgent command");
+
+      // 清空该用户队列中所有待处理消息
+      const queue = userQueues.get(peerId);
+      if (queue) {
+        const droppedCount = queue.length;
+        queue.length = 0; // 清空队列
+        totalEnqueued = Math.max(0, totalEnqueued - droppedCount);
+        log?.info(`[qqbot:${account.accountId}] Dropped ${droppedCount} queued messages for ${peerId} due to urgent command`);
+      }
+
+      // 立即异步执行紧急命令，不等待
+      if (handleMessageFnRef) {
+        handleMessageFnRef(msg).catch(err => {
+          log?.error(`[qqbot:${account.accountId}] Urgent command error: ${err}`);
+        });
+      }
+      return;
+    }
+
+    // 斜杠命令不参与普通消息合并，避免控制指令被拼到对话正文里。
+    if (trimmedContent.startsWith("/") || messageBufferConfig.bufferMs === 0) {
+      flushBufferedMessage(bufferKey, "command or buffer disabled");
+      enqueueMessageForProcessing(msg);
+      return;
+    }
+
+    let batch = messageBuffers.get(bufferKey);
+    if (!batch) {
+      batch = {
+        messages: [],
+        firstReceivedAt: Date.now(),
+        idleTimer: null,
+        maxTimer: null,
+      };
+      messageBuffers.set(bufferKey, batch);
+      if (messageBufferConfig.maxMs > messageBufferConfig.bufferMs) {
+        batch.maxTimer = setTimeout(() => flushBufferedMessage(bufferKey, "max window elapsed"), messageBufferConfig.maxMs);
+      }
+    }
+
+    batch.messages.push(msg);
+    const bufferedChars = batch.messages.reduce((sum, item) => sum + (item.content?.length ?? 0), 0);
+    const shouldFlushNow = batch.messages.length >= MESSAGE_BUFFER_MAX_MESSAGES
+      || bufferedChars >= MESSAGE_BUFFER_MAX_CONTENT_CHARS
+      || Date.now() - batch.firstReceivedAt >= messageBufferConfig.maxMs;
+    if (shouldFlushNow) {
+      flushBufferedMessage(bufferKey, "buffer limit reached");
+      return;
+    }
+
+    if (batch.idleTimer) clearTimeout(batch.idleTimer);
+    batch.idleTimer = setTimeout(() => flushBufferedMessage(bufferKey, "idle window elapsed"), messageBufferConfig.bufferMs);
+    log?.debug?.(`[qqbot:${account.accountId}] Message buffered for ${bufferKey}, batch=${batch.messages.length}, idle=${messageBufferConfig.bufferMs}ms, max=${messageBufferConfig.maxMs}ms`);
   };
 
   // 处理指定用户队列中的消息（串行）
@@ -1093,7 +1260,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
   const startMessageProcessor = (handleMessageFn: (msg: QueuedMessage) => Promise<void>): void => {
     handleMessageFnRef = handleMessageFn;
-    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users)`);
+    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users, buffer ${messageBufferConfig.bufferMs}ms/${messageBufferConfig.maxMs}ms)`);
   };
 
   abortSignal.addEventListener("abort", () => {
@@ -1102,6 +1269,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    for (const batch of messageBuffers.values()) {
+      clearBufferedBatchTimers(batch);
+    }
+    messageBuffers.clear();
     cleanup();
     // P1-1: 停止后台 Token 刷新
     stopBackgroundTokenRefresh(account.appId);
@@ -1184,23 +1355,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       const pluginRuntime = getQQBotRuntime();
 
       // 处理收到的消息
-      const handleMessage = async (event: {
-        type: "c2c" | "guild" | "dm" | "group";
-        senderId: string;
-        senderName?: string;
-        content: string;
-        messageId: string;
-        timestamp: string;
-        channelId?: string;
-        guildId?: string;
-        groupOpenid?: string;
-        attachments?: Array<{ content_type: string; url: string; filename?: string; voice_wav_url?: string; asr_refer_text?: string }>;
-        refMsgIdx?: string;
-        msgIdx?: string;
-      }) => {
+      const handleMessage = async (event: QueuedMessage) => {
 
         log?.debug?.(`[qqbot:${account.accountId}] Received message: ${JSON.stringify(event)}`);
-        log?.info(`[qqbot:${account.accountId}] Processing message from ${event.senderId}: ${event.content}`);
+        const sourceMessages = event.bufferedMessages?.length ? event.bufferedMessages : [toBufferedSourceMessage(event)];
+        log?.info(`[qqbot:${account.accountId}] Processing message from ${event.senderId}${sourceMessages.length > 1 ? ` (${sourceMessages.length} buffered messages)` : ""}: ${event.content}`);
         if (event.attachments?.length) {
           log?.info(`[qqbot:${account.accountId}] Attachments: ${event.attachments.length}`);
         }
@@ -1487,11 +1646,20 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           }
         }
 
-        // 2. 缓存当前消息自身的 msgIdx（供将来被引用时查找）
-        const currentMsgIdx = event.msgIdx;
-        if (currentMsgIdx) {
-          const attSummaries = buildAttachmentSummaries(event.attachments, attachmentLocalPaths);
-          if (attSummaries && voiceTranscripts.length > 0) {
+        // 2. 缓存当前消息自身的 msgIdx（供将来被引用时查找）。缓冲合并后仍逐条保留原始 msgIdx。
+        let sourceAttachmentOffset = 0;
+        for (const sourceMessage of sourceMessages) {
+          const sourceAttachments = sourceMessage.attachments;
+          const sourceAttachmentCount = sourceAttachments?.length ?? 0;
+          const sourceLocalPaths = sourceAttachmentCount > 0
+            ? attachmentLocalPaths.slice(sourceAttachmentOffset, sourceAttachmentOffset + sourceAttachmentCount)
+            : undefined;
+          sourceAttachmentOffset += sourceAttachmentCount;
+
+          if (!sourceMessage.msgIdx) continue;
+
+          const attSummaries = buildAttachmentSummaries(sourceAttachments, sourceLocalPaths);
+          if (sourceMessages.length === 1 && attSummaries && voiceTranscripts.length > 0) {
             let voiceIdx = 0;
             for (const att of attSummaries) {
               if (att.type === "voice" && voiceIdx < voiceTranscripts.length) {
@@ -1503,15 +1671,15 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               }
             }
           }
-          setRefIndex(currentMsgIdx, {
-            content: parsedContent,
-            senderId: event.senderId,
-            peerId: isGroupChat ? (event.groupOpenid ?? event.senderId) : event.senderId,
-            senderName: event.senderName,
-            timestamp: new Date(event.timestamp).getTime(),
+          setRefIndex(sourceMessage.msgIdx, {
+            content: parseFaceTags(sourceMessage.content),
+            senderId: sourceMessage.senderId,
+            peerId: isGroupChat ? (event.groupOpenid ?? sourceMessage.senderId) : sourceMessage.senderId,
+            senderName: sourceMessage.senderName,
+            timestamp: new Date(sourceMessage.timestamp).getTime(),
             attachments: attSummaries,
           });
-          log?.info(`[qqbot:${account.accountId}] Cached msgIdx=${currentMsgIdx} for future reference (source: message_scene.ext)`);
+          log?.info(`[qqbot:${account.accountId}] Cached msgIdx=${sourceMessage.msgIdx} for future reference (source: message_scene.ext)`);
         }
 
         // Body: 展示用的用户原文（Web UI 看到的）

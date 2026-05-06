@@ -61,6 +61,10 @@ export interface QQBotAccountConfig {
   proactiveQuietHours?: QQBotProactiveQuietHours;
   /** Asuka 场景推断配置 */
   sceneInference?: SceneInferenceConfig;
+  /** 入站普通消息缓冲窗口，单位毫秒；窗口内同一用户的新消息会合并为一次 agent 输入 */
+  messageBufferMs?: number;
+  /** 入站普通消息最长缓冲时间，单位毫秒；防止连续输入导致 agent 永不处理 */
+  messageBufferMaxMs?: number;
   /**
    * @deprecated 请使用 audioFormatPolicy.uploadDirectFormats
    * 可直接上传的音频格式（不转换为 SILK），向后兼容

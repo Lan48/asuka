@@ -340,6 +340,8 @@ export function resolveQQBotAccount(
       markdownSupport: qqbot?.markdownSupport ?? true,
       proactiveQuietHours: qqbot?.proactiveQuietHours,
       sceneInference: qqbot?.sceneInference,
+      messageBufferMs: qqbot?.messageBufferMs,
+      messageBufferMaxMs: qqbot?.messageBufferMaxMs,
     };
     appId = normalizeAppId(qqbot?.appId);
   } else {
@@ -359,10 +361,14 @@ export function resolveQQBotAccount(
             ...account?.sceneInference,
           }
         : undefined;
+    const inheritedMessageBufferMs = account?.messageBufferMs ?? qqbot?.messageBufferMs;
+    const inheritedMessageBufferMaxMs = account?.messageBufferMaxMs ?? qqbot?.messageBufferMaxMs;
     accountConfig = {
       ...(account ?? {}),
       ...(inheritedQuietHours ? { proactiveQuietHours: inheritedQuietHours } : {}),
       ...(inheritedSceneInference ? { sceneInference: inheritedSceneInference } : {}),
+      ...(inheritedMessageBufferMs !== undefined ? { messageBufferMs: inheritedMessageBufferMs } : {}),
+      ...(inheritedMessageBufferMaxMs !== undefined ? { messageBufferMaxMs: inheritedMessageBufferMaxMs } : {}),
     };
     appId = normalizeAppId(account?.appId);
   }
