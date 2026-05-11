@@ -38,6 +38,7 @@ import type { QQBotProactiveQuietHours } from "./types.js";
 import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
+import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -65,15 +66,6 @@ interface NormalizedProactiveQuietHours {
   startHour: number;
   endHour: number;
   timezone: string;
-}
-
-interface ZonedDateParts {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
 }
 
 interface BufferedReplyPayload {
@@ -396,32 +388,6 @@ function getNormalizedProactiveQuietHours(
     startHour,
     endHour,
     timezone: quietHours.timezone?.trim() || "Asia/Shanghai",
-  };
-}
-
-function getZonedDateParts(source: Date, timeZone: string): ZonedDateParts {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = formatter.formatToParts(source);
-  const read = (type: Intl.DateTimeFormatPartTypes): number => {
-    const value = parts.find(part => part.type === type)?.value;
-    return value ? Number(value) : 0;
-  };
-  return {
-    year: read("year"),
-    month: read("month"),
-    day: read("day"),
-    hour: read("hour"),
-    minute: read("minute"),
-    second: read("second"),
   };
 }
 
@@ -835,37 +801,8 @@ function formatConversationClock(date: Date): string {
   return `${hours}:${minutes}`;
 }
 
-function normalizePromptHour(hour: number): number {
-  return hour === 24 ? 0 : hour;
-}
-
-function describeDayPeriod(hour: number): string {
-  const normalizedHour = normalizePromptHour(hour);
-  if (normalizedHour < 5) return "凌晨";
-  if (normalizedHour < 9) return "早上";
-  if (normalizedHour < 12) return "上午";
-  if (normalizedHour < 14) return "中午";
-  if (normalizedHour < 18) return "下午";
-  if (normalizedHour < 21) return "晚上";
-  return "深夜";
-}
-
 function getPromptTimeZone(account: ResolvedQQBotAccount): string {
   return getNormalizedProactiveQuietHours(account)?.timezone ?? "Asia/Shanghai";
-}
-
-function formatZonedDateTimeForPrompt(timestampMs = Date.now(), timeZone = "Asia/Shanghai"): string {
-  const source = new Date(timestampMs);
-  const parts = getZonedDateParts(source, timeZone);
-  const weekday = new Intl.DateTimeFormat("zh-CN", { timeZone, weekday: "long" }).format(source);
-  const hour = normalizePromptHour(parts.hour);
-  const date = [
-    String(parts.year).padStart(4, "0"),
-    String(parts.month).padStart(2, "0"),
-    String(parts.day).padStart(2, "0"),
-  ].join("-");
-  const clock = `${String(hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
-  return `${date} ${weekday} ${clock}（${timeZone}，${describeDayPeriod(hour)}）`;
 }
 
 const DAYTIME_NIGHT_SCENE_RE = /(睡了吗|睡了没|睡前|睡觉|睡吧|晚安|今晚|晚上见|关灯|被窝|做个好梦|洗完澡|擦头发|准备睡|明天早上叫你|明早叫你)/;

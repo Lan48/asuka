@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig } from "./config.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
+import { formatRelativeTimeForPrompt, formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 import type { ParsedPromise, ParsedPromiseSchedule, PromiseTriggerKind } from "./promise-parser.js";
 
 export interface AsukaPeerContext {
@@ -814,6 +815,85 @@ function buildDefaultSceneState(peer: AsukaPeerState, state: AsukaStateFile, now
   });
 }
 
+const ASUKA_PROMPT_TIME_ZONE = "Asia/Shanghai";
+const ASSISTANT_TRACE_FULL_MS = 45 * 60 * 1000;
+const ASSISTANT_TRACE_KEEP_MS = 2 * 60 * 60 * 1000;
+const AMBIENT_TRACE_FULL_MS = 60 * 60 * 1000;
+const AMBIENT_TRACE_KEEP_MS = 90 * 60 * 1000;
+const CONCRETE_PHYSICAL_TRACE_RE = /(早餐|早饭|早茶|午饭|晚饭|吃饭|筷子|碗|盘子|醋碟|餐桌|饭桌|桌沿|喝粥|豆浆|煎蛋|面包|出门|门口|下楼|路上|车上|地铁|公交|被窝|关灯|洗澡|擦头发)/;
+const MORNING_MEAL_TRACE_RE = /(早餐|早饭|早茶|早上.{0,12}(?:吃|喝)|筷子|碗|盘子|醋碟|餐桌|饭桌|喝粥|豆浆|煎蛋|面包)/;
+
+function getPromptHour(timestampMs: number, timeZone = ASUKA_PROMPT_TIME_ZONE): number {
+  return normalizePromptHour(getZonedDateParts(new Date(timestampMs), timeZone).hour);
+}
+
+function crossesMorningMealBoundary(timestampMs: number | undefined, now: number): boolean {
+  if (typeof timestampMs !== "number" || !Number.isFinite(timestampMs)) return false;
+  const previousHour = getPromptHour(timestampMs);
+  const currentHour = getPromptHour(now);
+  return previousHour < 12 && currentHour >= 14;
+}
+
+function shouldDowngradeConcreteTrace(options: {
+  text: string;
+  timestampMs?: number;
+  now: number;
+  fullMs: number;
+  activePhysicalScene: boolean;
+  currentUserText?: string;
+}): boolean {
+  const hasConcreteTrace = CONCRETE_PHYSICAL_TRACE_RE.test(options.text);
+  if (!hasConcreteTrace) return false;
+
+  const currentUserCarriesPhysicalTrace = CONCRETE_PHYSICAL_TRACE_RE.test(options.currentUserText ?? "");
+  const ageMs = typeof options.timestampMs === "number" ? options.now - options.timestampMs : undefined;
+  if (typeof ageMs === "number" && ageMs > options.fullMs) return true;
+  if (MORNING_MEAL_TRACE_RE.test(options.text) && crossesMorningMealBoundary(options.timestampMs, options.now)) return true;
+
+  const currentHour = getPromptHour(options.now);
+  const afternoonOrLater = currentHour >= 14 || currentHour < 5;
+  return afternoonOrLater && !options.activePhysicalScene && !currentUserCarriesPhysicalTrace;
+}
+
+function buildDecayedTraceLine(
+  label: string,
+  text: string | undefined,
+  timestampMs: number | undefined,
+  now: number,
+  options: {
+    fullMs: number;
+    keepMs: number;
+    activePhysicalScene: boolean;
+    currentUserText?: string;
+  }
+): string | undefined {
+  const summary = summarizeText(text, 140);
+  if (!summary) return undefined;
+
+  const relative = formatRelativeTimeForPrompt(timestampMs, now);
+  const ageMs = typeof timestampMs === "number" && Number.isFinite(timestampMs) ? now - timestampMs : undefined;
+  const shouldDowngrade = shouldDowngradeConcreteTrace({
+    text: summary,
+    timestampMs,
+    now,
+    fullMs: options.fullMs,
+    activePhysicalScene: options.activePhysicalScene,
+    currentUserText: options.currentUserText,
+  });
+
+  if (shouldDowngrade) {
+    const ageLabel = relative || "较早前";
+    return `- ${label}: ${ageLabel}有一条生活动作线索，只作已经发生过的背景；当前以本地时间为准，不要继续具体动作或停留在当时场景。`;
+  }
+  if (typeof ageMs === "number" && ageMs > options.keepMs) {
+    return undefined;
+  }
+  if (typeof ageMs === "number" && ageMs > options.fullMs) {
+    return `- ${label}（${relative || "较早前"}，仅作背景）: ${summary}`;
+  }
+  return `- ${label}: ${summary}`;
+}
+
 function normalizeSceneContextText(text: string | undefined): string {
   return sanitizeAssistantStateText(text)
     .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
@@ -1607,9 +1687,34 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   const activePhysicalScene = scene.kind === "physical"
     && !isSceneExpired(scene, now)
     && scene.confidence >= PHYSICAL_SCENE_CONFIDENCE_THRESHOLD;
+  const lastAssistantLine = buildDecayedTraceLine(
+    "你上次回应里留过的线索",
+    peer.relationship.lastAssistantText,
+    peer.relationship.lastAssistantMessageAt,
+    now,
+    {
+      fullMs: ASSISTANT_TRACE_FULL_MS,
+      keepMs: ASSISTANT_TRACE_KEEP_MS,
+      activePhysicalScene,
+      currentUserText: peer.relationship.lastUserText,
+    }
+  );
+  const lastAmbientLine = buildDecayedTraceLine(
+    "最近一条主动消息摘要",
+    peer.ambient.lastTopicPreview,
+    peer.ambient.lastSentAt,
+    now,
+    {
+      fullMs: AMBIENT_TRACE_FULL_MS,
+      keepMs: AMBIENT_TRACE_KEEP_MS,
+      activePhysicalScene,
+      currentUserText: peer.relationship.lastUserText,
+    }
+  );
 
   const sections: string[] = [
     "【Asuka 连续状态】",
+    `- 当前本地时间: ${formatZonedDateTimeForPrompt(now, ASUKA_PROMPT_TIME_ZONE)}`,
     `- 关系阶段: ${peer.relationship.phase}（${describeRelationshipPhase(peer.relationship.phase)}）`,
     `- 亲密度: ${peer.relationship.intimacy}/100`,
     `- 关系温度: ${peer.relationship.warmth}/100（${peer.relationship.label}）`,
@@ -1618,8 +1723,8 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   if (peer.relationship.lastUserText) {
     sections.push(`- 用户刚才在说: ${peer.relationship.lastUserText}`);
   }
-  if (peer.relationship.lastAssistantText) {
-    sections.push(`- 你上次回应里留过的线索: ${peer.relationship.lastAssistantText}`);
+  if (lastAssistantLine) {
+    sections.push(lastAssistantLine);
   }
   if (activePhysicalScene) {
     sections.push(`- 你当前场景: ${scene.summary}`);
@@ -1629,8 +1734,8 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   } else if (!activePhysicalScene && (peer.ambient.currentPresence ?? disposition.presence)) {
     sections.push(`- 你现在自己的状态: ${peer.ambient.currentPresence ?? disposition.presence}`);
   }
-  if (peer.ambient.lastTopicPreview) {
-    sections.push(`- 最近一条主动消息摘要: ${peer.ambient.lastTopicPreview}`);
+  if (lastAmbientLine) {
+    sections.push(lastAmbientLine);
   }
   if (peer.ambient.currentAttention ?? disposition.attention) {
     sections.push(`- 你这次主动更像是因为: ${describeAttention(peer.ambient.currentAttention ?? disposition.attention)}`);
@@ -1664,6 +1769,7 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   sections.push("- 如果有到点却未确认的约定，优先自然续上，必要时温柔承认自己没接住。");
   sections.push("- 如果用户这轮换了动作、问题或语气，就顺着新的变化继续往前接，不要只把你上一句原样再说一遍。");
   sections.push("- 你最近留下的生活线痕迹只算背景，不要让旧线索盖过这轮对话、关系状态和需要补上的约定。");
+  sections.push("- 时间原则: 以当前本地时间为准；旧的早餐、上午或具体生活动作过了对应时段后，只能当作已经发生过的背景，不要继续表演还停留在那里。");
   sections.push("- 你不是任务助手。主动来找对方时，要更像一个会偏爱、会惦记、会先照顾情绪的恋人，而不是陪伴播报器。");
   sections.push("- 语气可以亲一点、黏一点、服软一点，但要自然，别写成模板，也别油腻用力。");
   return sections.join("\n");

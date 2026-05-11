@@ -27,6 +27,7 @@ import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
+import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 
 const execFileAsync = promisify(execFile);
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
@@ -58,6 +59,10 @@ let asukaVisualIdentityAnchorCache: string | undefined;
 
 export function resolveCompanionThinkingLevel(_userText: string, _isGroupChat: boolean): QQBotDeepSeekThinkingLevel {
   return "off";
+}
+
+function getPromptTimeZone(account: ResolvedQQBotAccount): string {
+  return account.config.proactiveQuietHours?.timezone?.trim() || "Asia/Shanghai";
 }
 
 function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
@@ -1815,6 +1820,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0
           ? `\n- 语音ASR兜底文本:\n${uniqueVoiceAsrReferTexts.map((t, i) => `  ${i + 1}. ${t}`).join("\n")}`
           : "";
+        const currentLocalTime = formatZonedDateTimeForPrompt(nowMs, getPromptTimeZone(account));
 
         const contextInfo = `你正在通过 QQ 与用户对话。
 
@@ -1823,6 +1829,7 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 - 场景: ${isGroupChat ? "群聊" : "私聊"}${isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
 - 消息ID: ${event.messageId}
 - 投递目标: ${qualifiedTarget}${receivedMediaSection}${voiceAsrSection}
+- 当前本地时间: ${currentLocalTime}
 - 当前时间戳(ms): ${nowMs}
 - 定时提醒投递地址: channel=qqbot, to=${qualifiedTarget}
 
