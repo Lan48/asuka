@@ -50,8 +50,8 @@ try {
   const prompt = buildAsukaStatePrompt(direct, afternoon);
   assert.match(prompt, /当前本地时间: 2026-05-11 .*14:50.*下午/, "state prompt should expose local afternoon time");
   assert.doesNotMatch(prompt, /筷子|醋碟|桌沿/, "stale concrete meal actions should not be reinjected in the afternoon");
-  assert.match(prompt, /生活动作线索，只作已经发生过的背景/, "stale concrete actions should decay to background guidance");
-  assert.match(prompt, /旧的早餐、上午或具体生活动作/, "prompt should include a time-boundary principle");
+  assert.match(prompt, /动作旁白已降权|动作旁白，只作已经发生过的背景/, "stale stage directions should decay to background guidance");
+  assert.match(prompt, /旧时段的动作旁白/, "prompt should include a time-boundary principle");
 
   const lunchPeer = {
     ...direct,
@@ -69,6 +69,11 @@ try {
   );
   const freshPrompt = buildAsukaStatePrompt(lunchPeer, afternoon);
   assert.match(freshPrompt, /把筷子放下/, "fresh physical context should remain when the current user turn invokes the meal scene");
+
+  const stateSource = fs.readFileSync(path.join(process.cwd(), "src", "asuka-state.ts"), "utf-8");
+  assert.equal(stateSource.includes("CONCRETE_PHYSICAL_TRACE_RE"), false, "state decay should not use a concrete physical keyword classifier");
+  assert.equal(stateSource.includes("MORNING_MEAL_TRACE_RE"), false, "state decay should not use a meal keyword classifier");
+  assert.equal(/醋碟|桌沿|喝粥|煎蛋/.test(stateSource), false, "state decay should not hard-code observed meal props");
 
   console.log("[qqbot:test] asuka time-context fixtures passed");
 } finally {

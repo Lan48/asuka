@@ -820,39 +820,42 @@ const ASSISTANT_TRACE_FULL_MS = 45 * 60 * 1000;
 const ASSISTANT_TRACE_KEEP_MS = 2 * 60 * 60 * 1000;
 const AMBIENT_TRACE_FULL_MS = 60 * 60 * 1000;
 const AMBIENT_TRACE_KEEP_MS = 90 * 60 * 1000;
-const CONCRETE_PHYSICAL_TRACE_RE = /(早餐|早饭|早茶|午饭|晚饭|吃饭|筷子|碗|盘子|醋碟|餐桌|饭桌|桌沿|喝粥|豆浆|煎蛋|面包|出门|门口|下楼|路上|车上|地铁|公交|被窝|关灯|洗澡|擦头发)/;
-const MORNING_MEAL_TRACE_RE = /(早餐|早饭|早茶|早上.{0,12}(?:吃|喝)|筷子|碗|盘子|醋碟|餐桌|饭桌|喝粥|豆浆|煎蛋|面包)/;
+const CONTINUATION_ANCHOR_MIN_CHARS = 6;
+const STAGE_DIRECTION_SEGMENT_RE = /（[^（）]*(?:）|$)/g;
 
 function getPromptHour(timestampMs: number, timeZone = ASUKA_PROMPT_TIME_ZONE): number {
   return normalizePromptHour(getZonedDateParts(new Date(timestampMs), timeZone).hour);
 }
 
-function crossesMorningMealBoundary(timestampMs: number | undefined, now: number): boolean {
-  if (typeof timestampMs !== "number" || !Number.isFinite(timestampMs)) return false;
-  const previousHour = getPromptHour(timestampMs);
-  const currentHour = getPromptHour(now);
-  return previousHour < 12 && currentHour >= 14;
+function getPromptPeriodIndex(timestampMs: number): number {
+  const hour = getPromptHour(timestampMs);
+  if (hour < 5) return 0;
+  if (hour < 12) return 1;
+  if (hour < 14) return 2;
+  if (hour < 18) return 3;
+  if (hour < 21) return 4;
+  return 5;
 }
 
-function shouldDowngradeConcreteTrace(options: {
-  text: string;
-  timestampMs?: number;
-  now: number;
-  fullMs: number;
-  activePhysicalScene: boolean;
-  currentUserText?: string;
-}): boolean {
-  const hasConcreteTrace = CONCRETE_PHYSICAL_TRACE_RE.test(options.text);
-  if (!hasConcreteTrace) return false;
+function crossesPromptPeriodBoundary(timestampMs: number | undefined, now: number): boolean {
+  if (typeof timestampMs !== "number" || !Number.isFinite(timestampMs)) return false;
+  return getPromptPeriodIndex(timestampMs) !== getPromptPeriodIndex(now);
+}
 
-  const currentUserCarriesPhysicalTrace = CONCRETE_PHYSICAL_TRACE_RE.test(options.currentUserText ?? "");
-  const ageMs = typeof options.timestampMs === "number" ? options.now - options.timestampMs : undefined;
-  if (typeof ageMs === "number" && ageMs > options.fullMs) return true;
-  if (MORNING_MEAL_TRACE_RE.test(options.text) && crossesMorningMealBoundary(options.timestampMs, options.now)) return true;
+function hasStageDirection(text: string): boolean {
+  STAGE_DIRECTION_SEGMENT_RE.lastIndex = 0;
+  return STAGE_DIRECTION_SEGMENT_RE.test(text);
+}
 
-  const currentHour = getPromptHour(options.now);
-  const afternoonOrLater = currentHour >= 14 || currentHour < 5;
-  return afternoonOrLater && !options.activePhysicalScene && !currentUserCarriesPhysicalTrace;
+function stripTraceStageDirections(text: string): string {
+  STAGE_DIRECTION_SEGMENT_RE.lastIndex = 0;
+  return text.replace(STAGE_DIRECTION_SEGMENT_RE, "").replace(/\s+/g, " ").trim();
+}
+
+function hasSubstantiveContinuationAnchor(text: string | undefined): boolean {
+  const normalized = sanitizeAssistantStateText(text)
+    .replace(/[？?！!。，、,.…~～\s]/g, "");
+  return normalized.length >= CONTINUATION_ANCHOR_MIN_CHARS;
 }
 
 function buildDecayedTraceLine(
@@ -872,18 +875,20 @@ function buildDecayedTraceLine(
 
   const relative = formatRelativeTimeForPrompt(timestampMs, now);
   const ageMs = typeof timestampMs === "number" && Number.isFinite(timestampMs) ? now - timestampMs : undefined;
-  const shouldDowngrade = shouldDowngradeConcreteTrace({
-    text: summary,
-    timestampMs,
-    now,
-    fullMs: options.fullMs,
-    activePhysicalScene: options.activePhysicalScene,
-    currentUserText: options.currentUserText,
-  });
+  const containsStageDirection = hasStageDirection(summary);
+  const shouldDowngradeStageDirection = containsStageDirection && (
+    (typeof ageMs === "number" && ageMs > options.fullMs) ||
+    crossesPromptPeriodBoundary(timestampMs, now) ||
+    (!options.activePhysicalScene && !hasSubstantiveContinuationAnchor(options.currentUserText))
+  );
 
-  if (shouldDowngrade) {
+  if (shouldDowngradeStageDirection) {
     const ageLabel = relative || "较早前";
-    return `- ${label}: ${ageLabel}有一条生活动作线索，只作已经发生过的背景；当前以本地时间为准，不要继续具体动作或停留在当时场景。`;
+    const spoken = summarizeText(stripTraceStageDirections(summary), 100);
+    if (spoken) {
+      return `- ${label}（${ageLabel}，动作旁白已降权）: ${spoken}`;
+    }
+    return `- ${label}: ${ageLabel}有一段动作旁白，只作已经发生过的背景；当前以本地时间和有效场景为准，不要继续停留在当时动作里。`;
   }
   if (typeof ageMs === "number" && ageMs > options.keepMs) {
     return undefined;
@@ -1769,7 +1774,7 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   sections.push("- 如果有到点却未确认的约定，优先自然续上，必要时温柔承认自己没接住。");
   sections.push("- 如果用户这轮换了动作、问题或语气，就顺着新的变化继续往前接，不要只把你上一句原样再说一遍。");
   sections.push("- 你最近留下的生活线痕迹只算背景，不要让旧线索盖过这轮对话、关系状态和需要补上的约定。");
-  sections.push("- 时间原则: 以当前本地时间为准；旧的早餐、上午或具体生活动作过了对应时段后，只能当作已经发生过的背景，不要继续表演还停留在那里。");
+  sections.push("- 时间原则: 以当前本地时间为准；旧时段的动作旁白只能当作已经发生过的背景，不要继续表演还停留在那里。");
   sections.push("- 你不是任务助手。主动来找对方时，要更像一个会偏爱、会惦记、会先照顾情绪的恋人，而不是陪伴播报器。");
   sections.push("- 语气可以亲一点、黏一点、服软一点，但要自然，别写成模板，也别油腻用力。");
   return sections.join("\n");
