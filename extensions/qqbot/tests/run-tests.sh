@@ -27,5 +27,6 @@ node tests/asuka-scheduling.test.mjs
 node tests/asuka-repair.test.mjs
 node tests/asuka-runtime.test.mjs
 node tests/asuka-time-context.test.mjs
+node tests/gateway-prompt-order.test.mjs
 node tests/message-buffer.test.mjs
 node tests/ref-index-store.test.mjs
