@@ -50,7 +50,7 @@ const MAX_SELFIE_RECENT_CONTEXT_CHARS = 640;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_CHAT_CONTEXT_DAYS = 7;
 const MAX_CHAT_RECENT_ENTRY_CHARS = 500;
-const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 300_000;
+const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 40_000;
 const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 2_000;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
 const MAX_SELFIE_PROMPT_CHARS = 1400;
@@ -1849,21 +1849,27 @@ ${ttsHint}${sttHint}`;
         const dynamicContextSections = [`【会话上下文】
 - 用户: ${event.senderName || "未知"} (${event.senderId})
 - 场景: ${isGroupChat ? "群聊" : "私聊"}${isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
-- 投递目标: ${qualifiedTarget}${receivedMediaSection}${voiceAsrSection}
-- 当前本地时间: ${currentLocalTime}
+- 投递目标: ${qualifiedTarget}
 - 定时提醒投递地址: channel=qqbot, to=${qualifiedTarget}
 `];
+        if (recentChatTranscript) {
+          dynamicContextSections.push(`【最近一周对话】\n${recentChatTranscript}`);
+        }
+        if (dynamicPromptSections.length > 0) {
+          dynamicContextSections.push(dynamicPromptSections.join("\n"));
+        }
+
+        const currentTurnContext = [
+          `- 当前本地时间: ${currentLocalTime}`,
+          receivedMediaSection.trim() ? `- 本轮媒体附件:\n${receivedMediaSection.trim()}` : "",
+          voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
+        ].filter(Boolean).join("\n");
+        dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
         if (hasAsrReferFallback) {
           dynamicContextSections.push("【语音 ASR 兜底】\n本条消息包含平台返回的 asr_refer_text 兜底文本（低置信度）。理解用户意图时可参考，但如关键信息不明确应先追问确认。");
         }
         if (uniqueVoicePaths.length > 0 || uniqueVoiceUrls.length > 0) {
           dynamicContextSections.push("【语音附件处理】\n本条消息已附带语音文件路径/URL。若你具备 STT 能力（框架能力或 STT skill），优先直接转写音频；若无 STT 能力或转写失败，再使用 asr_refer_text（若存在）作为兜底。");
-        }
-        if (dynamicPromptSections.length > 0) {
-          dynamicContextSections.push(dynamicPromptSections.join("\n"));
-        }
-        if (recentChatTranscript) {
-          dynamicContextSections.push(`【最近一周对话】\n${recentChatTranscript}`);
         }
 
         // 引用消息上下文
