@@ -61,7 +61,7 @@ Add to `~/.openclaw/openclaw.json`:
         "env": {
           "STUDIO_API_KEY": "your_studio_key_here",
           "STUDIO_API_BASE_URL": "https://api.awnjkankwik.asia/studio/v1",
-          "STUDIO_IMAGE_MODEL": "third_party_media:gpt-image-2",
+          "STUDIO_IMAGE_MODEL": "third_party_media:gemini-3-pro-image-preview",
           "OPENCLAW_PROFILE": "asuka"
         }
       }

@@ -44,7 +44,7 @@ Create or keep `openclaw.json` locally with the required values, including:
 
 - `STUDIO_API_KEY`
 - `STUDIO_API_BASE_URL=https://api.awnjkankwik.asia/studio/v1`
-- `STUDIO_IMAGE_MODEL=third_party_media:gpt-image-2`
+- `STUDIO_IMAGE_MODEL=third_party_media:gemini-3-pro-image-preview`
 - QQ bot `appId` / `clientSecret`
 - local gateway settings
 

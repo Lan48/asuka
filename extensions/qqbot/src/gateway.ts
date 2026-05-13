@@ -2127,7 +2127,7 @@ ${ttsHint}${sttHint}`;
           const skillEnv = skillCfg?.env || {};
           const apiKey = String(skillCfg?.apiKey || skillEnv.STUDIO_API_KEY || skillEnv.DASHSCOPE_API_KEY || "").trim();
           const baseUrl = String(skillEnv.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim();
-          const modelId = String(skillEnv.STUDIO_IMAGE_EDIT_MODEL || skillEnv.STUDIO_IMAGE_MODEL || skillEnv.STUDIO_MODEL || skillEnv.DASHSCOPE_MODEL || "third_party_media:gpt-image-2").trim();
+          const modelId = String(skillEnv.STUDIO_IMAGE_EDIT_MODEL || skillEnv.STUDIO_IMAGE_MODEL || skillEnv.STUDIO_MODEL || skillEnv.DASHSCOPE_MODEL || "third_party_media:gemini-3-pro-image-preview").trim();
           const quality = String(skillEnv.STUDIO_IMAGE_QUALITY || "standard").trim();
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 

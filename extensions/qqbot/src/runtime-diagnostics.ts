@@ -240,7 +240,7 @@ function summarizeMediaReadiness(
     || env.STUDIO_MODEL
     || skillEnv.DASHSCOPE_MODEL
     || env.DASHSCOPE_MODEL
-    || "third_party_media:gpt-image-2"
+    || "third_party_media:gemini-3-pro-image-preview"
   ).trim();
   return {
     selfieScript: summarizeFile(selfieScriptPath),
@@ -250,7 +250,7 @@ function summarizeMediaReadiness(
       || hasConfiguredSecret(env.STUDIO_API_KEY)
       || hasConfiguredSecret(skillEnv.DASHSCOPE_API_KEY)
       || hasConfiguredSecret(env.DASHSCOPE_API_KEY),
-    studioModel: model || "third_party_media:gpt-image-2",
+    studioModel: model || "third_party_media:gemini-3-pro-image-preview",
   };
 }
 
