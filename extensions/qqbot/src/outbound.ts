@@ -52,9 +52,9 @@ interface MessageReplyRecord {
 
 const messageReplyTracker = new Map<string, MessageReplyRecord>();
 const execFileAsync = promisify(execFile);
-const INTERNAL_DELIVERY_LEAK_RE = /(任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey)/i;
+const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
 const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
-const DEBUG_PROBE_TEXT_RE = /^(?:test\d*|\.)$/i;
+const DEBUG_PROBE_TEXT_RE = /^(?:test(?:\s+again|\d*)?|\.)$/i;
 let openClawConfigCache: any | undefined;
 let asukaVisualIdentityAnchorCache: string | undefined;
 type DecodedCronPayload = NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>;
@@ -632,7 +632,7 @@ function parseTarget(to: string): { type: "c2c" | "group" | "channel"; id: strin
   return { type: "c2c", id };
 }
 
-function looksLikeInternalDeliveryLeak(text: string): boolean {
+export function looksLikeInternalDeliveryLeak(text: string): boolean {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   return INTERNAL_DELIVERY_LEAK_RE.test(cleaned);
@@ -1988,6 +1988,22 @@ export async function sendProactiveMessage(
   text: string
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
+
+  const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
+  if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!cronProbe.isCronPayload && looksLikeDebugProbeText(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed debug probe text: ${text.slice(0, 80)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!cronProbe.isCronPayload && looksLikeBareEncodedPayloadLeak(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed bare encoded payload leak: ${text.slice(0, 80)}`);
+    return { channel: "qqbot" };
+  }
   
   if (!account.appId || !account.clientSecret) {
     const errorMsg = "QQBot not configured (missing appId or clientSecret)";

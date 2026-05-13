@@ -8,6 +8,7 @@ process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
 const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages } = await import("../dist/src/gateway.js");
+const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
 
 const first = {
   type: "c2c",
@@ -70,5 +71,17 @@ assert.equal(
   true,
   "valid payloads should not hide actual internal-process wording in visible text",
 );
+
+for (const leakedOutboundText of [
+  'Reasoning:\n_The user is reacting with "?" to my previous silent acknowledgement._',
+  "⏳ 已收到，正在处理中…",
+  "I need to exec to write a file",
+]) {
+  assert.equal(
+    looksLikeInternalDeliveryLeak(leakedOutboundText),
+    true,
+    `outbound should suppress internal leak text: ${leakedOutboundText.slice(0, 40)}`,
+  );
+}
 
 console.log("message-buffer tests passed");

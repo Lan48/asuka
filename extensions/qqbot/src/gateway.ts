@@ -3501,7 +3501,7 @@ ${ttsHint}${sttHint}`;
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
-              await sendErrorMessage("⏳ 已收到，正在处理中…");
+              log?.info(`[qqbot:${account.accountId}] Timeout fallback kept silent to avoid leaking processing status`);
             }
           } finally {
             // 清理 tool-only 兜底定时器
