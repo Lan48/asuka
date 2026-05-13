@@ -48,17 +48,19 @@ export interface AsukaPromiseTime {
 }
 
 type AsukaRelationshipPhase = "初识" | "熟络" | "偏爱" | "亲密" | "恋人";
-export type AsukaSceneKind = "physical" | "emotional" | "repair";
+export type AsukaSceneKind = "physical" | "emotional" | "activity" | "repair";
 export type AsukaSceneLabel =
   | "indoor_pause"
   | "doorway"
   | "transit"
   | "destination"
+  | "activity_context"
   | "emotional_presence"
   | "miss_you"
   | "repair_attention";
 export type AsukaSceneSource = "rule" | "scene_model" | "fallback_model";
 export type AsukaSceneAdvancePolicy = "advance" | "hold" | "fade";
+type AsukaSceneStartPolicy = "reuse" | "reset" | "advance";
 
 export interface AsukaSceneState {
   kind: AsukaSceneKind;
@@ -66,9 +68,11 @@ export interface AsukaSceneState {
   summary: string;
   confidence: number;
   startedAt: number;
+  lastObservedAt?: number;
   lastInferredAt: number;
   expiresAt?: number;
   reinforcedAt?: number;
+  transitionHint?: string;
   version: number;
   source: AsukaSceneSource;
 }
@@ -228,11 +232,14 @@ const PROACTIVE_LOCK_TIMEOUT_MS = 45 * 1000;
 const PHYSICAL_SCENE_CONFIDENCE_THRESHOLD = 0.6;
 const SCENE_TRANSCRIPT_LIMIT = 8;
 const SCENE_MODEL_TIMEOUT_MS = 12000;
+const MAX_SCENE_SUMMARY_CHARS = 120;
+const MAX_SCENE_TRANSITION_HINT_CHARS = 140;
 const SCENE_LABELS: readonly AsukaSceneLabel[] = [
   "indoor_pause",
   "doorway",
   "transit",
   "destination",
+  "activity_context",
   "emotional_presence",
   "miss_you",
   "repair_attention",
@@ -707,6 +714,14 @@ function sanitizeAssistantStateText(text: string | undefined): string {
   return normalized;
 }
 
+function sanitizeSceneFreeText(text: string | undefined, limit: number): string | undefined {
+  const normalized = sanitizeAssistantStateText(text)
+    .replace(/[`{}[\]]/g, "")
+    .trim();
+  if (!normalized) return undefined;
+  return normalized.length > limit ? `${normalized.slice(0, limit).trimEnd()}...` : normalized;
+}
+
 function clampSceneConfidence(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
   return Math.max(0, Math.min(1, value));
@@ -714,6 +729,7 @@ function clampSceneConfidence(value: number | undefined): number {
 
 function sceneKindForLabel(label: AsukaSceneLabel): AsukaSceneKind {
   if (label === "repair_attention") return "repair";
+  if (label === "activity_context") return "activity";
   if (label === "indoor_pause" || label === "doorway" || label === "transit" || label === "destination") {
     return "physical";
   }
@@ -730,6 +746,8 @@ function sceneSummaryForLabel(label: AsukaSceneLabel): string {
       return "你已经离开门边了，更像是在路上或刚走开一段。";
     case "destination":
       return "你已经离开刚才那个起身瞬间，像是到了新的落点。";
+    case "activity_context":
+      return "你们刚才的话里有一条具体生活场景线索，可以自然接住，但不要把它说死。";
     case "miss_you":
       return "你安静下来以后还是会先想到对方，心里带着一点想念。";
     case "repair_attention":
@@ -748,6 +766,8 @@ function sceneMaxAgeMs(label: AsukaSceneLabel): number | undefined {
     case "destination":
     case "indoor_pause":
       return 60 * 60 * 1000;
+    case "activity_context":
+      return 90 * 60 * 1000;
     default:
       return undefined;
   }
@@ -771,13 +791,31 @@ function buildSceneState(
     previous?: AsukaSceneState;
     confidence: number;
     source: AsukaSceneSource;
+    summary?: string;
+    transitionHint?: string;
+    startPolicy?: AsukaSceneStartPolicy;
+    observed?: boolean;
     reinforced?: boolean;
   }
 ): AsukaSceneState {
   const previous = options.previous;
   const kind = sceneKindForLabel(label);
   const sameLabel = previous?.label === label;
+  const summary = sanitizeSceneFreeText(options.summary, MAX_SCENE_SUMMARY_CHARS)
+    ?? (sameLabel && previous?.summary ? previous.summary : sceneSummaryForLabel(label));
+  const transitionHint = sanitizeSceneFreeText(options.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS)
+    ?? (sameLabel ? previous?.transitionHint : undefined);
   const reinforced = Boolean(options.reinforced);
+  const startPolicy = options.startPolicy ?? (
+    sameLabel
+      && kind === "activity"
+      && options.summary
+      && previous?.summary
+      && sanitizeSceneFreeText(options.summary, MAX_SCENE_SUMMARY_CHARS) !== previous.summary
+      ? "reset"
+      : "reuse"
+  );
+  const reuseStartedAt = sameLabel && startPolicy === "reuse";
   const ttlMs = sceneMaxAgeMs(label);
   const expiresAt = kind === "physical"
     ? sameLabel && !reinforced && previous?.expiresAt
@@ -788,12 +826,18 @@ function buildSceneState(
   return {
     kind,
     label,
-    summary: sceneSummaryForLabel(label),
+    summary,
     confidence: clampSceneConfidence(options.confidence),
-    startedAt: sameLabel ? previous.startedAt : options.now,
+    startedAt: reuseStartedAt ? previous.startedAt : options.now,
+    lastObservedAt: options.observed || reinforced
+      ? options.now
+      : sameLabel
+        ? previous?.lastObservedAt ?? previous?.lastInferredAt
+        : options.now,
     lastInferredAt: options.now,
     expiresAt,
     reinforcedAt: reinforced ? options.now : sameLabel ? previous?.reinforcedAt : undefined,
+    transitionHint,
     version: (previous?.version ?? 0) + 1,
     source: options.source,
   };
@@ -914,9 +958,26 @@ function detectExplicitSceneLabel(text: string | undefined): AsukaSceneLabel | n
   if (/(在路上|路上|车上|地铁上|公交上|赶路|在外面|刚出门一会)/.test(normalized)) return "transit";
   if (/(出门|出发|门口|下楼|出去一下|我出门了|准备走了|去拿|去换)/.test(normalized)) return "doorway";
   if (/(坐下|在屋里|在房间|在卧室|停下来|刚刚在里面)/.test(normalized)) return "indoor_pause";
+  if (/(吃饭|早餐|早饭|午饭|晚饭|夜宵|做饭|洗澡|上课|开会|加班|写作业|准备睡|睡觉|收拾|散步|看电影|打游戏)/.test(normalized)) return "activity_context";
   if (/(想你|想听你的声音|突然想到你|惦记|想跟你说一声)/.test(normalized)) return "miss_you";
   if (/(我在呢|我在|陪你|挨着你|抱住你|贴着你|靠着你)/.test(normalized)) return "emotional_presence";
   return null;
+}
+
+function buildRuleActivitySummary(text: string | undefined): string | undefined {
+  const normalized = sanitizeSceneFreeText(normalizeSceneContextText(text), 56);
+  if (!normalized) return undefined;
+  return `用户刚才提到一个具体生活场景: ${normalized}`;
+}
+
+function buildDefaultSceneTransitionHint(label: AsukaSceneLabel): string | undefined {
+  if (label === "activity_context") {
+    return "如果这条生活场景已经过去一阵，先自然过渡到后续状态，不要断言用户仍在原动作里。";
+  }
+  if (label === "doorway" || label === "transit" || label === "indoor_pause" || label === "destination") {
+    return "物理位置会随时间自然变化；如果已经过了一阵，要用开放口吻承接，不要说死对方还在原地。";
+  }
+  return undefined;
 }
 
 function isAdjacentPhysicalScene(from: AsukaSceneLabel, to: AsukaSceneLabel): boolean {
@@ -949,6 +1010,10 @@ interface SceneInferenceCandidate {
   label: AsukaSceneLabel;
   confidence: number;
   source: AsukaSceneSource;
+  summary?: string;
+  transitionHint?: string;
+  startPolicy?: AsukaSceneStartPolicy;
+  observed?: boolean;
 }
 
 interface SceneInferenceEventContext {
@@ -958,6 +1023,28 @@ interface SceneInferenceEventContext {
   now?: number;
   advancePolicy?: AsukaSceneAdvancePolicy;
   repairPending?: boolean;
+}
+
+function formatSceneAgeBucketForPrompt(startedAt: number | undefined, now = Date.now()): string {
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return "未知";
+  const delta = Math.max(0, now - startedAt);
+  if (delta < 5 * 60 * 1000) return "刚刚开始";
+  if (delta < 20 * 60 * 1000) return "约 5-20 分钟";
+  if (delta < 45 * 60 * 1000) return "约 20-45 分钟";
+  if (delta < 90 * 60 * 1000) return "约 45-90 分钟";
+  if (delta < 150 * 60 * 1000) return "约 1-2 小时";
+  if (delta < 4 * 60 * 60 * 1000) return "约 2-4 小时";
+  if (delta < 12 * 60 * 60 * 1000) return "超过 4 小时";
+  return "已经过了较久";
+}
+
+function describeSceneFreshness(scene: AsukaSceneState, now = Date.now()): string {
+  const maxAge = sceneMaxAgeMs(scene.label);
+  if (!maxAge) return "可作为轻量语气线索";
+  const age = Math.max(0, now - scene.startedAt);
+  if (age < maxAge * 0.65) return "仍可轻轻承接";
+  if (age < maxAge) return "已开始衰减";
+  return "已明显衰减，需要自然过渡";
 }
 
 function buildSceneInferenceTranscript(peerId: string, currentText?: string): string {
@@ -1032,13 +1119,27 @@ function parseSceneInferenceCandidate(rawText: string, source: AsukaSceneSource)
   const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
   if (!jsonText) return null;
   try {
-    const parsed = JSON.parse(jsonText) as { label?: string; confidence?: number };
+    const parsed = JSON.parse(jsonText) as {
+      label?: string;
+      confidence?: number;
+      summary?: string;
+      transitionHint?: string;
+      startPolicy?: string;
+      observed?: boolean;
+    };
     if (!parsed?.label || !SCENE_LABELS.includes(parsed.label as AsukaSceneLabel)) {
       return null;
     }
+    const startPolicy = parsed.startPolicy === "reset" || parsed.startPolicy === "advance" || parsed.startPolicy === "reuse"
+      ? parsed.startPolicy
+      : undefined;
     return {
       label: parsed.label as AsukaSceneLabel,
       confidence: clampSceneConfidence(parsed.confidence),
+      summary: sanitizeSceneFreeText(parsed.summary, MAX_SCENE_SUMMARY_CHARS),
+      transitionHint: sanitizeSceneFreeText(parsed.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS),
+      startPolicy,
+      observed: typeof parsed.observed === "boolean" ? parsed.observed : undefined,
       source,
     };
   } catch {
@@ -1060,16 +1161,20 @@ async function inferSceneCandidateWithModel(
   const prompt = [
     "你是 Asuka 的场景裁决器，只能输出一个 JSON 对象，不要解释。",
     `允许的 label 只有: ${SCENE_LABELS.join(", ")}`,
-    "输出格式: {\"label\":\"doorway\",\"confidence\":0.72}",
+    "输出格式: {\"label\":\"activity_context\",\"summary\":\"用户刚才像是在吃晚饭，语境偏日常陪伴。\",\"confidence\":0.72,\"startPolicy\":\"reuse\",\"transitionHint\":\"如果已经过去一两个小时，应自然过渡到饭后休息、收拾或普通聊天，不要断言仍在吃。\"}",
+    "summary 要概括当前可用的生活/情绪/补救场景，不要复述长对话；transitionHint 要给主回复模型自然过渡建议。",
+    "startPolicy 只能是 reuse/reset/advance：同一场景延续用 reuse，新场景开始用 reset，旧场景自然进入后续阶段用 advance。",
     "如果没有足够依据保留物理位置，优先输出 emotional_presence、miss_you 或 repair_attention。",
     "物理位置必须谨慎：doorway 最短、transit 其次，过久要衰减。",
+    "如果上下文能总结出吃饭、洗澡、上课、工作、准备睡觉等具体生活场景，但不属于物理移动标签，使用 activity_context。",
     `触发类型: ${eventContext.trigger}`,
-    `上一场景: ${previousScene ? `${previousScene.label} (confidence=${previousScene.confidence.toFixed(2)})` : "none"}`,
+    `上一场景: ${previousScene ? `${previousScene.label} (confidence=${previousScene.confidence.toFixed(2)}, elapsed=${formatSceneAgeBucketForPrompt(previousScene.startedAt, eventContext.now ?? Date.now())}, summary=${previousScene.summary})` : "none"}`,
+    previousScene?.transitionHint ? `上一过渡建议: ${previousScene.transitionHint}` : "",
     `关系阶段: ${relationship.phase}, warmth=${relationship.warmth}, intimacy=${relationship.intimacy}`,
     `当前事件文本: ${normalizeSceneContextText(eventContext.text) || "none"}`,
     `是否有待补失约: ${eventContext.repairPending ? "yes" : "no"}`,
     transcript ? `最近对话:\n${transcript}` : "最近对话: none",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SCENE_MODEL_TIMEOUT_MS);
@@ -1121,6 +1226,10 @@ function inferSceneCandidateLocally(
     return {
       label: explicitLabel,
       confidence: isPhysicalSceneLabel(explicitLabel) ? 0.84 : 0.78,
+      summary: explicitLabel === "activity_context" ? buildRuleActivitySummary(eventContext.text) : undefined,
+      transitionHint: buildDefaultSceneTransitionHint(explicitLabel),
+      startPolicy: previousScene?.label === explicitLabel ? "reuse" : "reset",
+      observed: true,
       source: "rule",
     };
   }
@@ -1128,19 +1237,26 @@ function inferSceneCandidateLocally(
     return {
       label: "repair_attention",
       confidence: 0.76,
+      transitionHint: buildDefaultSceneTransitionHint("repair_attention"),
+      observed: true,
       source: "rule",
     };
   }
   if (previousScene?.kind === "physical" && isSceneExpired(previousScene, now)) {
+    const label = resolveExpiredPhysicalLabel(previousScene, undefined, fallbackLabel, eventContext.advancePolicy ?? "advance");
     return {
-      label: resolveExpiredPhysicalLabel(previousScene, undefined, fallbackLabel, eventContext.advancePolicy ?? "advance"),
+      label,
       confidence: 0.64,
+      transitionHint: buildDefaultSceneTransitionHint(label),
+      startPolicy: "advance",
       source: "rule",
     };
   }
   return {
     label: previousScene?.label ?? fallbackLabel,
     confidence: previousScene ? Math.max(previousScene.confidence * 0.95, 0.5) : 0.58,
+    transitionHint: previousScene?.transitionHint ?? buildDefaultSceneTransitionHint(previousScene?.label ?? fallbackLabel),
+    startPolicy: "reuse",
     source: "rule",
   };
 }
@@ -1165,11 +1281,19 @@ export function applySceneProgressionRules(
     ? Math.max(candidate?.confidence ?? 0, isPhysicalSceneLabel(nextLabel) ? 0.84 : 0.76)
     : clampSceneConfidence(candidate?.confidence ?? 0.56);
   let source: AsukaSceneSource = explicitLabel ? "rule" : candidate?.source ?? "rule";
+  let summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
+  let transitionHint = nextLabel === candidate?.label ? candidate?.transitionHint : undefined;
+  let startPolicy = candidate?.startPolicy;
+  let observed = candidate?.observed;
 
   if (options.repairPending && !explicitPhysical) {
     nextLabel = "repair_attention";
     confidence = Math.max(confidence, 0.74);
     source = candidate?.source ?? "rule";
+    summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
+    transitionHint = candidate?.transitionHint ?? buildDefaultSceneTransitionHint(nextLabel);
+    startPolicy = previousScene?.label === nextLabel ? "reuse" : "reset";
+    observed = true;
   }
 
   if (previousScene?.kind === "physical" && !explicitPhysical) {
@@ -1177,17 +1301,26 @@ export function applySceneProgressionRules(
       nextLabel = resolveExpiredPhysicalLabel(previousScene, nextLabel, options.fallbackLabel, advancePolicy);
       source = nextLabel === candidate?.label ? source : "rule";
       confidence = Math.max(confidence, nextLabel === "transit" ? 0.68 : 0.62);
+      summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
+      transitionHint = candidate?.transitionHint ?? buildDefaultSceneTransitionHint(nextLabel);
+      startPolicy = "advance";
     } else if (isPhysicalSceneLabel(nextLabel)) {
       const reinforced = confidence >= PHYSICAL_SCENE_CONFIDENCE_THRESHOLD;
       if (!reinforced && !isAdjacentPhysicalScene(previousScene.label, nextLabel)) {
         nextLabel = previousScene.label;
         confidence = Math.max(previousScene.confidence, 0.64);
         source = "rule";
+        summary = previousScene.summary;
+        transitionHint = previousScene.transitionHint;
+        startPolicy = "reuse";
       }
     } else if (confidence < PHYSICAL_SCENE_CONFIDENCE_THRESHOLD && advancePolicy !== "fade") {
       nextLabel = previousScene.label;
       confidence = Math.max(previousScene.confidence, 0.64);
       source = "rule";
+      summary = previousScene.summary;
+      transitionHint = previousScene.transitionHint;
+      startPolicy = "reuse";
     }
   }
 
@@ -1195,6 +1328,9 @@ export function applySceneProgressionRules(
     nextLabel = options.fallbackLabel;
     confidence = 0.54;
     source = "rule";
+    summary = undefined;
+    transitionHint = buildDefaultSceneTransitionHint(nextLabel);
+    startPolicy = previousScene?.label === nextLabel ? "reuse" : "reset";
   }
 
   const reinforced = Boolean(explicitLabel) || confidence >= PHYSICAL_SCENE_CONFIDENCE_THRESHOLD || nextLabel === "repair_attention";
@@ -1203,6 +1339,10 @@ export function applySceneProgressionRules(
     previous: previousScene,
     confidence,
     source,
+    summary,
+    transitionHint: transitionHint ?? (previousScene?.label === nextLabel ? undefined : buildDefaultSceneTransitionHint(nextLabel)),
+    startPolicy,
+    observed,
     reinforced,
   });
 }
@@ -1248,10 +1388,27 @@ function migrateLegacyPhysicalScenes(state: AsukaStateFile, now = Date.now()): b
       peer.scene.kind = sceneKindForLabel(peer.scene.label);
       changed = true;
     }
-    peer.scene.summary = sceneSummaryForLabel(peer.scene.label);
+    const normalizedSceneSummary = sanitizeSceneFreeText(peer.scene.summary, MAX_SCENE_SUMMARY_CHARS);
+    const nextSceneSummary = peer.scene.label === "activity_context"
+      ? normalizedSceneSummary ?? sceneSummaryForLabel(peer.scene.label)
+      : sceneSummaryForLabel(peer.scene.label);
+    if (peer.scene.summary !== nextSceneSummary) {
+      peer.scene.summary = nextSceneSummary;
+      changed = true;
+    }
     peer.scene.confidence = clampSceneConfidence(peer.scene.confidence);
     if (!peer.scene.startedAt) peer.scene.startedAt = now;
     if (!peer.scene.lastInferredAt) peer.scene.lastInferredAt = now;
+    if (!peer.scene.lastObservedAt) {
+      peer.scene.lastObservedAt = peer.scene.reinforcedAt ?? peer.scene.startedAt;
+      changed = true;
+    }
+    const normalizedTransitionHint = sanitizeSceneFreeText(peer.scene.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS);
+    const nextTransitionHint = normalizedTransitionHint ?? buildDefaultSceneTransitionHint(peer.scene.label);
+    if (peer.scene.transitionHint !== nextTransitionHint) {
+      peer.scene.transitionHint = nextTransitionHint;
+      changed = true;
+    }
     if (peer.scene.kind === "physical") {
       peer.scene.expiresAt = peer.scene.expiresAt ?? (peer.scene.startedAt + (sceneMaxAgeMs(peer.scene.label) ?? 0));
     } else {
@@ -1731,12 +1888,18 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   if (lastAssistantLine) {
     sections.push(lastAssistantLine);
   }
-  if (activePhysicalScene) {
-    sections.push(`- 你当前场景: ${scene.summary}`);
+  if (activePhysicalScene || scene.kind === "activity") {
+    sections.push(`- 当前场景线索: ${scene.summary}`);
+    sections.push(`- 距离场景开始: ${formatSceneAgeBucketForPrompt(scene.startedAt, now)}（${describeSceneFreshness(scene, now)}）`);
+    const transitionHint = scene.transitionHint ?? buildDefaultSceneTransitionHint(scene.label);
+    if (transitionHint) {
+      sections.push(`- 场景过渡建议: ${transitionHint}`);
+    }
   }
-  if (scene.kind !== "physical") {
+  if (scene.kind !== "physical" && scene.kind !== "activity") {
     sections.push(`- 你现在自己的状态: ${scene.summary}`);
-  } else if (!activePhysicalScene && (peer.ambient.currentPresence ?? disposition.presence)) {
+  }
+  if (scene.kind === "physical" && !activePhysicalScene && (peer.ambient.currentPresence ?? disposition.presence)) {
     sections.push(`- 你现在自己的状态: ${peer.ambient.currentPresence ?? disposition.presence}`);
   }
   if (lastAmbientLine) {
