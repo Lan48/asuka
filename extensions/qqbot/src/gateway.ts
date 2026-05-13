@@ -1,10 +1,8 @@
 import WebSocket from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs";
-import { promisify } from "node:util";
 import type { ResolvedQQBotAccount, WSPayload, C2CMessageEvent, GuildMessageEvent, GroupMessageEvent } from "./types.js";
 import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify, onMessageSent } from "./api.js";
 import { loadSession, saveSession, clearSession, type SessionState } from "./session-store.js";
@@ -29,7 +27,6 @@ import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 
-const execFileAsync = promisify(execFile);
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
@@ -43,6 +40,13 @@ type ReplyDeliverPayload = {
   isReasoning?: boolean;
   isCompactionNotice?: boolean;
 };
+
+interface StudioSelfieConfig {
+  apiKey: string;
+  baseUrl: string;
+  modelId: string;
+  quality: string;
+}
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
@@ -470,10 +474,6 @@ function rewriteInternalLeakReply(leakedText: string, userText: string, peerId: 
   return buildLeakRewriteFallback(userText, peerId);
 }
 
-function resolveAsukaSelfieScriptPath(): string {
-  return path.resolve(__dirname, "../../../skills/asuka-selfie/skill/scripts/asuka-selfie.sh");
-}
-
 function getSelfieFallbackImageCandidates(): string[] {
   const assetRoots = [
     path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
@@ -500,31 +500,84 @@ function getSelfieFallbackImageCandidates(): string[] {
   return candidates;
 }
 
-function buildImageDataUrlFromFile(imagePath: string): string {
+function getImageMimeType(imagePath: string): string {
   const ext = path.extname(imagePath).toLowerCase();
-  const mime =
-    ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
-    : ext === ".png" ? "image/png"
-    : ext === ".webp" ? "image/webp"
-    : "application/octet-stream";
-  const base64 = fs.readFileSync(imagePath).toString("base64");
-  return `data:${mime};base64,${base64}`;
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
 }
 
-function createSelfiePromptFile(prompt: string): string {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-selfie-"));
-  const promptFilePath = path.join(tempDir, "prompt.txt");
-  fs.writeFileSync(promptFilePath, prompt, "utf8");
-  return promptFilePath;
+function normalizeStudioImageSize(size?: string): string {
+  const raw = (size || "1024x1024").trim();
+  if (/^1k$/i.test(raw)) return "1024x1024";
+  if (/^2k$/i.test(raw)) return "2048x2048";
+  return raw;
 }
 
-function cleanupSelfiePromptFile(promptFilePath: string | null): void {
-  if (!promptFilePath) return;
-  try {
-    fs.rmSync(path.dirname(promptFilePath), { recursive: true, force: true });
-  } catch {
-    // Ignore cleanup failures for temp prompt files.
+function extractStudioImageUrl(response: any): string {
+  const data = Array.isArray(response?.data) ? response.data : [];
+  for (const item of data) {
+    if (item?.url && typeof item.url === "string") return item.url;
   }
+  const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
+  for (const url of resultUrls) {
+    if (typeof url === "string" && url) return url;
+  }
+  throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+async function generateStudioSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  if (!fs.existsSync(referenceImagePath)) {
+    throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  form.append("model", config.modelId);
+  form.append("prompt", prompt);
+  form.append("size", normalizeStudioImageSize(size));
+  form.append("n", "1");
+  form.append("quality", config.quality || "standard");
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
+}
+
+function buildImageDataUrlFromFile(imagePath: string): string {
+  const base64 = fs.readFileSync(imagePath).toString("base64");
+  return `data:${getImageMimeType(imagePath)};base64,${base64}`;
 }
 
 function resolveVisiblePayloadText(replyText: string, rawVisibleText: string): string {
@@ -2076,8 +2129,6 @@ ${ttsHint}${sttHint}`;
           const baseUrl = String(skillEnv.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim();
           const modelId = String(skillEnv.STUDIO_IMAGE_EDIT_MODEL || skillEnv.STUDIO_IMAGE_MODEL || skillEnv.STUDIO_MODEL || skillEnv.DASHSCOPE_MODEL || "third_party_media:gpt-image-2").trim();
           const quality = String(skillEnv.STUDIO_IMAGE_QUALITY || "standard").trim();
-          const profileName = String(skillEnv.OPENCLAW_PROFILE || "asuka").trim();
-          const scriptPath = resolveAsukaSelfieScriptPath();
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
@@ -2123,61 +2174,70 @@ ${ttsHint}${sttHint}`;
             return false;
           };
 
+          const sendGeneratedSelfieImage = async (imageUrl: string): Promise<boolean> => {
+            let sent = false;
+            await sendWithTokenRetry(async (token) => {
+              if (event.type === "c2c") {
+                await sendC2CImageMessage(token, event.senderId, imageUrl, event.messageId, trimmedCaption || undefined);
+                sent = true;
+                return;
+              }
+              if (event.type === "group" && event.groupOpenid) {
+                await sendGroupImageMessage(token, event.groupOpenid, imageUrl, event.messageId, trimmedCaption || undefined);
+                sent = true;
+                return;
+              }
+              log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: unsupported event type ${event.type}`);
+            });
+            return sent;
+          };
+
+          const generateAndSendSelfie = async (): Promise<boolean> => {
+            const referenceImagePath = getSelfieFallbackImageCandidates()[0];
+            if (!referenceImagePath) {
+              throw new Error("no bundled reference image found");
+            }
+            const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, baseUrl, modelId, quality }, referenceImagePath);
+            log?.info(`[qqbot:${account.accountId}] Studio selfie image generated for ${event.senderId}`);
+            return await sendGeneratedSelfieImage(imageUrl);
+          };
+
           if (!apiKey) {
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: STUDIO_API_KEY missing`);
             return await sendFallbackSelfieImage();
           }
 
-          if (!fs.existsSync(scriptPath)) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: script not found: ${scriptPath}`);
-            return await sendFallbackSelfieImage();
-          }
-
-          const target = `qqbot:c2c:${event.senderId}`;
-
           try {
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow triggered for ${event.senderId}`);
-            const promptFilePath = createSelfiePromptFile(prompt);
-            const args = ["--prompt-file", promptFilePath, target];
-            if (trimmedCaption) {
-              args.push(trimmedCaption);
-            }
-
-            const childEnv = {
-              ...process.env,
-              STUDIO_API_KEY: apiKey,
-              STUDIO_API_BASE_URL: baseUrl,
-              STUDIO_IMAGE_MODEL: modelId,
-              STUDIO_IMAGE_QUALITY: quality,
-              OPENCLAW_PROFILE: profileName,
-            };
-
             if (options?.background) {
-              const child = execFile(scriptPath, args, { env: childEnv }, async (err) => {
-                cleanupSelfiePromptFile(promptFilePath);
-                if (err) {
+              void (async () => {
+                try {
+                  const sent = await generateAndSendSelfie();
+                  if (!sent) {
+                    const sentFallback = await sendFallbackSelfieImage();
+                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+                  }
+                  log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
+                } catch (err) {
                   log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
                   try {
                     const sentFallback = await sendFallbackSelfieImage();
-                    if (!sentFallback) {
-                      await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
-                    }
+                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
                   } catch (sendErr) {
                     log?.error(`[qqbot:${account.accountId}] Failed to send selfie background error: ${sendErr}`);
                   }
-                  return;
                 }
-                log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
-              });
-              child.unref?.();
+              })();
               log?.info(`[qqbot:${account.accountId}] Direct selfie flow launched in background for ${event.senderId}`);
               return true;
             }
 
-            try {
-              await execFileAsync(scriptPath, args, { env: childEnv });
-            } finally {
-              cleanupSelfiePromptFile(promptFilePath);
+            const sent = await generateAndSendSelfie();
+            if (!sent) {
+              const sentFallback = await sendFallbackSelfieImage();
+              if (!sentFallback) {
+                await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+              }
             }
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
             return true;

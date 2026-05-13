@@ -2,10 +2,8 @@
  * QQ Bot 消息发送模块
  */
 
-import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "path";
-import { promisify } from "node:util";
 import type { ResolvedQQBotAccount } from "./types.js";
 import { decodeCronPayload } from "./utils/payload.js";
 import {
@@ -51,13 +49,18 @@ interface MessageReplyRecord {
 }
 
 const messageReplyTracker = new Map<string, MessageReplyRecord>();
-const execFileAsync = promisify(execFile);
 const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
 const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
 const DEBUG_PROBE_TEXT_RE = /^(?:test(?:\s+again|\d*)?|\.)$/i;
 let openClawConfigCache: any | undefined;
 let asukaVisualIdentityAnchorCache: string | undefined;
 type DecodedCronPayload = NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>;
+interface StudioSelfieConfig {
+  apiKey: string;
+  baseUrl: string;
+  modelId: string;
+  quality: string;
+}
 const PROACTIVE_SEND_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_SEND_LOCK_TIMEOUT_MS = 45 * 1000;
 const proactiveSendDedupTracker = new Map<string, number>();
@@ -941,7 +944,6 @@ function resolveSelfieSkillRuntimeConfig(): {
   baseUrl: string;
   modelId: string;
   quality: string;
-  profileName: string;
 } {
   const cfg = loadOpenClawConfig();
   const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
@@ -951,8 +953,97 @@ function resolveSelfieSkillRuntimeConfig(): {
     baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim(),
     modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "third_party_media:gpt-image-2").trim(),
     quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
-    profileName: String(env.OPENCLAW_PROFILE || process.env.OPENCLAW_PROFILE || "asuka").trim(),
   };
+}
+
+function getSelfiePrimaryReferenceImagePath(): string | null {
+  const roots = [
+    path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
+    path.resolve(__dirname, "../../../skills/asuka-selfie/assets"),
+  ];
+  const extensions = ["jpg", "jpeg", "png", "webp"];
+  for (const root of roots) {
+    for (const ext of extensions) {
+      const candidate = path.join(root, `1.${ext}`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function getImageMimeType(imagePath: string): string {
+  const ext = path.extname(imagePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
+}
+
+function normalizeStudioImageSize(size?: string): string {
+  const raw = (size || "1024x1024").trim();
+  if (/^1k$/i.test(raw)) return "1024x1024";
+  if (/^2k$/i.test(raw)) return "2048x2048";
+  return raw;
+}
+
+function extractStudioImageUrl(response: any): string {
+  const data = Array.isArray(response?.data) ? response.data : [];
+  for (const item of data) {
+    if (item?.url && typeof item.url === "string") return item.url;
+  }
+  const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
+  for (const url of resultUrls) {
+    if (typeof url === "string" && url) return url;
+  }
+  throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+async function generateStudioSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  if (!fs.existsSync(referenceImagePath)) {
+    throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  form.append("model", config.modelId);
+  form.append("prompt", prompt);
+  form.append("size", normalizeStudioImageSize(size));
+  form.append("n", "1");
+  form.append("quality", config.quality || "standard");
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
 }
 
 function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | null {
@@ -1416,37 +1507,29 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
-  const { apiKey, baseUrl, modelId, quality, profileName } = resolveSelfieSkillRuntimeConfig();
-  const scriptPath = path.resolve(__dirname, "../../../skills/asuka-selfie/skill/scripts/asuka-selfie.sh");
+  const { apiKey, baseUrl, modelId, quality } = resolveSelfieSkillRuntimeConfig();
 
   if (!apiKey) {
     return { channel: "qqbot", error: "selfie skill api key missing" };
   }
-  if (!fs.existsSync(scriptPath)) {
-    return { channel: "qqbot", error: `selfie script not found: ${scriptPath}` };
+  const referenceImagePath = getSelfiePrimaryReferenceImagePath();
+  if (!referenceImagePath) {
+    return { channel: "qqbot", error: "selfie reference image missing" };
   }
 
   const target = `qqbot:c2c:${payload.targetAddress}`;
   const prompt = buildCronSelfiePrompt(payload, captionOverride);
   const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content);
-  const args = [prompt, target];
-  if (caption) {
-    args.push(caption);
-  }
 
   try {
-    await execFileAsync(scriptPath, args, {
-      env: {
-        ...process.env,
-        STUDIO_API_KEY: apiKey,
-        STUDIO_API_BASE_URL: baseUrl,
-        STUDIO_IMAGE_MODEL: modelId,
-        STUDIO_IMAGE_QUALITY: quality,
-        OPENCLAW_PROFILE: profileName,
-      },
-      maxBuffer: 1024 * 1024,
+    const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, baseUrl, modelId, quality }, referenceImagePath);
+    return await sendMedia({
+      to: target,
+      text: caption,
+      replyToId: undefined,
+      account,
+      mediaUrl: imageUrl,
     });
-    return { channel: "qqbot" };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     return { channel: "qqbot", error: errorMessage };
