@@ -18,6 +18,12 @@ const DEFAULT_STUDIO_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
 const DEFAULT_MODEL = "third_party_media:gemini-3-pro-image-preview";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_QUALITY = "standard";
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+].join(" ");
 
 interface StudioMediaItem {
   url?: string;
@@ -63,6 +69,22 @@ interface Result {
 }
 
 function getBundledReferenceImagePath(): string | null {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH;
+  const identityCandidates = [
+    process.env.ASUKA_REFERENCE_IMAGE_PATH,
+    process.env.OPENCLAW_STATE_DIR ? path.resolve(process.env.OPENCLAW_STATE_DIR, "identity.jpg") : undefined,
+    configPath ? path.resolve(path.dirname(configPath), "identity.jpg") : undefined,
+    path.resolve(process.cwd(), "identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+    path.resolve(__dirname, "../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of identityCandidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
   const candidates = [
     path.resolve(__dirname, "../assets/1.jpg"),
     path.resolve(__dirname, "../assets/1.jpeg"),
@@ -83,6 +105,10 @@ function getBundledReferenceImagePath(): string | null {
   }
 
   return null;
+}
+
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
 }
 
 function getBundledExtraReferenceImagePaths(): string[] {
@@ -344,7 +370,7 @@ async function generateImageEdit(input: {
   const image = await resolveImagePart(referenceImages[0] || DEFAULT_REFERENCE_IMAGE);
   const form = new FormData();
   form.append("model", getModelId());
-  form.append("prompt", input.prompt);
+  form.append("prompt", buildStudioSelfiePrompt(input.prompt));
   form.append("size", normalizeStudioSize(input.size));
   form.append("n", "1");
   form.append("quality", getQuality());

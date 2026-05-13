@@ -61,6 +61,12 @@ interface StudioSelfieConfig {
   modelId: string;
   quality: string;
 }
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+].join(" ");
 const PROACTIVE_SEND_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_SEND_LOCK_TIMEOUT_MS = 45 * 1000;
 const proactiveSendDedupTracker = new Map<string, number>();
@@ -539,9 +545,29 @@ async function maybeSendRepairBeforeProactive(
 
   if (repair.selfiePrompt && payload.targetType === "c2c") {
     const repairResult = await runDirectSelfieFlowForCron(account, repairPayload, deliveredRepairText);
-    if (repairResult.error) {
-      console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${repairResult.error}`);
-      markPromiseDeliveryFailed(repair.promiseId, repairResult.error, Date.now(), { failureKind: "selfie" });
+    if (repairResult.error || repairResult.skipped) {
+      const failureReason = repairResult.error || repairResult.skipReason || "generated selfie send skipped";
+      console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${failureReason}`);
+      markPromiseDeliveryFailed(repair.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
+      const fallbackResult = await sendCronSelfieFallbackImage(account, repairPayload, deliveredRepairText, failureReason);
+      if (fallbackResult.skipped) {
+        markPromiseDeliveryFallback(repair.promiseId, {
+          state: "skipped",
+          skipReason: fallbackResult.skipReason ?? "duplicate",
+        });
+        console.warn(
+          `[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback skipped for promise=${repair.promiseId}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
+        );
+        return;
+      }
+      markPromiseDeliveryFallback(repair.promiseId, fallbackResult.error
+        ? { state: "failed", error: fallbackResult.error }
+        : { state: "sent" });
+      if (fallbackResult.error) {
+        console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback failed for promise=${repair.promiseId}: ${fallbackResult.error}`);
+      } else {
+        console.log(`[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback sent for promise=${repair.promiseId}`);
+      }
       return;
     }
   } else {
@@ -944,6 +970,7 @@ function resolveSelfieSkillRuntimeConfig(): {
   baseUrl: string;
   modelId: string;
   quality: string;
+  referenceImagePath: string;
 } {
   const cfg = loadOpenClawConfig();
   const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
@@ -953,10 +980,26 @@ function resolveSelfieSkillRuntimeConfig(): {
     baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim(),
     modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "third_party_media:gemini-3-pro-image-preview").trim(),
     quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
+    referenceImagePath: String(env.ASUKA_REFERENCE_IMAGE_PATH || process.env.ASUKA_REFERENCE_IMAGE_PATH || "").trim(),
   };
 }
 
-function getSelfiePrimaryReferenceImagePath(): string | null {
+function getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath?: string): string | null {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || resolveOpenClawStateDir();
+  const identityCandidates = [
+    configuredReferenceImagePath,
+    process.env.ASUKA_REFERENCE_IMAGE_PATH?.trim(),
+    stateDir ? path.join(stateDir, "identity.jpg") : "",
+    configPath ? path.join(path.dirname(configPath), "identity.jpg") : "",
+    path.resolve(__dirname, "../../../identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of identityCandidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
   const roots = [
     path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
     path.resolve(__dirname, "../../../skills/asuka-selfie/assets"),
@@ -986,6 +1029,10 @@ function normalizeStudioImageSize(size?: string): string {
   return raw;
 }
 
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
+}
+
 function extractStudioImageUrl(response: any): string {
   const data = Array.isArray(response?.data) ? response.data : [];
   for (const item of data) {
@@ -1011,7 +1058,7 @@ async function generateStudioSelfieImageUrl(
   const form = new FormData();
   const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
   form.append("model", config.modelId);
-  form.append("prompt", prompt);
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
   form.append("size", normalizeStudioImageSize(size));
   form.append("n", "1");
   form.append("quality", config.quality || "standard");
@@ -1493,7 +1540,7 @@ function buildCronSelfiePrompt(
   const visibleContent = sanitizeSelfieContextText(visibleTextOverride || payload.selfieCaption || payload.content);
   const recentContext = buildRecentConversationContext(peerId, visibleContent);
   return [
-    "保持 Asuka 参考脸一致，真实自然，生成符合当前约定的本人近照或自拍。",
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前约定的本人近照或自拍。`,
     loadAsukaVisualIdentityAnchor(),
     recentContext ? `最近对话摘要：${recentContext}。` : "",
     visibleContent ? `这次要兑现给用户的内容是：${visibleContent}。` : "",
@@ -1507,12 +1554,12 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
-  const { apiKey, baseUrl, modelId, quality } = resolveSelfieSkillRuntimeConfig();
+  const { apiKey, baseUrl, modelId, quality, referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
 
   if (!apiKey) {
     return { channel: "qqbot", error: "selfie skill api key missing" };
   }
-  const referenceImagePath = getSelfiePrimaryReferenceImagePath();
+  const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
   if (!referenceImagePath) {
     return { channel: "qqbot", error: "selfie reference image missing" };
   }
@@ -1523,17 +1570,53 @@ async function runDirectSelfieFlowForCron(
 
   try {
     const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, baseUrl, modelId, quality }, referenceImagePath);
-    return await sendMedia({
+    console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image for target=${payload.targetAddress}`);
+    const result = await sendMedia({
       to: target,
       text: caption,
       replyToId: undefined,
       account,
       mediaUrl: imageUrl,
     });
+    if (result.error) {
+      console.warn(`[qqbot] runDirectSelfieFlowForCron: generated selfie image was not sent for target=${payload.targetAddress}: ${result.error}`);
+    }
+    if (result.skipped) {
+      console.warn(`[qqbot] runDirectSelfieFlowForCron: generated selfie image send skipped for target=${payload.targetAddress}: ${result.skipReason ?? "unknown"}`);
+    }
+    return result;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     return { channel: "qqbot", error: errorMessage };
   }
+}
+
+async function sendCronSelfieFallbackImage(
+  account: ResolvedQQBotAccount,
+  payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
+  captionOverride?: string,
+  reason?: string,
+): Promise<OutboundResult> {
+  const { referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
+  const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
+  if (!referenceImagePath) {
+    return { channel: "qqbot", error: "selfie fallback reference image missing" };
+  }
+
+  const target = `qqbot:c2c:${payload.targetAddress}`;
+  const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content)
+    || "这次先给你看一张我现成的。";
+  console.warn(
+    `[qqbot] sendCronSelfieFallbackImage: sending identity fallback image for target=${payload.targetAddress}`
+      + (reason ? `, reason=${reason}` : "")
+  );
+  return await sendMedia({
+    to: target,
+    text: caption,
+    replyToId: undefined,
+    account,
+    mediaUrl: referenceImagePath,
+  });
 }
 
 /**
@@ -2802,12 +2885,13 @@ export async function sendCronMessage(
       if (payload.selfiePrompt && payload.targetType === "c2c") {
         console.log(`[${timestamp}] [qqbot] sendCronMessage: fulfilling selfie promise directly for target=${payload.targetAddress}`);
         const result = await runDirectSelfieFlowForCron(account, payload, deliveryText);
-        if (result.error) {
-          console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${result.error}`);
+        if (result.error || result.skipped) {
+          const failureReason = result.error || result.skipReason || "generated selfie send skipped";
+          console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${failureReason}`);
           if (payload.promiseId) {
-            markPromiseDeliveryFailed(payload.promiseId, result.error, Date.now(), { failureKind: "selfie" });
+            markPromiseDeliveryFailed(payload.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
           }
-          const fallbackResult = await sendProactiveMessage(account, targetTo, "这张照片刚刚没有顺利送到你面前。我不想拿别的东西敷衍你，等我重新整理好再带给你。");
+          const fallbackResult = await sendCronSelfieFallbackImage(account, payload, deliveryText, failureReason);
           if (fallbackResult.skipped) {
             if (payload.promiseId) {
               markPromiseDeliveryFallback(payload.promiseId, {
@@ -2816,7 +2900,7 @@ export async function sendCronMessage(
               });
             }
             console.log(
-              `[${timestamp}] [qqbot] sendCronMessage: selfie fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
+              `[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
             );
             return fallbackResult;
           }
@@ -2825,7 +2909,12 @@ export async function sendCronMessage(
               ? { state: "failed", error: fallbackResult.error }
               : { state: "sent" });
           }
-          return fallbackResult.error ? result : fallbackResult;
+          if (fallbackResult.error) {
+            console.error(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback failed for target=${payload.targetAddress}, error=${fallbackResult.error}`);
+          } else {
+            console.log(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback sent for target=${payload.targetAddress}`);
+          }
+          return fallbackResult;
         }
         if (payload.promiseId) {
           markPromiseDelivered(payload.promiseId, {

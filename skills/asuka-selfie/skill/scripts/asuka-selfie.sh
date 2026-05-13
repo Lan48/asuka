@@ -71,6 +71,7 @@ STUDIO_API_BASE_URL="${STUDIO_API_BASE_URL:-https://api.awnjkankwik.asia/studio/
 STUDIO_API_BASE_URL="${STUDIO_API_BASE_URL%/}"
 STUDIO_IMAGE_MODEL="${STUDIO_IMAGE_EDIT_MODEL:-${STUDIO_IMAGE_MODEL:-${STUDIO_MODEL:-${DASHSCOPE_MODEL:-third_party_media:gemini-3-pro-image-preview}}}}"
 STUDIO_IMAGE_QUALITY="${STUDIO_IMAGE_QUALITY:-standard}"
+SELFIE_IDENTITY_LOCK_PROMPT="必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REFERENCE_IMAGE_PATH="${ASUKA_REFERENCE_IMAGE_PATH:-}"
 if [ -z "$REFERENCE_IMAGE_PATH" ]; then
@@ -86,6 +87,11 @@ EXTRA_REFERENCE_IMAGE_URLS="${ASUKA_EXTRA_REFERENCE_IMAGE_URLS:-}"
 
 find_bundled_reference() {
     for candidate in \
+        "${OPENCLAW_STATE_DIR:-}/identity.jpg" \
+        "$(dirname "${OPENCLAW_CONFIG_PATH:-/}")/identity.jpg" \
+        "$PWD/identity.jpg" \
+        "$SCRIPT_DIR/../../../../identity.jpg" \
+        "$SCRIPT_DIR/../../../identity.jpg" \
         "$SCRIPT_DIR/../assets/1.jpg" \
         "$SCRIPT_DIR/../assets/1.jpeg" \
         "$SCRIPT_DIR/../assets/1.png" \
@@ -199,6 +205,16 @@ if [ -z "$PROMPT_FILE" ] || [ -z "$CHANNEL" ]; then
     echo "  $0 \"给她加一顶牛仔帽，镜子自拍，真实自然\" \"qqbot:c2c:12345\""
     exit 1
 fi
+
+if [ -z "$TEMP_PROMPT_DIR" ]; then
+    TEMP_PROMPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/asuka-selfie.XXXXXX")"
+fi
+IDENTITY_PROMPT_FILE="$TEMP_PROMPT_DIR/prompt.identity.txt"
+{
+    printf '%s\n\n' "$SELFIE_IDENTITY_LOCK_PROMPT"
+    cat "$PROMPT_FILE"
+} > "$IDENTITY_PROMPT_FILE"
+PROMPT_FILE="$IDENTITY_PROMPT_FILE"
 
 PROMPT_SIZE_BYTES="$(wc -c < "$PROMPT_FILE" | tr -d '[:space:]')"
 PROMPT_PREVIEW="$(tr '\r\n\t' '   ' < "$PROMPT_FILE" | tr -s ' ' | cut -c 1-160)"

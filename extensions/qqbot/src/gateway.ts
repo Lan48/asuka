@@ -47,6 +47,12 @@ interface StudioSelfieConfig {
   modelId: string;
   quality: string;
 }
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+].join(" ");
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
@@ -338,7 +344,7 @@ function buildDirectSelfiePromptFromContext(userText: string, assistantText: str
   ].filter(Boolean);
   const contextClause = contextParts.length > 0 ? `${contextParts.join("。")}。请优先延续这个语境里的场景、动作、地点、穿着或正在做的事情。` : "";
   return truncateForSelfiePrompt(
-    `保持 Asuka 参考脸一致，真实自然，生成符合当前对话语境的本人画面。${contextClause}用户当前要求：${cleanedUser}`,
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境的本人画面。${contextClause}用户当前要求：${cleanedUser}`,
     MAX_SELFIE_PROMPT_CHARS,
   );
 }
@@ -474,24 +480,49 @@ function rewriteInternalLeakReply(leakedText: string, userText: string, peerId: 
   return buildLeakRewriteFallback(userText, peerId);
 }
 
-function getSelfieFallbackImageCandidates(): string[] {
+function getSelfieIdentityReferenceImagePath(configuredReferenceImagePath?: unknown): string | null {
+  const explicitPath = typeof configuredReferenceImagePath === "string"
+    ? configuredReferenceImagePath.trim()
+    : "";
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  const stateDir = resolveOpenClawStateDir();
+  const candidates = [
+    explicitPath,
+    process.env.ASUKA_REFERENCE_IMAGE_PATH?.trim(),
+    stateDir ? path.join(stateDir, "identity.jpg") : "",
+    configPath ? path.join(path.dirname(configPath), "identity.jpg") : "",
+    path.resolve(__dirname, "../../../identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function getSelfieFallbackImageCandidates(configuredReferenceImagePath?: unknown): string[] {
   const assetRoots = [
     path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
     path.resolve(__dirname, "../../../skills/asuka-selfie/assets"),
   ];
   const extensions = ["jpg", "jpeg", "png", "webp"];
   const candidates: string[] = [];
+  const identityReference = getSelfieIdentityReferenceImagePath(configuredReferenceImagePath);
+  if (identityReference) {
+    candidates.push(identityReference);
+  }
 
   for (const index of [1, 2, 3, 4]) {
     for (const root of assetRoots) {
       for (const ext of extensions) {
         const candidate = path.join(root, `${index}.${ext}`);
-        if (fs.existsSync(candidate)) {
+        if (fs.existsSync(candidate) && !candidates.includes(candidate)) {
           candidates.push(candidate);
           break;
         }
       }
-      if (candidates.length === index) {
+      if (candidates.length >= index + (identityReference ? 1 : 0)) {
         break;
       }
     }
@@ -513,6 +544,10 @@ function normalizeStudioImageSize(size?: string): string {
   if (/^1k$/i.test(raw)) return "1024x1024";
   if (/^2k$/i.test(raw)) return "2048x2048";
   return raw;
+}
+
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
 }
 
 function extractStudioImageUrl(response: any): string {
@@ -540,7 +575,7 @@ async function generateStudioSelfieImageUrl(
   const form = new FormData();
   const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
   form.append("model", config.modelId);
-  form.append("prompt", prompt);
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
   form.append("size", normalizeStudioImageSize(size));
   form.append("n", "1");
   form.append("quality", config.quality || "standard");
@@ -2132,18 +2167,13 @@ ${ttsHint}${sttHint}`;
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
-            const candidates = getSelfieFallbackImageCandidates();
+            const candidates = getSelfieFallbackImageCandidates(skillEnv.ASUKA_REFERENCE_IMAGE_PATH);
             if (candidates.length === 0) {
               log?.info(`[qqbot:${account.accountId}] Selfie fallback skipped: no bundled images found`);
               return false;
             }
 
-            const shuffled = candidates
-              .map((imagePath) => ({ imagePath, sortKey: Math.random() }))
-              .sort((a, b) => a.sortKey - b.sortKey)
-              .map((item) => item.imagePath);
-
-            for (const imagePath of shuffled) {
+            for (const imagePath of candidates) {
               try {
                 const imageDataUrl = buildImageDataUrlFromFile(imagePath);
                 const fallbackCaption = trimmedCaption || "这次先给你看一张我现成的。";
@@ -2178,11 +2208,13 @@ ${ttsHint}${sttHint}`;
             let sent = false;
             await sendWithTokenRetry(async (token) => {
               if (event.type === "c2c") {
+                log?.info(`[qqbot:${account.accountId}] Sending generated selfie image to ${event.senderId}: ${imageUrl.slice(0, 120)}`);
                 await sendC2CImageMessage(token, event.senderId, imageUrl, event.messageId, trimmedCaption || undefined);
                 sent = true;
                 return;
               }
               if (event.type === "group" && event.groupOpenid) {
+                log?.info(`[qqbot:${account.accountId}] Sending generated selfie image to group ${event.groupOpenid}: ${imageUrl.slice(0, 120)}`);
                 await sendGroupImageMessage(token, event.groupOpenid, imageUrl, event.messageId, trimmedCaption || undefined);
                 sent = true;
                 return;
@@ -2193,7 +2225,7 @@ ${ttsHint}${sttHint}`;
           };
 
           const generateAndSendSelfie = async (): Promise<boolean> => {
-            const referenceImagePath = getSelfieFallbackImageCandidates()[0];
+            const referenceImagePath = getSelfieFallbackImageCandidates(skillEnv.ASUKA_REFERENCE_IMAGE_PATH)[0];
             if (!referenceImagePath) {
               throw new Error("no bundled reference image found");
             }
@@ -2214,6 +2246,7 @@ ${ttsHint}${sttHint}`;
                 try {
                   const sent = await generateAndSendSelfie();
                   if (!sent) {
+                    log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
                     const sentFallback = await sendFallbackSelfieImage();
                     if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
                   }
@@ -2221,6 +2254,7 @@ ${ttsHint}${sttHint}`;
                 } catch (err) {
                   log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
                   try {
+                    log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
                     const sentFallback = await sendFallbackSelfieImage();
                     if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
                   } catch (sendErr) {
@@ -2234,6 +2268,7 @@ ${ttsHint}${sttHint}`;
 
             const sent = await generateAndSendSelfie();
             if (!sent) {
+              log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
               const sentFallback = await sendFallbackSelfieImage();
               if (!sentFallback) {
                 await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
@@ -2243,6 +2278,7 @@ ${ttsHint}${sttHint}`;
             return true;
           } catch (err) {
             log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
+            log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
             const sentFallback = await sendFallbackSelfieImage();
             if (!sentFallback) {
               await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
@@ -3255,7 +3291,7 @@ ${ttsHint}${sttHint}`;
                     }
                   }
                 }
-                
+
                 // ============ 非结构化消息：简化处理 ============
                 // 📝 设计原则：JSON payload (QQBOT_PAYLOAD) 是发送本地图片的唯一方式
                 // 非结构化消息只处理：公网 URL (http/https) 和 Base64 Data URL
