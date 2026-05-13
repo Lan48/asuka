@@ -348,8 +348,18 @@ function extractSelfieCaptionFromAssistantText(text: string): string {
   return truncateForSelfiePrompt(cleaned, MAX_SELFIE_CAPTION_CHARS);
 }
 
-function looksLikeInternalProcessLeak(text: string): boolean {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+function extractVisibleTextForLeakInspection(text: string): string {
+  if (!hasStructuredPayloadPrefix(text)) return text;
+  const payloadResult = parseQQBotPayload(text);
+  if (!payloadResult.isPayload || payloadResult.error || !payloadResult.payload) return text;
+  return [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+}
+
+export function looksLikeInternalProcessLeak(text: string): boolean {
+  const cleaned = extractVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   if (INTERNAL_PROCESS_LEAK_RE.test(cleaned)) return true;
   if (cleaned.includes("/Users/") || cleaned.includes("openclaw-asuka/skills/")) return true;

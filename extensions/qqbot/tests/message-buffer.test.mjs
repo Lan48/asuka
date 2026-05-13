@@ -7,7 +7,7 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-message-buffer-test
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
-const { mergeBufferedQueuedMessages } = await import("../dist/src/gateway.js");
+const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages } = await import("../dist/src/gateway.js");
 
 const first = {
   type: "c2c",
@@ -45,6 +45,30 @@ assert.throws(
   () => mergeBufferedQueuedMessages([]),
   /empty message buffer/,
   "empty buffers should be rejected",
+);
+
+const selfieReply = `QQBOT_PAYLOAD: {"type":"selfie","caption":"被太阳抓到了……"}
+
+（眯着眼睛，拿手挡了一下从窗帘缝钻进来的光线）
+
+……哪有晒屁股……明明离窗边还有半米远。你就是想叫我起床吧。`;
+
+assert.equal(
+  looksLikeInternalProcessLeak(selfieReply),
+  false,
+  "valid QQBOT_PAYLOAD with natural visible text should not be treated as an internal leak",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak('QQBOT_PAYLOAD: {"internal":true}'),
+  true,
+  "invalid payload artifacts should still be treated as internal leaks",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak('QQBOT_PAYLOAD: {"type":"selfie"}\n\n现在让我调用 API 发送图片。'),
+  true,
+  "valid payloads should not hide actual internal-process wording in visible text",
 );
 
 console.log("message-buffer tests passed");
