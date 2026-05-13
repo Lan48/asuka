@@ -211,7 +211,7 @@ async function checkPrerequisites() {
 async function getStudioApiKey(rl) {
   logStep("2/7", "Setting up Studio media API key...");
 
-  const STUDIO_BASE_URL = "https://www.cst9.com/studio/v1";
+  const STUDIO_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
 
   log(
     `\nTo generate images, you need a Studio media API key.`
@@ -293,8 +293,8 @@ async function updateOpenClawConfig(studioKey) {
           apiKey: studioKey,
           env: {
             STUDIO_API_KEY: studioKey,
-            STUDIO_API_BASE_URL: "https://www.cst9.com/studio/v1",
-            STUDIO_IMAGE_MODEL: "wan2.6-image",
+            STUDIO_API_BASE_URL: "https://api.awnjkankwik.asia/studio/v1",
+            STUDIO_IMAGE_MODEL: "third_party_media:gpt-image-2",
             OPENCLAW_PROFILE: "asuka",
           },
         },

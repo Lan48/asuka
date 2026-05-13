@@ -60,8 +60,8 @@ Add to `~/.openclaw/openclaw.json`:
         "enabled": true,
         "env": {
           "STUDIO_API_KEY": "your_studio_key_here",
-          "STUDIO_API_BASE_URL": "https://www.cst9.com/studio/v1",
-          "STUDIO_IMAGE_MODEL": "your-image-edit-model",
+          "STUDIO_API_BASE_URL": "https://api.awnjkankwik.asia/studio/v1",
+          "STUDIO_IMAGE_MODEL": "third_party_media:gpt-image-2",
           "OPENCLAW_PROFILE": "asuka"
         }
       }

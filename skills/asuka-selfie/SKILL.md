@@ -45,8 +45,8 @@ OPENCLAW_PROFILE=asuka
 Optional:
 
 ```bash
-STUDIO_API_BASE_URL=https://www.cst9.com/studio/v1
-STUDIO_IMAGE_MODEL=your-image-edit-model
+STUDIO_API_BASE_URL=https://api.awnjkankwik.asia/studio/v1
+STUDIO_IMAGE_MODEL=third_party_media:gpt-image-2
 STUDIO_IMAGE_QUALITY=standard
 OPENCLAW_GATEWAY_TOKEN=...
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:19001

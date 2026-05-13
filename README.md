@@ -43,8 +43,8 @@ machine-specific state.
 Create or keep `openclaw.json` locally with the required values, including:
 
 - `STUDIO_API_KEY`
-- `STUDIO_API_BASE_URL=https://www.cst9.com/studio/v1`
-- `STUDIO_IMAGE_MODEL=<image-edit-model>`
+- `STUDIO_API_BASE_URL=https://api.awnjkankwik.asia/studio/v1`
+- `STUDIO_IMAGE_MODEL=third_party_media:gpt-image-2`
 - QQ bot `appId` / `clientSecret`
 - local gateway settings
 

@@ -240,7 +240,7 @@ function summarizeMediaReadiness(
     || env.STUDIO_MODEL
     || skillEnv.DASHSCOPE_MODEL
     || env.DASHSCOPE_MODEL
-    || "wan2.6-image"
+    || "third_party_media:gpt-image-2"
   ).trim();
   return {
     selfieScript: summarizeFile(selfieScriptPath),
@@ -250,7 +250,7 @@ function summarizeMediaReadiness(
       || hasConfiguredSecret(env.STUDIO_API_KEY)
       || hasConfiguredSecret(skillEnv.DASHSCOPE_API_KEY)
       || hasConfiguredSecret(env.DASHSCOPE_API_KEY),
-    studioModel: model || "wan2.6-image",
+    studioModel: model || "third_party_media:gpt-image-2",
   };
 }
 

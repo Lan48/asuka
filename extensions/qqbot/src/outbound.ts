@@ -948,8 +948,8 @@ function resolveSelfieSkillRuntimeConfig(): {
   const env = skillCfg?.env || {};
   return {
     apiKey: String(skillCfg?.apiKey || env.STUDIO_API_KEY || process.env.STUDIO_API_KEY || env.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
-    baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://www.cst9.com/studio/v1").trim(),
-    modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "wan2.6-image").trim(),
+    baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim(),
+    modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "third_party_media:gpt-image-2").trim(),
     quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
     profileName: String(env.OPENCLAW_PROFILE || process.env.OPENCLAW_PROFILE || "asuka").trim(),
   };

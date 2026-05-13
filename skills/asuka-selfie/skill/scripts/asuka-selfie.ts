@@ -14,8 +14,8 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_REFERENCE_IMAGE =
   "https://cdn.jsdelivr.net/gh/SumeLabs/asuka@main/assets/asuka.png";
-const DEFAULT_STUDIO_BASE_URL = "https://www.cst9.com/studio/v1";
-const DEFAULT_MODEL = "wan2.6-image";
+const DEFAULT_STUDIO_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
+const DEFAULT_MODEL = "third_party_media:gpt-image-2";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_QUALITY = "standard";
 
