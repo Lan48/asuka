@@ -938,15 +938,20 @@ function resolveRecentTranscriptFromNormalSession(targetAddress: string): string
 
 function resolveSelfieSkillRuntimeConfig(): {
   apiKey: string;
+  baseUrl: string;
   modelId: string;
+  quality: string;
   profileName: string;
 } {
   const cfg = loadOpenClawConfig();
   const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
+  const env = skillCfg?.env || {};
   return {
-    apiKey: String(skillCfg?.apiKey || skillCfg?.env?.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
-    modelId: String(skillCfg?.env?.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "wan2.6-image").trim(),
-    profileName: String(skillCfg?.env?.OPENCLAW_PROFILE || process.env.OPENCLAW_PROFILE || "asuka").trim(),
+    apiKey: String(skillCfg?.apiKey || env.STUDIO_API_KEY || process.env.STUDIO_API_KEY || env.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
+    baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://www.cst9.com/studio/v1").trim(),
+    modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "wan2.6-image").trim(),
+    quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
+    profileName: String(env.OPENCLAW_PROFILE || process.env.OPENCLAW_PROFILE || "asuka").trim(),
   };
 }
 
@@ -1411,7 +1416,7 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
-  const { apiKey, modelId, profileName } = resolveSelfieSkillRuntimeConfig();
+  const { apiKey, baseUrl, modelId, quality, profileName } = resolveSelfieSkillRuntimeConfig();
   const scriptPath = path.resolve(__dirname, "../../../skills/asuka-selfie/skill/scripts/asuka-selfie.sh");
 
   if (!apiKey) {
@@ -1433,8 +1438,10 @@ async function runDirectSelfieFlowForCron(
     await execFileAsync(scriptPath, args, {
       env: {
         ...process.env,
-        DASHSCOPE_API_KEY: apiKey,
-        DASHSCOPE_MODEL: modelId,
+        STUDIO_API_KEY: apiKey,
+        STUDIO_API_BASE_URL: baseUrl,
+        STUDIO_IMAGE_MODEL: modelId,
+        STUDIO_IMAGE_QUALITY: quality,
         OPENCLAW_PROFILE: profileName,
       },
       maxBuffer: 1024 * 1024,

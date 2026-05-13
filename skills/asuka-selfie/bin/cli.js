@@ -170,7 +170,7 @@ ${c("magenta", "│")}  ${c("bright", "Asuka Selfie")} - OpenClaw Skill Installe
 ${c("magenta", "└─────────────────────────────────────────┘")}
 
 Add selfie generation superpowers to your OpenClaw agent!
-Uses ${c("cyan", "Alibaba Cloud Bailian / DashScope")} with ${c("cyan", "wan2.6-image")} for image editing.
+Uses a ${c("cyan", "Studio OpenAI-compatible media API")} for image editing.
 `);
 }
 
@@ -207,43 +207,32 @@ async function checkPrerequisites() {
   return true;
 }
 
-// Get DashScope API key
-async function getDashScopeApiKey(rl) {
-  logStep("2/7", "Setting up DashScope API key...");
+// Get Studio API key
+async function getStudioApiKey(rl) {
+  logStep("2/7", "Setting up Studio media API key...");
 
-  const DASHSCOPE_URL =
-    "https://bailian.console.aliyun.com/?tab=model#/api-key";
+  const STUDIO_BASE_URL = "https://www.cst9.com/studio/v1";
 
   log(
-    `\nTo use wan2.6-image, you need an Alibaba Cloud Bailian / DashScope API key.`
+    `\nTo generate images, you need a Studio media API key.`
   );
-  log(`${c("cyan", "→")} Get your key from: ${c("bright", DASHSCOPE_URL)}\n`);
-
-  const openIt = await ask(rl, "Open Bailian console in browser? (Y/n): ");
-
-  if (openIt.toLowerCase() !== "n") {
-    logInfo("Opening browser...");
-    if (!openBrowser(DASHSCOPE_URL)) {
-      logWarn("Could not open browser automatically");
-      logInfo(`Please visit: ${DASHSCOPE_URL}`);
-    }
-  }
+  log(`${c("cyan", "→")} Default API base URL: ${c("bright", STUDIO_BASE_URL)}\n`);
 
   log("");
-  const dashscopeKey = await ask(rl, "Enter your DASHSCOPE_API_KEY: ");
+  const studioKey = await ask(rl, "Enter your STUDIO_API_KEY: ");
 
-  if (!dashscopeKey) {
-    logError("DASHSCOPE_API_KEY is required!");
+  if (!studioKey) {
+    logError("STUDIO_API_KEY is required!");
     return null;
   }
 
   // Basic validation
-  if (dashscopeKey.length < 10) {
+  if (studioKey.length < 10) {
     logWarn("That key looks too short. Make sure you copied the full key.");
   }
 
   logSuccess("API key received");
-  return dashscopeKey;
+  return studioKey;
 }
 
 // Install skill files
@@ -290,7 +279,7 @@ async function installSkill() {
 }
 
 // Update OpenClaw config
-async function updateOpenClawConfig(dashscopeKey) {
+async function updateOpenClawConfig(studioKey) {
   logStep("4/7", "Updating OpenClaw configuration...");
 
   let config = readJsonFile(OPENCLAW_CONFIG) || {};
@@ -301,9 +290,11 @@ async function updateOpenClawConfig(dashscopeKey) {
       entries: {
         [SKILL_NAME]: {
           enabled: true,
-          apiKey: dashscopeKey,
+          apiKey: studioKey,
           env: {
-            DASHSCOPE_API_KEY: dashscopeKey,
+            STUDIO_API_KEY: studioKey,
+            STUDIO_API_BASE_URL: "https://www.cst9.com/studio/v1",
+            STUDIO_IMAGE_MODEL: "wan2.6-image",
             OPENCLAW_PROFILE: "asuka",
           },
         },
@@ -489,9 +480,9 @@ async function main() {
       }
     }
 
-    // Step 2: Get DashScope API key
-    const dashscopeKey = await getDashScopeApiKey(rl);
-    if (!dashscopeKey) {
+    // Step 2: Get Studio API key
+    const studioKey = await getStudioApiKey(rl);
+    if (!studioKey) {
       rl.close();
       process.exit(1);
     }
@@ -500,7 +491,7 @@ async function main() {
     await installSkill();
 
     // Step 4: Update OpenClaw config
-    await updateOpenClawConfig(dashscopeKey);
+    await updateOpenClawConfig(studioKey);
 
     // Step 5: Write IDENTITY.md
     await writeIdentity();

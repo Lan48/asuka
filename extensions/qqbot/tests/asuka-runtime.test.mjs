@@ -112,8 +112,9 @@ fs.writeFileSync(configPath, JSON.stringify({
     entries: {
       "asuka-selfie": {
         env: {
-          DASHSCOPE_API_KEY: "super-secret-dashscope-key",
-          DASHSCOPE_MODEL: "wan2.6-image",
+          STUDIO_API_KEY: "super-secret-studio-key",
+          STUDIO_API_BASE_URL: "https://www.cst9.com/studio/v1",
+          STUDIO_IMAGE_MODEL: "wan2.6-image",
         },
       },
     },
@@ -143,7 +144,7 @@ assert.equal(health.promiseState.total, 3, "runtime health should count promises
 assert.equal(health.promiseState.cronJobIds, 2, "runtime health should count primary and follow-up cron job ids");
 assert.equal(health.promiseState.fallbackTracked, 1, "runtime health should count fallback metadata");
 assert.equal(health.media.selfieScript.exists, true, "runtime health should report selfie script presence");
-assert.equal(health.media.dashscopeApiKeyConfigured, true, "runtime health should report DashScope key presence as a boolean");
+assert.equal(health.media.studioApiKeyConfigured, true, "runtime health should report Studio key presence as a boolean");
 const healthText = formatLocalRuntimeHealthReport(health);
 assert.ok(healthText.includes("QQBot runtime health: pass"), "formatted health should include overall status");
 assert.equal(healthText.includes("super-secret"), false, "formatted health should not leak secret values");

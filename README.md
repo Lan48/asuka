@@ -31,7 +31,7 @@ posture without stage exaggeration.
 - `workspace/IDENTITY.md` - stable identity, background, appearance, and notes
 - `workspace/SOUL.md` - runtime behavior, relationship tone, and selfie rules
 - `workspace/AGENTS.md` - workspace startup and operating instructions
-- `skills/asuka-selfie/` - local DashScope / `wan2.6-image` selfie skill
+- `skills/asuka-selfie/` - local Studio OpenAI-compatible media selfie skill
 - `extensions/qqbot/` - QQ bot extension source and runtime integration
 
 ## Local Configuration
@@ -42,8 +42,9 @@ machine-specific state.
 
 Create or keep `openclaw.json` locally with the required values, including:
 
-- `DASHSCOPE_API_KEY`
-- `DASHSCOPE_MODEL=wan2.6-image`
+- `STUDIO_API_KEY`
+- `STUDIO_API_BASE_URL=https://www.cst9.com/studio/v1`
+- `STUDIO_IMAGE_MODEL=<image-edit-model>`
 - QQ bot `appId` / `clientSecret`
 - local gateway settings
 

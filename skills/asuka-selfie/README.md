@@ -10,7 +10,7 @@ npx asuka@latest
 
 This will:
 1. Check OpenClaw is installed
-2. Guide you to configure an Alibaba Cloud Bailian / DashScope API key
+2. Guide you to configure a Studio media API key
 3. Install the skill to `~/.openclaw/skills/asuka-selfie/`
 4. Configure OpenClaw to use the skill
 5. Add selfie capabilities to your agent's SOUL.md
@@ -32,7 +32,7 @@ Asuka Selfie enables your OpenClaw agent to:
 ## Prerequisites
 
 - [OpenClaw](https://github.com/openclaw/openclaw) installed and configured
-- Alibaba Cloud Bailian / DashScope account and API key
+- Studio media API key
 
 ## Manual Installation
 
@@ -40,7 +40,7 @@ If you prefer manual setup:
 
 ### 1. Get API Key
 
-Create a Bailian / DashScope API key and export it as `DASHSCOPE_API_KEY`.
+Create a Studio media API key and export it as `STUDIO_API_KEY`.
 
 ### 2. Clone the Skill
 
@@ -59,7 +59,9 @@ Add to `~/.openclaw/openclaw.json`:
       "asuka-selfie": {
         "enabled": true,
         "env": {
-          "DASHSCOPE_API_KEY": "your_dashscope_key_here",
+          "STUDIO_API_KEY": "your_studio_key_here",
+          "STUDIO_API_BASE_URL": "https://www.cst9.com/studio/v1",
+          "STUDIO_IMAGE_MODEL": "your-image-edit-model",
           "OPENCLAW_PROFILE": "asuka"
         }
       }
@@ -108,7 +110,7 @@ compatibility fallbacks.
 
 ## Technical Details
 
-- **Image Generation**: Alibaba Cloud Bailian / DashScope `wan2.6-image`
+- **Image Generation**: Studio OpenAI-compatible `/images/edits` API
 - **Messaging**: OpenClaw Gateway API
 - **Supported Platforms**: Discord, Telegram, WhatsApp, Slack, Signal, MS Teams
 

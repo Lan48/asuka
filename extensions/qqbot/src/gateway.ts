@@ -2071,9 +2071,12 @@ ${ttsHint}${sttHint}`;
 
         const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
           const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
-          const apiKey = String(skillCfg?.apiKey || skillCfg?.env?.DASHSCOPE_API_KEY || "").trim();
-          const modelId = String(skillCfg?.env?.DASHSCOPE_MODEL || "wan2.6-image").trim();
-          const profileName = String(skillCfg?.env?.OPENCLAW_PROFILE || "asuka").trim();
+          const skillEnv = skillCfg?.env || {};
+          const apiKey = String(skillCfg?.apiKey || skillEnv.STUDIO_API_KEY || skillEnv.DASHSCOPE_API_KEY || "").trim();
+          const baseUrl = String(skillEnv.STUDIO_API_BASE_URL || "https://www.cst9.com/studio/v1").trim();
+          const modelId = String(skillEnv.STUDIO_IMAGE_EDIT_MODEL || skillEnv.STUDIO_IMAGE_MODEL || skillEnv.STUDIO_MODEL || skillEnv.DASHSCOPE_MODEL || "wan2.6-image").trim();
+          const quality = String(skillEnv.STUDIO_IMAGE_QUALITY || "standard").trim();
+          const profileName = String(skillEnv.OPENCLAW_PROFILE || "asuka").trim();
           const scriptPath = resolveAsukaSelfieScriptPath();
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
@@ -2121,7 +2124,7 @@ ${ttsHint}${sttHint}`;
           };
 
           if (!apiKey) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: DASHSCOPE_API_KEY missing`);
+            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: STUDIO_API_KEY missing`);
             return await sendFallbackSelfieImage();
           }
 
@@ -2142,8 +2145,10 @@ ${ttsHint}${sttHint}`;
 
             const childEnv = {
               ...process.env,
-              DASHSCOPE_API_KEY: apiKey,
-              DASHSCOPE_MODEL: modelId,
+              STUDIO_API_KEY: apiKey,
+              STUDIO_API_BASE_URL: baseUrl,
+              STUDIO_IMAGE_MODEL: modelId,
+              STUDIO_IMAGE_QUALITY: quality,
               OPENCLAW_PROFILE: profileName,
             };
 

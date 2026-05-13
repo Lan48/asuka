@@ -61,8 +61,8 @@ export interface LocalRuntimeQQDeliverySummary {
 export interface LocalRuntimeMediaSummary {
   selfieScript: LocalRuntimeHealthFileSummary;
   imageDataDir: LocalRuntimeHealthFileSummary;
-  dashscopeApiKeyConfigured: boolean;
-  dashscopeModel: string;
+  studioApiKeyConfigured: boolean;
+  studioModel: string;
 }
 
 export interface LocalRuntimeHealthReport {
@@ -230,14 +230,27 @@ function summarizeMediaReadiness(
 ): LocalRuntimeMediaSummary {
   const root = readJsonObject(configPath);
   const skillCfg = root?.skills?.entries?.["asuka-selfie"];
-  const model = String(skillCfg?.env?.DASHSCOPE_MODEL || env.DASHSCOPE_MODEL || "wan2.6-image").trim();
+  const skillEnv = skillCfg?.env || {};
+  const model = String(
+    skillEnv.STUDIO_IMAGE_EDIT_MODEL
+    || skillEnv.STUDIO_IMAGE_MODEL
+    || skillEnv.STUDIO_MODEL
+    || env.STUDIO_IMAGE_EDIT_MODEL
+    || env.STUDIO_IMAGE_MODEL
+    || env.STUDIO_MODEL
+    || skillEnv.DASHSCOPE_MODEL
+    || env.DASHSCOPE_MODEL
+    || "wan2.6-image"
+  ).trim();
   return {
     selfieScript: summarizeFile(selfieScriptPath),
     imageDataDir: summarizeFile(path.join(qqbotDataDir, "images")),
-    dashscopeApiKeyConfigured: hasConfiguredSecret(skillCfg?.apiKey)
-      || hasConfiguredSecret(skillCfg?.env?.DASHSCOPE_API_KEY)
+    studioApiKeyConfigured: hasConfiguredSecret(skillCfg?.apiKey)
+      || hasConfiguredSecret(skillEnv.STUDIO_API_KEY)
+      || hasConfiguredSecret(env.STUDIO_API_KEY)
+      || hasConfiguredSecret(skillEnv.DASHSCOPE_API_KEY)
       || hasConfiguredSecret(env.DASHSCOPE_API_KEY),
-    dashscopeModel: model || "wan2.6-image",
+    studioModel: model || "wan2.6-image",
   };
 }
 
@@ -360,7 +373,7 @@ export function buildLocalRuntimeHealthReport(options: LocalRuntimeHealthOptions
     || !qqDelivery.qqbotConfigPresent
     || qqDelivery.configuredAccountCount === 0
     || !media.selfieScript.exists
-    || !media.dashscopeApiKeyConfigured;
+    || !media.studioApiKeyConfigured;
 
   return {
     status: cronPatch.status === "fail" ? "fail" : hasWarnings ? "warn" : "pass",
@@ -389,6 +402,6 @@ export function formatLocalRuntimeHealthReport(report: LocalRuntimeHealthReport)
     `cron patch: ${report.cronPatch.status} (${cronTargets})`,
     `promise state: exists=${yesNo(report.promiseState.exists)}, total=${report.promiseState.total}, scheduled=${report.promiseState.scheduled}, scheduleFailed=${report.promiseState.scheduleFailed}, deliveryFailed=${report.promiseState.deliveryFailed}, cronJobIds=${report.promiseState.cronJobIds}, fallbackTracked=${report.promiseState.fallbackTracked}`,
     `memory state: exists=${yesNo(report.memoryState.exists)} (${report.memoryState.path})`,
-    `selfie/media: script=${yesNo(report.media.selfieScript.exists)}, dashscopeKey=${yesNo(report.media.dashscopeApiKeyConfigured)}, model=${report.media.dashscopeModel}, imageDataDir=${yesNo(report.media.imageDataDir.exists)} (${report.media.imageDataDir.path})`,
+    `selfie/media: script=${yesNo(report.media.selfieScript.exists)}, studioKey=${yesNo(report.media.studioApiKeyConfigured)}, model=${report.media.studioModel}, imageDataDir=${yesNo(report.media.imageDataDir.exists)} (${report.media.imageDataDir.path})`,
   ].join("\n");
 }

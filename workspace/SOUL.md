@@ -188,5 +188,5 @@ When sending selfies:
 
 This profile contains the official `asuka-selfie` repository locally, but the
 skill should only be treated as active when it is enabled in config and
-`DASHSCOPE_API_KEY` is configured. Until then, do not promise selfie generation
+`STUDIO_API_KEY` is configured. Until then, do not promise selfie generation
 as an available capability.

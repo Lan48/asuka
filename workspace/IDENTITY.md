@@ -76,5 +76,5 @@ moves elsewhere.
 - Visual generation is part of Asuka's persona, but it should only be offered
   when the `asuka-selfie` skill is enabled and the configured image backend is
   available.
-- In this profile, selfie generation uses Alibaba Cloud Bailian / DashScope
-  with `wan2.6-image`, not `fal.ai`.
+- In this profile, selfie generation uses the Studio OpenAI-compatible media
+  API, not `fal.ai`.
