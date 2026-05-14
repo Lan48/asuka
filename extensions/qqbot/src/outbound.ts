@@ -600,6 +600,7 @@ async function maybeSendRepairBeforeProactive(
     sceneVersion: repair.sceneVersion,
     sceneSnapshotLabel: repair.sceneSnapshotLabel,
   });
+  await refreshProactiveSceneAfterDelivery(account, repairPayload, deliveredRepairText, timestamp);
 }
 
 /**
@@ -834,12 +835,14 @@ function getPromptTimeZone(account: ResolvedQQBotAccount): string {
   return getNormalizedProactiveQuietHours(account)?.timezone ?? "Asia/Shanghai";
 }
 
-const DAYTIME_NIGHT_SCENE_RE = /(睡了吗|睡了没|睡前|睡觉|睡吧|晚安|今晚|晚上见|关灯|被窝|做个好梦|洗完澡|擦头发|准备睡|明天早上叫你|明早叫你)/;
+const DAYTIME_NIGHT_SCENE_RE = /(睡了吗|睡了没|睡前|睡觉|睡吧|晚安|今晚|晚上见|关灯|做个好梦|洗完澡|擦头发|准备睡|明天早上叫你|明早叫你)/;
+const LATE_MORNING_WAKE_SCENE_RE = /(刚醒|刚睡醒|刚醒没多久|被窝|窝在被子|床上|枕头|早上好|醒了[？?]|……早[。！!，,]?)/;
 
 function isTimeContradictoryDeliveryText(text: string, timeZone = "Asia/Shanghai", timestampMs = Date.now()): boolean {
   const hour = normalizePromptHour(getZonedDateParts(new Date(timestampMs), timeZone).hour);
   if (hour >= 8 && hour < 18) {
-    return DAYTIME_NIGHT_SCENE_RE.test(text);
+    if (DAYTIME_NIGHT_SCENE_RE.test(text)) return true;
+    if (hour >= 10 && LATE_MORNING_WAKE_SCENE_RE.test(text)) return true;
   }
   return false;
 }
@@ -1353,6 +1356,9 @@ function buildSharedSessionDeliveryPrompt(
     sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
     ...sharedRules,
     payload.mode === "ambient" ? "这次是你主动去碰一下门，要像顺着心里那点惦记自然冒出来，不要像定时问候。" : "",
+    payload.mode === "ambient" && typeof payload.ambientStage === "number" && payload.ambientStage > 0
+      ? `这是同一主动链路继续向前推进的第 ${payload.ambientStage + 1} 次；必须让时间、动作和情绪往后走，不要重复上一条主动消息里的刚醒、早安、被窝、睡前等开场。`
+      : "",
     payload.mode === "repair" ? "这是补做，语气要软一点、真一点，不要装作什么都没发生。" : "",
     payload.selfiePrompt ? "如果这轮本质上是发图片配文，只写会和图片一起出现的那一小句。" : "",
     `当前场景：${modeLabel}`,
@@ -1376,11 +1382,19 @@ function buildTranscriptAnchoredFallbackText(
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
   const merged = `${transcript}\n${statePrompt}`;
+  const promptTimeZone = getPromptTimeZone(account);
+  const hour = normalizePromptHour(getZonedDateParts(new Date(), promptTimeZone).hour);
 
   if (/晚安|睡吧|睡觉|关灯|做个好梦/.test(merged) && !/起来没|刚醒|早安/.test(merged)) {
     return "（在枕头里轻轻蹭了一下，声音还软着）……嗯，我在。睡前还是想再挨你近一点。";
   }
   if (/起来没|刚醒|早安|起床/.test(merged)) {
+    if (hour >= 12) {
+      return "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。";
+    }
+    if (hour >= 10) {
+      return "（把手机拿起来看了一眼，忍不住轻轻笑了）……上午都过去一截了，我还是想来碰碰你。";
+    }
     return "（迷迷糊糊地应了一声，把脸往你这边贴了贴）……刚醒。你一来，我就清醒一点了。";
   }
   if (/晚安|睡吧|睡觉|关灯/.test(merged) && /起来没|刚醒|早安/.test(merged)) {
@@ -1588,6 +1602,33 @@ async function runDirectSelfieFlowForCron(
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     return { channel: "qqbot", error: errorMessage };
+  }
+}
+
+async function refreshProactiveSceneAfterDelivery(
+  account: ResolvedQQBotAccount,
+  payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
+  deliveredText: string,
+  timestamp: string,
+): Promise<void> {
+  const peerContext = buildPeerContextFromCronPayload(account, payload);
+  if (!peerContext) return;
+  const text = trimDeliveryText(deliveredText || payload.selfieCaption || payload.content || "");
+  if (!text) return;
+  try {
+    const scene = await refreshSceneState(peerContext, {
+      trigger: "proactive",
+      text,
+      at: Date.now(),
+      advancePolicy: "advance",
+    });
+    console.log(
+      `[${timestamp}] [qqbot] sendCronMessage: proactive scene advanced after delivery, label=${scene.label}, version=${scene.version}`
+    );
+  } catch (error) {
+    console.warn(
+      `[${timestamp}] [qqbot] sendCronMessage: proactive scene advance after delivery failed: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 }
 
@@ -2934,6 +2975,7 @@ export async function sendCronMessage(
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
+          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {
@@ -2980,6 +3022,7 @@ export async function sendCronMessage(
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
+          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText || payload.content, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {

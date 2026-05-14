@@ -29,6 +29,7 @@ try {
     markPromiseDelivered,
     markPromiseScheduled,
     markPromiseScheduleFailed,
+    markProactiveDelivered,
     prepareAmbientLifePayload,
     prepareRepairDelivery,
     recordAssistantReply,
@@ -103,6 +104,20 @@ try {
   const cancelled = cancelPromisesFromUserMessage(cancelContext, "不用发自拍了", base + 31_000);
   assert.equal(cancelled.cancelledPromises.length, 1, "selfie promise should be cancelled");
   assert.equal(shouldSendPromiseFollowUp(selfiePromise.id, base, base + 32_000), false, "follow-up should stop after cancellation");
+
+  const ambientContext = directContext("user-ambient-advance", "repair-m-5");
+  recordInboundInteraction(ambientContext, "早安，醒了吗", base + 40_000);
+  const firstAmbient = prepareAmbientLifePayload(ambientContext, base + 41_000);
+  assert.equal(firstAmbient.stage, 0, "new ambient thread should start at stage zero");
+  markProactiveDelivered("acct-test:direct:user-ambient-advance", {
+    at: base + 42_000,
+    content: "早，已经醒了。我先去把窗帘拉开。",
+    threadId: firstAmbient.threadId,
+    stage: firstAmbient.stage,
+    advancePolicy: "advance",
+  });
+  const secondAmbient = prepareAmbientLifePayload(ambientContext, base + 43_000);
+  assert.equal(secondAmbient.stage, 1, "delivered proactive ambient messages should advance the next stage");
 
   console.log("[qqbot:test] asuka-repair fixtures passed");
 } finally {

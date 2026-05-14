@@ -2242,6 +2242,17 @@ export function markProactiveDelivered(
   peer.ambient.lastSentAt = at;
   peer.ambient.styleVersion = AMBIENT_STYLE_VERSION;
   peer.ambient.lastTopicPreview = summarizeText(options.content, 80);
+  if (options.threadId) {
+    peer.ambient.currentThreadId = options.threadId;
+  }
+  if (options.advancePolicy === "advance") {
+    const currentStage = Number.isInteger(options.stage) && options.stage !== undefined && options.stage >= 0
+      ? options.stage
+      : peer.ambient.currentStage;
+    peer.ambient.currentStage = Math.max(0, currentStage) + 1;
+  } else if (options.advancePolicy === "fade") {
+    peer.ambient.currentStage = 0;
+  }
   peer.ambient.currentMood = disposition.mood;
   peer.ambient.currentAttention = disposition.attention;
   peer.ambient.currentPresence = options.presenceOverride ?? disposition.presence;
