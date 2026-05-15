@@ -25,4 +25,13 @@ assert.match(ctxPayloadSnippet, /GroupSystemPrompt: stableSystemPrompt/, "stable
 assert.equal(source.includes("- 消息ID: ${event.messageId}"), false, "LLM prompt should not include per-message id");
 assert.equal(source.includes("- 当前时间戳(ms): ${nowMs}"), false, "LLM prompt should not include millisecond timestamp");
 
+const clearModeIndex = source.indexOf("async function clearCompanionSessionModeOverrides");
+const clearModeCallIndex = source.indexOf("await clearCompanionSessionModeOverrides");
+assert.ok(clearModeIndex >= 0, "gateway should clear companion session mode overrides");
+assert.ok(clearModeCallIndex > clearModeIndex, "natural companion messages should clear persisted mode overrides");
+const clearModeSnippet = source.slice(clearModeIndex, clearModeIndex + 1200);
+assert.match(clearModeSnippet, /"thinkingLevel"/, "companion mode reset should clear persisted thinking mode");
+assert.match(clearModeSnippet, /"reasoningLevel"/, "companion mode reset should clear persisted reasoning mode");
+assert.match(clearModeSnippet, /"verboseLevel"/, "companion mode reset should clear persisted verbose mode");
+
 console.log("[qqbot:test] gateway prompt order fixtures passed");

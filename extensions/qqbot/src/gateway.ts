@@ -124,7 +124,7 @@ function resolveOpenClawStateDir(): string {
   return path.join(os.homedir(), ".openclaw");
 }
 
-async function clearCompanionThinkingSessionOverride(
+async function clearCompanionSessionModeOverrides(
   sessionKey: string | undefined,
   agentId: string | undefined,
   log?: { warn?: (message: string) => void; error?: (message: string) => void; info?: (message: string) => void }
@@ -136,14 +136,20 @@ async function clearCompanionThinkingSessionOverride(
     const raw = await fs.promises.readFile(storePath, "utf-8");
     const store = JSON.parse(raw) as Record<string, Record<string, unknown> | undefined>;
     const entry = store[sessionKey];
-    if (!entry || !Object.prototype.hasOwnProperty.call(entry, "thinkingLevel")) return;
-    delete entry.thinkingLevel;
+    if (!entry) return;
+    const modeFields = ["thinkingLevel", "reasoningLevel", "verboseLevel"] as const;
+    const clearedFields = modeFields.filter((field) => Object.prototype.hasOwnProperty.call(entry, field));
+    if (clearedFields.length === 0) return;
+    for (const field of clearedFields) {
+      delete entry[field];
+    }
     entry.updatedAt = Date.now();
     const tmpPath = `${storePath}.tmp-${process.pid}-${Date.now()}`;
     await fs.promises.writeFile(tmpPath, JSON.stringify(store, null, 2));
     await fs.promises.rename(tmpPath, storePath);
+    log?.info?.(`[qqbot] cleared companion session mode override(s): ${clearedFields.join(", ")}`);
   } catch (err) {
-    const message = `[qqbot] failed to clear companion thinking override: ${err}`;
+    const message = `[qqbot] failed to clear companion session mode override: ${err}`;
     if (log?.warn) log.warn(message);
     else if (log?.error) log.error(message);
     else log?.info?.(message);
@@ -2189,7 +2195,7 @@ ${ttsHint}${sttHint}`;
         log?.info?.(`[qqbot:${account.accountId}] companion thinking level=${companionThinkingLevel}`);
         const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/") && !shouldForceFreshSession;
         if (shouldApplyCompanionThinkingPolicy) {
-          await clearCompanionThinkingSessionOverride(route.sessionKey, route.agentId, log);
+          await clearCompanionSessionModeOverrides(route.sessionKey, route.agentId, log);
         }
         const cfgForCompanionThinking = shouldApplyCompanionThinkingPolicy
           ? withCompanionThinkingDefault(cfg as Record<string, unknown>, companionThinkingLevel)
