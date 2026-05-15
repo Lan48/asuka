@@ -26,11 +26,13 @@ export interface ConversationWeeklyDigest {
   recentEmotionalArc: string;
   currentOpenLoops: string[];
   userPreferences: string[];
+  temporaryDirectives: string[];
   asukaSelfContinuity: string;
   sceneContinuity: string;
   importantRecentFacts: string[];
   thingsToAvoid: string[];
   lastSalientTurns: string[];
+  evidenceNotes: string[];
 }
 
 export interface ConversationDailyDigest {
@@ -40,11 +42,13 @@ export interface ConversationDailyDigest {
   emotionalArc: string;
   openLoops: string[];
   userPreferences: string[];
+  temporaryDirectives: string[];
   asukaSelfContinuity: string;
   sceneContinuity: string;
   importantFacts: string[];
   thingsToAvoid: string[];
   salientTurns: string[];
+  evidenceNotes: string[];
 }
 
 export interface LegacyConversationDigest extends ConversationWeeklyDigest {
@@ -233,6 +237,19 @@ function normalizeStringArray(value: unknown): string[] {
     .slice(0, MAX_ARRAY_ITEMS);
 }
 
+function normalizeOpenLoops(value: unknown): string[] {
+  return normalizeStringArray(value)
+    .map((item) => {
+      if (/(愧疚|抱歉|迟到).*(语音|声音|voice)|(?:语音|声音|voice).*(愧疚|抱歉|迟到)/i.test(item)) {
+        return "语音回答问题仍需稳定承接";
+      }
+      return item;
+    })
+    .filter((item) => !/(已完成|已解决|已兑现|已和解|已经聊开|不要再提|别再提|不需要再|只需避免)/.test(item))
+    .filter((item) => !/(愧疚感?|迟到).*(话题|情绪)/.test(item))
+    .slice(0, MAX_ARRAY_ITEMS);
+}
+
 function normalizeDetailLevel(value: unknown, fallback: ConversationDailyDigest["detailLevel"]): ConversationDailyDigest["detailLevel"] {
   return value === "detailed" || value === "balanced" || value === "brief" ? value : fallback;
 }
@@ -242,13 +259,15 @@ function normalizeWeeklyDigest(value: unknown): ConversationWeeklyDigest {
   return {
     relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, 520),
     recentEmotionalArc: sanitizeDigestText(input.recentEmotionalArc, 420),
-    currentOpenLoops: normalizeStringArray(input.currentOpenLoops),
+    currentOpenLoops: normalizeOpenLoops(input.currentOpenLoops),
     userPreferences: normalizeStringArray(input.userPreferences),
+    temporaryDirectives: normalizeStringArray(input.temporaryDirectives ?? input.temporaryPreferences),
     asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, 420),
     sceneContinuity: sanitizeDigestText(input.sceneContinuity, 420),
     importantRecentFacts: normalizeStringArray(input.importantRecentFacts),
     thingsToAvoid: normalizeStringArray(input.thingsToAvoid),
     lastSalientTurns: normalizeStringArray(input.lastSalientTurns),
+    evidenceNotes: normalizeStringArray(input.evidenceNotes ?? input.evidence),
   };
 }
 
@@ -273,19 +292,42 @@ function normalizeDailyDigest(value: unknown, fallbackDate: string, fallbackLeve
   const fieldLimit = dailyFieldLimit(detailLevel);
   const arrayLimit = dailyArrayLimit(detailLevel);
   const clampArray = (arrayValue: unknown): string[] => normalizeStringArray(arrayValue).slice(0, arrayLimit);
-  return {
+  const normalized = {
     date,
     detailLevel,
     relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, fieldLimit),
     emotionalArc: sanitizeDigestText(input.emotionalArc ?? input.recentEmotionalArc, fieldLimit),
-    openLoops: clampArray(input.openLoops ?? input.currentOpenLoops),
+    openLoops: normalizeOpenLoops(input.openLoops ?? input.currentOpenLoops).slice(0, arrayLimit),
     userPreferences: clampArray(input.userPreferences),
+    temporaryDirectives: clampArray(input.temporaryDirectives ?? input.temporaryPreferences),
     asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, fieldLimit),
     sceneContinuity: sanitizeDigestText(input.sceneContinuity, fieldLimit),
     importantFacts: clampArray(input.importantFacts ?? input.importantRecentFacts),
     thingsToAvoid: clampArray(input.thingsToAvoid),
     salientTurns: clampArray(input.salientTurns ?? input.lastSalientTurns),
+    evidenceNotes: clampArray(input.evidenceNotes ?? input.evidence),
   };
+  return isEmptyDailyPlaceholder(normalized) ? null : normalized;
+}
+
+function isEmptyDailyPlaceholder(day: ConversationDailyDigest): boolean {
+  const joinedText = [
+    day.relationshipContinuity,
+    day.emotionalArc,
+    day.asukaSelfContinuity,
+    day.sceneContinuity,
+  ].join(" ");
+  const hasArrays = [
+    day.openLoops,
+    day.userPreferences,
+    day.temporaryDirectives,
+    day.importantFacts,
+    day.thingsToAvoid,
+    day.salientTurns,
+    day.evidenceNotes,
+  ].some((items) => items.length > 0);
+  if (!joinedText.trim() && !hasArrays) return true;
+  return !hasArrays && /(普通日常|日常在家|细节未记录|无特殊事件记录|没有记录|无历史|no entries|no record)/i.test(joinedText);
 }
 
 function fallbackDetailLevelForIndex(index: number, total: number): ConversationDailyDigest["detailLevel"] {
@@ -456,30 +498,35 @@ function buildDigestPrompt(input: {
       weekly: {
         relationshipContinuity: "七天总体关系连续性，保留会影响下一轮陪伴回复的关系事实",
         recentEmotionalArc: "七天情绪变化和当前情绪，不要复述长对话",
-        currentOpenLoops: ["仍未完成的承诺、待接住的问题、用户刚提出的期待"],
-        userPreferences: ["用户近期表达的偏好、边界、交互方式要求"],
+        currentOpenLoops: ["仍未完成的承诺、待接住的问题、用户刚提出的期待；已解决或只需避免的旧情绪不要放这里"],
+        userPreferences: ["稳定偏好和边界；不要把只持续几轮的临时要求放这里"],
+        temporaryDirectives: ["有明确持续时间、计数或触发条件的临时交互要求，例如'接下来十轮用语音回答（剩余/起点未知时标注需外部计数）'"],
         asukaSelfContinuity: "Asuka 自己近几天生活线，只保留下一轮可能需要承接的部分",
         sceneContinuity: "当前场景/时间线连续性，过期场景要标注自然过渡",
         importantRecentFacts: ["重要事实，避免流水账"],
         thingsToAvoid: ["下一轮应避免的说法、重复、误触发"],
         lastSalientTurns: ["最多保留几条极重要原话摘要"],
+        evidenceNotes: ["证据强度/来源说明：明确说过、近轮推断、Asuka 自述、旧摘要继承；不确定就标注不确定"],
       },
       daily: [{
         date: "YYYY-MM-DD",
         detailLevel: "detailed | balanced | brief，越新的日期越 detailed，越远越 brief",
         relationshipContinuity: "当天关系进展；brief 日期只写真正影响当前回复的部分",
         emotionalArc: "当天情绪线",
-        openLoops: ["当天留下且仍可能影响后续的未闭环事项"],
-        userPreferences: ["当天出现的新偏好或边界"],
+        openLoops: ["当天留下且仍可能影响后续的未闭环事项；已和解/已解决内容移到 thingsToAvoid 或省略"],
+        userPreferences: ["当天出现的新稳定偏好或边界"],
+        temporaryDirectives: ["当天出现的临时要求，必须带持续时间/计数/触发条件"],
         asukaSelfContinuity: "当天 Asuka 自己生活线",
         sceneContinuity: "当天场景/时间线，不要把早晚和睡醒弄混",
         importantFacts: ["当天重要事实"],
         thingsToAvoid: ["当天得出的避免项"],
         salientTurns: ["当天极少量关键原话摘要；旧日期要少"],
+        evidenceNotes: ["当天关键信息的证据强度/来源"],
       }],
     }),
     "",
-    "daily 只保留最近 7 个本地自然日；今天和昨天要详细，前 2-3 天适中，更早日期简略。weekly 必须从 daily 汇总，不要和 daily 互相矛盾。",
+    "daily 只为近一周对话节选里实际出现的本地自然日生成，不要为无记录日期生成'普通日常/细节未记录'占位。今天和昨天要详细，前 2-3 天适中，更早日期简略。",
+    "weekly 必须从 daily 和本轮新增汇总，不要和 daily 互相矛盾。已完成、已和解、只需避免的事项不要进入 openLoops；临时要求必须进入 temporaryDirectives，并写明过期条件或计数状态。",
   ].join("\n");
 }
 
@@ -502,6 +549,10 @@ async function requestDigestFromMiniMax(prompt: string, config: MiniMaxDigestCon
           "你只能维护内部摘要 JSON，不能生成用户可见回复，不能调用任何外部消息发送能力。",
           "保留会影响下一轮自然陪伴、关系连续性、场景连续性和用户偏好的信息；删除闲聊噪声。",
           "摘要要分为 weekly 总览和 daily 日摘要；越近的 daily 越详细，越远越简略。",
+          "daily 只能覆盖近一周历史中实际有记录的日期，不能补写没有记录的日期。",
+          "openLoops 只放仍需继续承接的事项；已解决旧话题放 thingsToAvoid 或省略。",
+          "有轮数、时段、直到某事件为止的临时要求放 temporaryDirectives，不要混入稳定偏好。",
+          "重要事实、偏好和推断要用 evidenceNotes 标出证据强度或来源。",
           "字段顺序和 schema 必须稳定；只输出一个 JSON 对象。",
         ].join("\n"),
         messages: [{ role: "user", content: prompt }],
@@ -551,11 +602,13 @@ export function formatConversationDigestForPrompt(digest: ConversationDigest | L
     `- 七天情绪线: ${weekly.recentEmotionalArc || "无"}`,
     `- 当前未闭环事项: ${formatList(weekly.currentOpenLoops)}`,
     `- 用户偏好/边界: ${formatList(weekly.userPreferences)}`,
+    `- 临时指令/待过期偏好: ${formatList(weekly.temporaryDirectives)}`,
     `- Asuka 自我生活线: ${weekly.asukaSelfContinuity || "无"}`,
     `- 场景连续性: ${weekly.sceneContinuity || "无"}`,
     `- 重要近期事实: ${formatList(weekly.importantRecentFacts)}`,
     `- 下一轮避免: ${formatList(weekly.thingsToAvoid)}`,
     `- 关键近轮: ${formatList(weekly.lastSalientTurns)}`,
+    `- 证据/置信度: ${formatList(weekly.evidenceNotes)}`,
   ];
 
   if (normalized.daily.length > 0) {
@@ -571,8 +624,10 @@ export function formatConversationDigestForPrompt(digest: ConversationDigest | L
         `  重要事实: ${formatList(day.importantFacts)}`,
       ];
       if (day.userPreferences.length > 0) dayLines.push(`  偏好/边界: ${formatList(day.userPreferences)}`);
+      if (day.temporaryDirectives.length > 0) dayLines.push(`  临时指令: ${formatList(day.temporaryDirectives)}`);
       if (day.thingsToAvoid.length > 0) dayLines.push(`  避免: ${formatList(day.thingsToAvoid)}`);
       if (day.salientTurns.length > 0) dayLines.push(`  关键近轮: ${formatList(day.salientTurns)}`);
+      if (day.evidenceNotes.length > 0) dayLines.push(`  证据: ${formatList(day.evidenceNotes)}`);
       lines.push(dayLines.join("\n"));
     }
   }
