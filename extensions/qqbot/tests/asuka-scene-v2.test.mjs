@@ -76,6 +76,7 @@ try {
   }, base + 110 * 60 * 1000);
 
   assert.match(prompt, /当前场景线索: 用户刚才像是在吃晚饭/, "state prompt should expose summarized activity scene");
+  assert.match(prompt, /当前结构化场景: lifePhase=meal, activity=dinner/, "state prompt should expose structured activity fields");
   assert.match(prompt, /距离场景开始: 约 1-2 小时/, "state prompt should expose bucketed relative scene age");
   assert.match(prompt, /场景过渡建议: 如果已经过去一两个小时/, "state prompt should expose transition guidance");
   assert.doesNotMatch(prompt, /startedAt|lastInferredAt|lastObservedAt/, "state prompt should not leak raw scene timestamps");
@@ -93,7 +94,12 @@ try {
     source: "scene_model",
   }, {
     label: "activity_context",
-    summary: "用户刚才像是在吃晚饭，语境偏日常陪伴。",
+    lifePhase: "school_day",
+    activity: "after_class",
+    place: "campus",
+    owner: "asuka",
+    timeContinuity: "advanced_from_morning",
+    summary: "Asuka 上午刚下课，准备关心用户下午考试",
     confidence: 0.7,
     source: "scene_model",
     startPolicy: "reuse",
@@ -104,7 +110,11 @@ try {
 
   assert.equal(continued.kind, "activity", "activity_context should render as an activity scene");
   assert.equal(continued.startedAt, base, "reuse start policy should preserve original scene start time");
-  assert.equal(continued.transitionHint?.includes("饭后休息"), true, "continued scene should preserve transition hint");
+  assert.equal(continued.lifePhase, "school_day", "candidate lifePhase should be retained as structured scene state");
+  assert.equal(continued.activity, "after_class", "candidate activity should be retained as structured scene state");
+  assert.equal(continued.place, "campus", "candidate place should be retained as structured scene state");
+  assert.equal(continued.owner, "asuka", "candidate owner should be retained as structured scene state");
+  assert.equal(continued.timeContinuity, "advanced_from_morning", "candidate continuity should be retained as structured scene state");
 
   console.log("[qqbot:test] asuka scene-v2 fixtures passed");
 } finally {

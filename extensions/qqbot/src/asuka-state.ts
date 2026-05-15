@@ -61,10 +61,35 @@ export type AsukaSceneLabel =
 export type AsukaSceneSource = "rule" | "scene_model" | "fallback_model";
 export type AsukaSceneAdvancePolicy = "advance" | "hold" | "fade";
 type AsukaSceneStartPolicy = "reuse" | "reset" | "advance";
+export type AsukaSceneLifePhase =
+  | "unknown"
+  | "school_day"
+  | "sleep"
+  | "meal"
+  | "home"
+  | "work"
+  | "leisure"
+  | "emotional"
+  | "repair";
+export type AsukaSceneOwner = "asuka" | "user" | "shared" | "unknown";
+export type AsukaSceneTimeContinuity =
+  | "unknown"
+  | "same_moment"
+  | "advanced_from_previous"
+  | "advanced_from_morning"
+  | "advanced_from_daytime"
+  | "advanced_from_night"
+  | "reset_by_user"
+  | "reset_by_model";
 
 export interface AsukaSceneState {
   kind: AsukaSceneKind;
   label: AsukaSceneLabel;
+  lifePhase: AsukaSceneLifePhase;
+  activity: string;
+  place: string;
+  owner: AsukaSceneOwner;
+  timeContinuity: AsukaSceneTimeContinuity;
   summary: string;
   confidence: number;
   startedAt: number;
@@ -234,6 +259,7 @@ const SCENE_TRANSCRIPT_LIMIT = 8;
 const SCENE_MODEL_TIMEOUT_MS = 12000;
 const MAX_SCENE_SUMMARY_CHARS = 120;
 const MAX_SCENE_TRANSITION_HINT_CHARS = 140;
+const MAX_SCENE_FIELD_CHARS = 48;
 const SCENE_LABELS: readonly AsukaSceneLabel[] = [
   "indoor_pause",
   "doorway",
@@ -243,6 +269,28 @@ const SCENE_LABELS: readonly AsukaSceneLabel[] = [
   "emotional_presence",
   "miss_you",
   "repair_attention",
+] as const;
+const SCENE_LIFE_PHASES: readonly AsukaSceneLifePhase[] = [
+  "unknown",
+  "school_day",
+  "sleep",
+  "meal",
+  "home",
+  "work",
+  "leisure",
+  "emotional",
+  "repair",
+] as const;
+const SCENE_OWNERS: readonly AsukaSceneOwner[] = ["asuka", "user", "shared", "unknown"] as const;
+const SCENE_TIME_CONTINUITIES: readonly AsukaSceneTimeContinuity[] = [
+  "unknown",
+  "same_moment",
+  "advanced_from_previous",
+  "advanced_from_morning",
+  "advanced_from_daytime",
+  "advanced_from_night",
+  "reset_by_user",
+  "reset_by_model",
 ] as const;
 
 function emptyState(): AsukaStateFile {
@@ -722,6 +770,10 @@ function sanitizeSceneFreeText(text: string | undefined, limit: number): string 
   return normalized.length > limit ? `${normalized.slice(0, limit).trimEnd()}...` : normalized;
 }
 
+function sanitizeSceneField(text: string | undefined, fallback: string): string {
+  return sanitizeSceneFreeText(text, MAX_SCENE_FIELD_CHARS) ?? fallback;
+}
+
 function clampSceneConfidence(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
   return Math.max(0, Math.min(1, value));
@@ -755,6 +807,86 @@ function sceneSummaryForLabel(label: AsukaSceneLabel): string {
     default:
       return "你这会儿更像是把情绪和惦记轻轻放到对方面前。";
   }
+}
+
+function normalizeSceneLifePhase(value: string | undefined, fallback: AsukaSceneLifePhase): AsukaSceneLifePhase {
+  return value && SCENE_LIFE_PHASES.includes(value as AsukaSceneLifePhase)
+    ? value as AsukaSceneLifePhase
+    : fallback;
+}
+
+function normalizeSceneOwner(value: string | undefined, fallback: AsukaSceneOwner): AsukaSceneOwner {
+  return value && SCENE_OWNERS.includes(value as AsukaSceneOwner)
+    ? value as AsukaSceneOwner
+    : fallback;
+}
+
+function normalizeSceneTimeContinuity(value: string | undefined, fallback: AsukaSceneTimeContinuity): AsukaSceneTimeContinuity {
+  return value && SCENE_TIME_CONTINUITIES.includes(value as AsukaSceneTimeContinuity)
+    ? value as AsukaSceneTimeContinuity
+    : fallback;
+}
+
+function inferSceneStructureFromText(
+  text: string | undefined,
+  label: AsukaSceneLabel,
+  previous?: AsukaSceneState
+): Pick<AsukaSceneState, "lifePhase" | "activity" | "place" | "owner" | "timeContinuity"> {
+  const normalized = normalizeSceneContextText(text);
+  let lifePhase: AsukaSceneLifePhase = previous?.lifePhase ?? "unknown";
+  let activity = previous?.activity ?? "unspecified";
+  let place = previous?.place ?? "unknown";
+  let owner: AsukaSceneOwner = previous?.owner ?? "unknown";
+
+  if (/(我这边|我刚|我在|Asuka)/i.test(normalized)) owner = "asuka";
+  if (/(用户|你刚才|你要|你在|你下午|你今天)/.test(normalized)) owner = owner === "asuka" ? "shared" : "user";
+  if (/(我们|一起|牵着|抱着|陪你|陪我)/.test(normalized)) owner = "shared";
+
+  if (/(学校|校园|教室|上课|下课|自习|考试|考场|课题|作业|复习)/.test(normalized)) {
+    lifePhase = "school_day";
+    place = /(考场)/.test(normalized) ? "exam_room" : /(教室|上课|下课)/.test(normalized) ? "classroom" : "campus";
+    if (/(刚下课|下课)/.test(normalized)) activity = "after_class";
+    else if (/(上课)/.test(normalized)) activity = "in_class";
+    else if (/(考试|考场)/.test(normalized)) activity = "exam";
+    else if (/(自习|复习|作业|课题)/.test(normalized)) activity = "study";
+  } else if (/(睡前|准备睡|睡觉|睡吧|晚安|被窝|床上|醒了没|刚醒|早安)/.test(normalized)) {
+    lifePhase = /醒了没|刚醒|早安/.test(normalized) ? "home" : "sleep";
+    activity = /醒了没|刚醒|早安/.test(normalized) ? "waking_up" : "sleeping_or_winding_down";
+    place = /(被窝|床上)/.test(normalized) ? "bed" : "home";
+  } else if (/(吃饭|早餐|早饭|午饭|晚饭|夜宵|做饭)/.test(normalized)) {
+    lifePhase = "meal";
+    activity = /(早餐|早饭)/.test(normalized) ? "breakfast" : /(午饭)/.test(normalized) ? "lunch" : /(晚饭)/.test(normalized) ? "dinner" : "meal";
+    place = previous?.place ?? "unknown";
+  } else if (/(洗澡|浴室|擦头发)/.test(normalized)) {
+    lifePhase = "home";
+    activity = "bath";
+    place = "bathroom";
+  } else if (/(开会|加班|工作)/.test(normalized)) {
+    lifePhase = "work";
+    activity = /(开会)/.test(normalized) ? "meeting" : "work";
+    place = "workplace";
+  } else if (/(散步|看电影|打游戏|咖啡|音乐)/.test(normalized)) {
+    lifePhase = "leisure";
+    activity = /(散步)/.test(normalized) ? "walk" : /(看电影)/.test(normalized) ? "movie" : /(打游戏)/.test(normalized) ? "game" : "leisure";
+  } else if (label === "repair_attention") {
+    lifePhase = "repair";
+    activity = "repair_attention";
+    place = "conversation";
+    owner = "shared";
+  } else if (label === "miss_you" || label === "emotional_presence") {
+    lifePhase = "emotional";
+    activity = label;
+    place = "conversation";
+  } else if (label !== "activity_context") {
+    lifePhase = "unknown";
+    activity = label;
+  }
+
+  const timeContinuity: AsukaSceneTimeContinuity = previous?.lifePhase && previous.lifePhase !== lifePhase
+    ? "advanced_from_previous"
+    : "same_moment";
+
+  return { lifePhase, activity, place, owner, timeContinuity };
 }
 
 function sceneMaxAgeMs(label: AsukaSceneLabel): number | undefined {
@@ -791,6 +923,11 @@ function buildSceneState(
     previous?: AsukaSceneState;
     confidence: number;
     source: AsukaSceneSource;
+    lifePhase?: AsukaSceneLifePhase;
+    activity?: string;
+    place?: string;
+    owner?: AsukaSceneOwner;
+    timeContinuity?: AsukaSceneTimeContinuity;
     summary?: string;
     transitionHint?: string;
     startPolicy?: AsukaSceneStartPolicy;
@@ -801,6 +938,15 @@ function buildSceneState(
   const previous = options.previous;
   const kind = sceneKindForLabel(label);
   const sameLabel = previous?.label === label;
+  const inferredStructure = inferSceneStructureFromText(options.summary, label, sameLabel ? previous : undefined);
+  const lifePhase = normalizeSceneLifePhase(options.lifePhase, inferredStructure.lifePhase);
+  const activity = sanitizeSceneField(options.activity, inferredStructure.activity);
+  const place = sanitizeSceneField(options.place, inferredStructure.place);
+  const owner = normalizeSceneOwner(options.owner, inferredStructure.owner);
+  const timeContinuity = normalizeSceneTimeContinuity(
+    options.timeContinuity,
+    options.startPolicy === "reset" ? "reset_by_model" : inferredStructure.timeContinuity
+  );
   const summary = sanitizeSceneFreeText(options.summary, MAX_SCENE_SUMMARY_CHARS)
     ?? (sameLabel && previous?.summary ? previous.summary : sceneSummaryForLabel(label));
   const transitionHint = sanitizeSceneFreeText(options.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS)
@@ -826,6 +972,11 @@ function buildSceneState(
   return {
     kind,
     label,
+    lifePhase,
+    activity,
+    place,
+    owner,
+    timeContinuity,
     summary,
     confidence: clampSceneConfidence(options.confidence),
     startedAt: reuseStartedAt ? previous.startedAt : options.now,
@@ -1010,6 +1161,11 @@ interface SceneInferenceCandidate {
   label: AsukaSceneLabel;
   confidence: number;
   source: AsukaSceneSource;
+  lifePhase?: AsukaSceneLifePhase;
+  activity?: string;
+  place?: string;
+  owner?: AsukaSceneOwner;
+  timeContinuity?: AsukaSceneTimeContinuity;
   summary?: string;
   transitionHint?: string;
   startPolicy?: AsukaSceneStartPolicy;
@@ -1122,6 +1278,11 @@ function parseSceneInferenceCandidate(rawText: string, source: AsukaSceneSource)
     const parsed = JSON.parse(jsonText) as {
       label?: string;
       confidence?: number;
+      lifePhase?: string;
+      activity?: string;
+      place?: string;
+      owner?: string;
+      timeContinuity?: string;
       summary?: string;
       transitionHint?: string;
       startPolicy?: string;
@@ -1136,6 +1297,17 @@ function parseSceneInferenceCandidate(rawText: string, source: AsukaSceneSource)
     return {
       label: parsed.label as AsukaSceneLabel,
       confidence: clampSceneConfidence(parsed.confidence),
+      lifePhase: parsed.lifePhase && SCENE_LIFE_PHASES.includes(parsed.lifePhase as AsukaSceneLifePhase)
+        ? parsed.lifePhase as AsukaSceneLifePhase
+        : undefined,
+      activity: sanitizeSceneFreeText(parsed.activity, MAX_SCENE_FIELD_CHARS),
+      place: sanitizeSceneFreeText(parsed.place, MAX_SCENE_FIELD_CHARS),
+      owner: parsed.owner && SCENE_OWNERS.includes(parsed.owner as AsukaSceneOwner)
+        ? parsed.owner as AsukaSceneOwner
+        : undefined,
+      timeContinuity: parsed.timeContinuity && SCENE_TIME_CONTINUITIES.includes(parsed.timeContinuity as AsukaSceneTimeContinuity)
+        ? parsed.timeContinuity as AsukaSceneTimeContinuity
+        : undefined,
       summary: sanitizeSceneFreeText(parsed.summary, MAX_SCENE_SUMMARY_CHARS),
       transitionHint: sanitizeSceneFreeText(parsed.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS),
       startPolicy,
@@ -1161,8 +1333,12 @@ async function inferSceneCandidateWithModel(
   const prompt = [
     "你是 Asuka 的场景裁决器，只能输出一个 JSON 对象，不要解释。",
     `允许的 label 只有: ${SCENE_LABELS.join(", ")}`,
-    "输出格式: {\"label\":\"activity_context\",\"summary\":\"用户刚才像是在吃晚饭，语境偏日常陪伴。\",\"confidence\":0.72,\"startPolicy\":\"reuse\",\"transitionHint\":\"如果已经过去一两个小时，应自然过渡到饭后休息、收拾或普通聊天，不要断言仍在吃。\"}",
+    `允许的 lifePhase 只有: ${SCENE_LIFE_PHASES.join(", ")}`,
+    `允许的 owner 只有: ${SCENE_OWNERS.join(", ")}`,
+    `允许的 timeContinuity 只有: ${SCENE_TIME_CONTINUITIES.join(", ")}`,
+    "输出格式: {\"label\":\"activity_context\",\"lifePhase\":\"school_day\",\"activity\":\"after_class\",\"place\":\"campus\",\"owner\":\"asuka\",\"timeContinuity\":\"advanced_from_morning\",\"summary\":\"Asuka 上午刚下课，准备关心用户下午考试。\",\"confidence\":0.72,\"startPolicy\":\"reuse\",\"transitionHint\":\"自然承接上午校园状态，不要回退到睡前或夜间场景。\"}",
     "summary 要概括当前可用的生活/情绪/补救场景，不要复述长对话；transitionHint 要给主回复模型自然过渡建议。",
+    "lifePhase/activity/place/owner/timeContinuity 是给程序维护时间线的结构化字段，必须比 summary 更稳定；不要把校园、睡觉、吃饭混在同一个结构化阶段里。",
     "startPolicy 只能是 reuse/reset/advance：同一场景延续用 reuse，新场景开始用 reset，旧场景自然进入后续阶段用 advance。",
     "如果没有足够依据保留物理位置，优先输出 emotional_presence、miss_you 或 repair_attention。",
     "物理位置必须谨慎：doorway 最短、transit 其次，过久要衰减。",
@@ -1223,9 +1399,12 @@ function inferSceneCandidateLocally(
 ): SceneInferenceCandidate {
   const explicitLabel = detectExplicitSceneLabel(eventContext.text);
   if (explicitLabel) {
+    const structure = inferSceneStructureFromText(eventContext.text, explicitLabel, previousScene);
     return {
       label: explicitLabel,
       confidence: isPhysicalSceneLabel(explicitLabel) ? 0.84 : 0.78,
+      ...structure,
+      timeContinuity: previousScene?.lifePhase && previousScene.lifePhase !== structure.lifePhase ? "reset_by_user" : structure.timeContinuity,
       summary: explicitLabel === "activity_context" ? buildRuleActivitySummary(eventContext.text) : undefined,
       transitionHint: buildDefaultSceneTransitionHint(explicitLabel),
       startPolicy: previousScene?.label === explicitLabel ? "reuse" : "reset",
@@ -1237,6 +1416,11 @@ function inferSceneCandidateLocally(
     return {
       label: "repair_attention",
       confidence: 0.76,
+      lifePhase: "repair",
+      activity: "repair_attention",
+      place: "conversation",
+      owner: "shared",
+      timeContinuity: previousScene?.lifePhase === "repair" ? "same_moment" : "advanced_from_previous",
       transitionHint: buildDefaultSceneTransitionHint("repair_attention"),
       observed: true,
       source: "rule",
@@ -1247,6 +1431,8 @@ function inferSceneCandidateLocally(
     return {
       label,
       confidence: 0.64,
+      ...inferSceneStructureFromText(undefined, label, previousScene),
+      timeContinuity: "advanced_from_previous",
       transitionHint: buildDefaultSceneTransitionHint(label),
       startPolicy: "advance",
       source: "rule",
@@ -1255,6 +1441,11 @@ function inferSceneCandidateLocally(
   return {
     label: previousScene?.label ?? fallbackLabel,
     confidence: previousScene ? Math.max(previousScene.confidence * 0.95, 0.5) : 0.58,
+    lifePhase: previousScene?.lifePhase,
+    activity: previousScene?.activity,
+    place: previousScene?.place,
+    owner: previousScene?.owner,
+    timeContinuity: "same_moment",
     transitionHint: previousScene?.transitionHint ?? buildDefaultSceneTransitionHint(previousScene?.label ?? fallbackLabel),
     startPolicy: "reuse",
     source: "rule",
@@ -1283,6 +1474,11 @@ export function applySceneProgressionRules(
   let source: AsukaSceneSource = explicitLabel ? "rule" : candidate?.source ?? "rule";
   let summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
   let transitionHint = nextLabel === candidate?.label ? candidate?.transitionHint : undefined;
+  let lifePhase = nextLabel === candidate?.label ? candidate?.lifePhase : undefined;
+  let activity = nextLabel === candidate?.label ? candidate?.activity : undefined;
+  let place = nextLabel === candidate?.label ? candidate?.place : undefined;
+  let owner = nextLabel === candidate?.label ? candidate?.owner : undefined;
+  let timeContinuity = nextLabel === candidate?.label ? candidate?.timeContinuity : undefined;
   let startPolicy = candidate?.startPolicy;
   let observed = candidate?.observed;
 
@@ -1292,6 +1488,11 @@ export function applySceneProgressionRules(
     source = candidate?.source ?? "rule";
     summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
     transitionHint = candidate?.transitionHint ?? buildDefaultSceneTransitionHint(nextLabel);
+    lifePhase = "repair";
+    activity = "repair_attention";
+    place = "conversation";
+    owner = "shared";
+    timeContinuity = previousScene?.lifePhase === "repair" ? "same_moment" : "advanced_from_previous";
     startPolicy = previousScene?.label === nextLabel ? "reuse" : "reset";
     observed = true;
   }
@@ -1303,6 +1504,12 @@ export function applySceneProgressionRules(
       confidence = Math.max(confidence, nextLabel === "transit" ? 0.68 : 0.62);
       summary = nextLabel === candidate?.label ? candidate?.summary : undefined;
       transitionHint = candidate?.transitionHint ?? buildDefaultSceneTransitionHint(nextLabel);
+      const structure = inferSceneStructureFromText(summary, nextLabel, previousScene);
+      lifePhase = nextLabel === candidate?.label ? candidate?.lifePhase ?? structure.lifePhase : structure.lifePhase;
+      activity = nextLabel === candidate?.label ? candidate?.activity ?? structure.activity : structure.activity;
+      place = nextLabel === candidate?.label ? candidate?.place ?? structure.place : structure.place;
+      owner = nextLabel === candidate?.label ? candidate?.owner ?? structure.owner : structure.owner;
+      timeContinuity = "advanced_from_previous";
       startPolicy = "advance";
     } else if (isPhysicalSceneLabel(nextLabel)) {
       const reinforced = confidence >= PHYSICAL_SCENE_CONFIDENCE_THRESHOLD;
@@ -1312,6 +1519,11 @@ export function applySceneProgressionRules(
         source = "rule";
         summary = previousScene.summary;
         transitionHint = previousScene.transitionHint;
+        lifePhase = previousScene.lifePhase;
+        activity = previousScene.activity;
+        place = previousScene.place;
+        owner = previousScene.owner;
+        timeContinuity = "same_moment";
         startPolicy = "reuse";
       }
     } else if (confidence < PHYSICAL_SCENE_CONFIDENCE_THRESHOLD && advancePolicy !== "fade") {
@@ -1320,6 +1532,11 @@ export function applySceneProgressionRules(
       source = "rule";
       summary = previousScene.summary;
       transitionHint = previousScene.transitionHint;
+      lifePhase = previousScene.lifePhase;
+      activity = previousScene.activity;
+      place = previousScene.place;
+      owner = previousScene.owner;
+      timeContinuity = "same_moment";
       startPolicy = "reuse";
     }
   }
@@ -1330,6 +1547,12 @@ export function applySceneProgressionRules(
     source = "rule";
     summary = undefined;
     transitionHint = buildDefaultSceneTransitionHint(nextLabel);
+    const structure = inferSceneStructureFromText(options.eventText, nextLabel, previousScene);
+    lifePhase = structure.lifePhase;
+    activity = structure.activity;
+    place = structure.place;
+    owner = structure.owner;
+    timeContinuity = previousScene?.lifePhase && previousScene.lifePhase !== structure.lifePhase ? "reset_by_model" : structure.timeContinuity;
     startPolicy = previousScene?.label === nextLabel ? "reuse" : "reset";
   }
 
@@ -1339,6 +1562,11 @@ export function applySceneProgressionRules(
     previous: previousScene,
     confidence,
     source,
+    lifePhase,
+    activity,
+    place,
+    owner,
+    timeContinuity,
     summary,
     transitionHint: transitionHint ?? (previousScene?.label === nextLabel ? undefined : buildDefaultSceneTransitionHint(nextLabel)),
     startPolicy,
@@ -1394,6 +1622,32 @@ function migrateLegacyPhysicalScenes(state: AsukaStateFile, now = Date.now()): b
       : sceneSummaryForLabel(peer.scene.label);
     if (peer.scene.summary !== nextSceneSummary) {
       peer.scene.summary = nextSceneSummary;
+      changed = true;
+    }
+    const structure = inferSceneStructureFromText(peer.scene.summary, peer.scene.label, peer.scene);
+    const nextLifePhase = normalizeSceneLifePhase(peer.scene.lifePhase, structure.lifePhase);
+    if (peer.scene.lifePhase !== nextLifePhase) {
+      peer.scene.lifePhase = nextLifePhase;
+      changed = true;
+    }
+    const nextActivity = sanitizeSceneField(peer.scene.activity, structure.activity);
+    if (peer.scene.activity !== nextActivity) {
+      peer.scene.activity = nextActivity;
+      changed = true;
+    }
+    const nextPlace = sanitizeSceneField(peer.scene.place, structure.place);
+    if (peer.scene.place !== nextPlace) {
+      peer.scene.place = nextPlace;
+      changed = true;
+    }
+    const nextOwner = normalizeSceneOwner(peer.scene.owner, structure.owner);
+    if (peer.scene.owner !== nextOwner) {
+      peer.scene.owner = nextOwner;
+      changed = true;
+    }
+    const nextTimeContinuity = normalizeSceneTimeContinuity(peer.scene.timeContinuity, structure.timeContinuity);
+    if (peer.scene.timeContinuity !== nextTimeContinuity) {
+      peer.scene.timeContinuity = nextTimeContinuity;
       changed = true;
     }
     peer.scene.confidence = clampSceneConfidence(peer.scene.confidence);
@@ -1700,21 +1954,31 @@ function getOrCreatePeer(context: AsukaPeerContext): AsukaPeerState {
   return created;
 }
 
-export function getSceneSnapshot(context: AsukaPeerContext): Pick<AsukaSceneState, "label" | "summary" | "version"> | null {
+export function getSceneSnapshot(context: AsukaPeerContext): Pick<AsukaSceneState, "label" | "lifePhase" | "activity" | "place" | "owner" | "timeContinuity" | "summary" | "version"> | null {
   const peer = loadState().peers[makePeerKey(context)];
   if (!peer?.scene) return null;
   return {
     label: peer.scene.label,
+    lifePhase: peer.scene.lifePhase,
+    activity: peer.scene.activity,
+    place: peer.scene.place,
+    owner: peer.scene.owner,
+    timeContinuity: peer.scene.timeContinuity,
     summary: peer.scene.summary,
     version: peer.scene.version,
   };
 }
 
-export function getSceneSnapshotByPeerKey(peerKey: string): Pick<AsukaSceneState, "label" | "summary" | "version"> | null {
+export function getSceneSnapshotByPeerKey(peerKey: string): Pick<AsukaSceneState, "label" | "lifePhase" | "activity" | "place" | "owner" | "timeContinuity" | "summary" | "version"> | null {
   const peer = loadState().peers[peerKey];
   if (!peer?.scene) return null;
   return {
     label: peer.scene.label,
+    lifePhase: peer.scene.lifePhase,
+    activity: peer.scene.activity,
+    place: peer.scene.place,
+    owner: peer.scene.owner,
+    timeContinuity: peer.scene.timeContinuity,
     summary: peer.scene.summary,
     version: peer.scene.version,
   };
@@ -1889,6 +2153,7 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
     sections.push(lastAssistantLine);
   }
   if (activePhysicalScene || scene.kind === "activity") {
+    sections.push(`- 当前结构化场景: lifePhase=${scene.lifePhase}, activity=${scene.activity}, place=${scene.place}, owner=${scene.owner}, timeContinuity=${scene.timeContinuity}`);
     sections.push(`- 当前场景线索: ${scene.summary}`);
     sections.push(`- 距离场景开始: ${formatSceneAgeBucketForPrompt(scene.startedAt, now)}（${describeSceneFreshness(scene, now)}）`);
     const transitionHint = scene.transitionHint ?? buildDefaultSceneTransitionHint(scene.label);
@@ -1897,6 +2162,7 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
     }
   }
   if (scene.kind !== "physical" && scene.kind !== "activity") {
+    sections.push(`- 当前结构化状态: lifePhase=${scene.lifePhase}, activity=${scene.activity}, place=${scene.place}, owner=${scene.owner}, timeContinuity=${scene.timeContinuity}`);
     sections.push(`- 你现在自己的状态: ${scene.summary}`);
   }
   if (scene.kind === "physical" && !activePhysicalScene && (peer.ambient.currentPresence ?? disposition.presence)) {

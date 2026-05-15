@@ -65,6 +65,25 @@ export interface LocalRuntimeMediaSummary {
   studioModel: string;
 }
 
+export type LocalRuntimeMiniMaxCapabilityKind = "text" | "image" | "voice" | "vision" | "search";
+
+export interface LocalRuntimeMiniMaxCapabilitySummary {
+  configured: boolean;
+  implemented: boolean;
+  source: string;
+  model: string;
+  baseUrlConfigured: boolean;
+  apiKeyConfigured: boolean;
+  notes: string[];
+}
+
+export interface LocalRuntimeMiniMaxSummary {
+  providerConfigured: boolean;
+  providerBaseUrlConfigured: boolean;
+  providerApiKeyConfigured: boolean;
+  capabilities: Record<LocalRuntimeMiniMaxCapabilityKind, LocalRuntimeMiniMaxCapabilitySummary>;
+}
+
 export interface LocalRuntimeHealthReport {
   status: LocalRuntimeHealthStatus;
   checkedAt: string;
@@ -73,6 +92,7 @@ export interface LocalRuntimeHealthReport {
   promiseState: LocalRuntimePromiseStateSummary;
   memoryState: LocalRuntimeHealthFileSummary;
   media: LocalRuntimeMediaSummary;
+  minimax: LocalRuntimeMiniMaxSummary;
 }
 
 export interface LocalRuntimeHealthOptions extends RuntimeCronPatchOptions {
@@ -166,7 +186,8 @@ function summarizeFile(targetPath: string): LocalRuntimeHealthFileSummary {
 function readJsonObject(targetPath: string): Record<string, any> | null {
   if (!fs.existsSync(targetPath)) return null;
   try {
-    const parsed = JSON.parse(fs.readFileSync(targetPath, "utf-8"));
+    const content = fs.readFileSync(targetPath, "utf-8").replace(/^\uFEFF/, "");
+    const parsed = JSON.parse(content);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
   } catch {
     return null;
@@ -251,6 +272,175 @@ function summarizeMediaReadiness(
       || hasConfiguredSecret(skillEnv.DASHSCOPE_API_KEY)
       || hasConfiguredSecret(env.DASHSCOPE_API_KEY),
     studioModel: model || "third_party_media:gemini-3-pro-image-preview",
+  };
+}
+
+function getObject(root: any, pathParts: string[]): Record<string, any> | undefined {
+  let current = root;
+  for (const part of pathParts) {
+    current = current?.[part];
+    if (!current || typeof current !== "object") return undefined;
+  }
+  return current as Record<string, any>;
+}
+
+function getStringValue(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+function isEnabledBlock(block: Record<string, any> | undefined): boolean {
+  return Boolean(block) && block?.enabled !== false;
+}
+
+function makeMiniMaxCapabilitySummary(input: {
+  configured: boolean;
+  implemented: boolean;
+  source: string;
+  model: string;
+  baseUrlConfigured: boolean;
+  apiKeyConfigured: boolean;
+  notes?: string[];
+}): LocalRuntimeMiniMaxCapabilitySummary {
+  return {
+    configured: input.configured,
+    implemented: input.implemented,
+    source: input.source,
+    model: input.model,
+    baseUrlConfigured: input.baseUrlConfigured,
+    apiKeyConfigured: input.apiKeyConfigured,
+    notes: input.notes ?? [],
+  };
+}
+
+function summarizeMiniMaxReadiness(
+  configPath: string,
+  env: Record<string, string | undefined>
+): LocalRuntimeMiniMaxSummary {
+  const root = readJsonObject(configPath);
+  const provider = getObject(root, ["models", "providers", "minimax"]);
+  const providerBaseUrlConfigured = hasConfiguredSecret(provider?.baseUrl);
+  const providerApiKeyConfigured = hasConfiguredSecret(provider?.apiKey)
+    || hasConfiguredSecret(env.MINIMAX_API_KEY);
+  const providerConfigured = providerBaseUrlConfigured && providerApiKeyConfigured;
+  const providerModel = getStringValue(provider?.models?.[0]?.id, provider?.model, "MiniMax-M2.7");
+
+  const primaryModel = getStringValue(root?.agents?.defaults?.model?.primary);
+  const textModel = primaryModel.toLowerCase().startsWith("minimax/")
+    ? primaryModel.replace(/^minimax\//i, "")
+    : providerModel;
+  const textConfigured = providerConfigured && (
+    primaryModel.toLowerCase().startsWith("minimax/")
+    || providerModel.toLowerCase().startsWith("minimax-")
+  );
+
+  const skillCfg = root?.skills?.entries?.["asuka-selfie"];
+  const skillEnv = skillCfg?.env || {};
+  const imageModel = getStringValue(
+    skillEnv.STUDIO_IMAGE_EDIT_MODEL,
+    skillEnv.STUDIO_IMAGE_MODEL,
+    skillEnv.STUDIO_MODEL,
+    env.STUDIO_IMAGE_EDIT_MODEL,
+    env.STUDIO_IMAGE_MODEL,
+    env.STUDIO_MODEL,
+    "image-01"
+  );
+  const imageBaseUrlConfigured = hasConfiguredSecret(skillEnv.STUDIO_API_BASE_URL)
+    || hasConfiguredSecret(env.STUDIO_API_BASE_URL)
+    || providerBaseUrlConfigured;
+  const imageApiKeyConfigured = hasConfiguredSecret(skillCfg?.apiKey)
+    || hasConfiguredSecret(skillEnv.STUDIO_API_KEY)
+    || hasConfiguredSecret(env.STUDIO_API_KEY)
+    || providerApiKeyConfigured;
+  const imageConfigured = imageBaseUrlConfigured && imageApiKeyConfigured && /^image-01(?:$|-)/i.test(imageModel);
+
+  const channelTts = getObject(root, ["channels", "qqbot", "tts"]);
+  const messagesTts = getObject(root, ["messages", "tts"]);
+  const messagesProviderId = getStringValue(messagesTts?.provider);
+  const messagesProviderBlock = messagesProviderId ? getObject(messagesTts, [messagesProviderId]) : undefined;
+  const ttsBlock = isEnabledBlock(channelTts) ? channelTts : isEnabledBlock(messagesTts) ? messagesProviderBlock : undefined;
+  const ttsProviderId = getStringValue(channelTts?.provider, messagesProviderId);
+  const ttsProvider = ttsProviderId ? getObject(root, ["models", "providers", ttsProviderId]) : undefined;
+  const voiceModel = getStringValue(ttsBlock?.model, env.MINIMAX_TTS_MODEL);
+  const voiceBaseUrlConfigured = hasConfiguredSecret(ttsBlock?.baseUrl)
+    || hasConfiguredSecret(ttsProvider?.baseUrl)
+    || (ttsProviderId === "minimax" && providerBaseUrlConfigured);
+  const voiceApiKeyConfigured = hasConfiguredSecret(ttsBlock?.apiKey)
+    || hasConfiguredSecret(ttsProvider?.apiKey)
+    || (ttsProviderId === "minimax" && providerApiKeyConfigured);
+  const voiceConfigured = voiceBaseUrlConfigured
+    && voiceApiKeyConfigured
+    && (ttsProviderId === "minimax" || /^minimax/i.test(voiceModel) || hasConfiguredSecret(env.MINIMAX_TTS_MODEL));
+
+  const miniMaxBlock = getObject(root, ["channels", "qqbot", "minimax"]);
+  const visionBlock = getObject(miniMaxBlock, ["vision"]);
+  const visionModel = getStringValue(visionBlock?.model, env.MINIMAX_VISION_MODEL);
+  const visionConfigured = isEnabledBlock(visionBlock)
+    && providerConfigured
+    && Boolean(visionModel);
+
+  const searchBlock = getObject(miniMaxBlock, ["search"]);
+  const searchModel = getStringValue(searchBlock?.model, env.MINIMAX_SEARCH_MODEL);
+  const searchEnvEnabled = /^(1|true|yes|on)$/i.test(getStringValue(env.MINIMAX_SEARCH_ENABLED));
+  const searchConfigured = (isEnabledBlock(searchBlock) || searchEnvEnabled)
+    && providerConfigured
+    && Boolean(searchModel || searchEnvEnabled);
+
+  return {
+    providerConfigured,
+    providerBaseUrlConfigured,
+    providerApiKeyConfigured,
+    capabilities: {
+      text: makeMiniMaxCapabilitySummary({
+        configured: textConfigured,
+        implemented: true,
+        source: textConfigured ? "models.providers.minimax" : "not-configured",
+        model: textConfigured ? textModel : "",
+        baseUrlConfigured: providerBaseUrlConfigured,
+        apiKeyConfigured: providerApiKeyConfigured,
+        notes: textConfigured ? [] : ["primary-model-not-minimax-or-provider-missing"],
+      }),
+      image: makeMiniMaxCapabilitySummary({
+        configured: imageConfigured,
+        implemented: true,
+        source: imageConfigured ? "skills.entries.asuka-selfie" : "not-configured",
+        model: imageConfigured ? imageModel : "",
+        baseUrlConfigured: imageBaseUrlConfigured,
+        apiKeyConfigured: imageApiKeyConfigured,
+        notes: imageConfigured ? [] : ["image-01-skill-config-missing"],
+      }),
+      voice: makeMiniMaxCapabilitySummary({
+        configured: voiceConfigured,
+        implemented: true,
+        source: voiceConfigured ? "channels.qqbot.tts" : "not-configured",
+        model: voiceConfigured ? voiceModel : "",
+        baseUrlConfigured: voiceBaseUrlConfigured,
+        apiKeyConfigured: voiceApiKeyConfigured,
+        notes: voiceConfigured ? [] : ["tts-config-missing"],
+      }),
+      vision: makeMiniMaxCapabilitySummary({
+        configured: visionConfigured,
+        implemented: true,
+        source: visionConfigured ? "channels.qqbot.minimax.vision" : "not-configured",
+        model: visionConfigured ? visionModel : "",
+        baseUrlConfigured: providerBaseUrlConfigured,
+        apiKeyConfigured: providerApiKeyConfigured,
+        notes: visionConfigured ? [] : ["vision-config-missing"],
+      }),
+      search: makeMiniMaxCapabilitySummary({
+        configured: searchConfigured,
+        implemented: true,
+        source: searchConfigured ? (isEnabledBlock(searchBlock) ? "channels.qqbot.minimax.search" : "env.MINIMAX_SEARCH_ENABLED") : "not-configured",
+        model: searchConfigured ? (searchModel || providerModel) : "",
+        baseUrlConfigured: providerBaseUrlConfigured,
+        apiKeyConfigured: providerApiKeyConfigured,
+        notes: searchConfigured ? [] : ["search-config-missing"],
+      }),
+    },
   };
 }
 
@@ -368,6 +558,7 @@ export function buildLocalRuntimeHealthReport(options: LocalRuntimeHealthOptions
   const promiseState = summarizePromiseState(qqbotDataDir);
   const memoryState = summarizeFile(path.join(qqbotDataDir, "data", "asuka-memory", "memory.json"));
   const media = summarizeMediaReadiness(configPath, qqbotDataDir, selfieScriptPath, env);
+  const minimax = summarizeMiniMaxReadiness(configPath, env);
 
   const hasWarnings = !qqDelivery.configExists
     || !qqDelivery.qqbotConfigPresent
@@ -383,6 +574,7 @@ export function buildLocalRuntimeHealthReport(options: LocalRuntimeHealthOptions
     promiseState,
     memoryState,
     media,
+    minimax,
   };
 }
 
@@ -394,6 +586,14 @@ export function formatLocalRuntimeHealthReport(report: LocalRuntimeHealthReport)
   const cronTargets = report.cronPatch.targets
     .map((target) => `${target.kind}:${target.status}`)
     .join(", ");
+  const minimaxCapabilities = (["text", "image", "voice", "vision", "search"] as LocalRuntimeMiniMaxCapabilityKind[])
+    .map((kind) => {
+      const capability = report.minimax.capabilities[kind];
+      const modelSuffix = capability.model ? `:${capability.model}` : "";
+      const implementedSuffix = capability.implemented ? "" : ":pending";
+      return `${kind}=${yesNo(capability.configured)}${modelSuffix}${implementedSuffix}`;
+    })
+    .join(", ");
   return [
     `QQBot runtime health: ${report.status}`,
     `checkedAt: ${report.checkedAt}`,
@@ -403,5 +603,6 @@ export function formatLocalRuntimeHealthReport(report: LocalRuntimeHealthReport)
     `promise state: exists=${yesNo(report.promiseState.exists)}, total=${report.promiseState.total}, scheduled=${report.promiseState.scheduled}, scheduleFailed=${report.promiseState.scheduleFailed}, deliveryFailed=${report.promiseState.deliveryFailed}, cronJobIds=${report.promiseState.cronJobIds}, fallbackTracked=${report.promiseState.fallbackTracked}`,
     `memory state: exists=${yesNo(report.memoryState.exists)} (${report.memoryState.path})`,
     `selfie/media: script=${yesNo(report.media.selfieScript.exists)}, studioKey=${yesNo(report.media.studioApiKeyConfigured)}, model=${report.media.studioModel}, imageDataDir=${yesNo(report.media.imageDataDir.exists)} (${report.media.imageDataDir.path})`,
+    `minimax: provider=${yesNo(report.minimax.providerConfigured)}, ${minimaxCapabilities}`,
   ].join("\n");
 }

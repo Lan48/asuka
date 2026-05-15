@@ -151,36 +151,115 @@ export interface TTSConfig {
   apiKey: string;
   model: string;
   voice: string;
+  provider?: string;
   /** Azure OpenAI 风格：使用 api-key header 而非 Bearer token */
   authStyle?: "bearer" | "api-key";
   /** 附加在 URL 后的查询参数，如 Azure 的 api-version */
   queryParams?: Record<string, string>;
   /** 自定义速度（默认不传） */
   speed?: number;
+  /** MiniMax T2A 音量，默认不传 */
+  vol?: number;
+  /** MiniMax T2A 音高，默认不传 */
+  pitch?: number;
+  /** MiniMax T2A voice_modify 参数，由单轮 payload 可选覆盖 */
+  voiceModify?: MiniMaxVoiceModify;
+  /** MiniMax T2A 语言增强，如 Chinese/Japanese/auto */
+  languageBoost?: string;
+  /** MiniMax T2A 读音控制，格式为 text/tone */
+  pronunciationTone?: string[];
+  /** 期望音频格式；MiniMax 默认使用 wav 以便本地直接解析为 PCM */
+  audioFormat?: "pcm" | "mp3" | "wav" | "flac";
+  /** 输出采样率 */
+  sampleRate?: number;
+  /** 输出码率 */
+  bitrate?: number;
+  /** 输出声道数 */
+  channel?: number;
+  /** 单次 TTS 最大文本长度 */
+  maxInputChars?: number;
+  /** 单进程 TTS 请求冷却时间 */
+  cooldownMs?: number;
+  /** TTS 返回音频最大字节数 */
+  maxOutputBytes?: number;
 }
+
+export interface MiniMaxVoiceModify {
+  pitch?: number;
+  intensity?: number;
+  timbre?: number;
+  soundEffects?: string[];
+}
+
+export interface TTSRuntimeOverrides {
+  voice?: string;
+  speed?: number;
+  vol?: number;
+  pitch?: number;
+  languageBoost?: string;
+  emotion?: "neutral" | "gentle" | "soft" | "happy" | "amused" | "shy" | "sleepy" | "relieved" | "serious";
+  pause?: "none" | "light" | "normal" | "long";
+  pauseBeforeSeconds?: number;
+  pauseAfterSeconds?: number;
+  voiceModify?: MiniMaxVoiceModify;
+  pronunciationTone?: string[];
+}
+
+const DEFAULT_TTS_MAX_INPUT_CHARS = 240;
+const DEFAULT_TTS_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MINIMAX_TTS_MODEL = "speech-2.8-hd";
+const DEFAULT_MINIMAX_VOICE_ID = "Chinese (Mandarin)_Laid_BackGirl";
+const ttsLastRequestByKey = new Map<string, number>();
 
 function resolveTTSFromBlock(
   block: Record<string, any>,
   providerCfg: Record<string, any> | undefined,
+  providerId: string = "openai",
 ): TTSConfig | null {
   const baseUrl: string | undefined = block?.baseUrl || providerCfg?.baseUrl;
   const apiKey: string | undefined = block?.apiKey || providerCfg?.apiKey;
-  const model: string = block?.model || "tts-1";
-  const voice: string = block?.voice || "alloy";
+  const isMiniMax = providerId === "minimax" || /minimax/i.test(String(baseUrl ?? ""));
+  const model: string = block?.model || (isMiniMax ? DEFAULT_MINIMAX_TTS_MODEL : "tts-1");
+  const voice: string = block?.voice || block?.voiceId || (isMiniMax ? DEFAULT_MINIMAX_VOICE_ID : "alloy");
   if (!baseUrl || !apiKey) return null;
 
   const authStyle = (block?.authStyle || providerCfg?.authStyle) === "api-key" ? "api-key" as const : "bearer" as const;
   const queryParams: Record<string, string> = { ...(providerCfg?.queryParams ?? {}), ...(block?.queryParams ?? {}) };
   const speed: number | undefined = block?.speed;
+  const vol: number | undefined = block?.vol;
+  const pitch: number | undefined = block?.pitch;
+  const voiceModify = normalizeMiniMaxVoiceModify(block?.voiceModify ?? block?.voice_modify);
+  const sampleRate: number | undefined = block?.sampleRate ?? block?.sample_rate;
+  const bitrate: number | undefined = block?.bitrate;
+  const channel: number | undefined = block?.channel;
+  const maxInputChars: number | undefined = block?.maxInputChars ?? block?.max_input_chars;
+  const cooldownMs: number | undefined = block?.cooldownMs ?? block?.cooldown_ms;
+  const maxOutputBytes: number | undefined = block?.maxOutputBytes ?? block?.max_output_bytes;
+  const languageBoost: string | undefined = block?.languageBoost ?? block?.language_boost;
+  const pronunciationTone = normalizeRuntimePronunciationTone(block?.pronunciationTone ?? block?.pronunciation_tone);
+  const audioFormat: TTSConfig["audioFormat"] | undefined = block?.audioFormat ?? block?.audio_format ?? (isMiniMax ? "wav" : undefined);
 
   return {
     baseUrl: baseUrl.replace(/\/+$/, ""),
     apiKey,
     model,
     voice,
+    provider: providerId,
     authStyle,
     ...(Object.keys(queryParams).length > 0 ? { queryParams } : {}),
     ...(speed !== undefined ? { speed } : {}),
+    ...(vol !== undefined ? { vol } : {}),
+    ...(pitch !== undefined ? { pitch } : {}),
+    ...(voiceModify ? { voiceModify } : {}),
+    ...(languageBoost ? { languageBoost } : {}),
+    ...(pronunciationTone ? { pronunciationTone } : {}),
+    ...(audioFormat ? { audioFormat } : {}),
+    ...(sampleRate !== undefined ? { sampleRate } : {}),
+    ...(bitrate !== undefined ? { bitrate } : {}),
+    ...(channel !== undefined ? { channel } : {}),
+    ...(maxInputChars !== undefined ? { maxInputChars } : {}),
+    ...(cooldownMs !== undefined ? { cooldownMs } : {}),
+    ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
   };
 }
 
@@ -192,7 +271,7 @@ export function resolveTTSConfig(cfg: Record<string, unknown>): TTSConfig | null
   if (channelTts && channelTts.enabled !== false) {
     const providerId: string = channelTts?.provider || "openai";
     const providerCfg = c?.models?.providers?.[providerId];
-    const result = resolveTTSFromBlock(channelTts, providerCfg);
+    const result = resolveTTSFromBlock(channelTts, providerCfg, providerId);
     if (result) return result;
   }
 
@@ -202,11 +281,113 @@ export function resolveTTSConfig(cfg: Record<string, unknown>): TTSConfig | null
     const providerId: string = msgTts?.provider || "openai";
     const providerBlock = msgTts?.[providerId];
     const providerCfg = c?.models?.providers?.[providerId];
-    const result = resolveTTSFromBlock(providerBlock ?? {}, providerCfg);
+    const result = resolveTTSFromBlock(providerBlock ?? {}, providerCfg, providerId);
     if (result) return result;
   }
 
   return null;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function clampNumber(value: unknown, min: number, max: number): number | undefined {
+  const numberValue = asFiniteNumber(value);
+  if (numberValue === undefined) return undefined;
+  return Math.min(max, Math.max(min, numberValue));
+}
+
+function normalizeMiniMaxVoiceModify(value: unknown): MiniMaxVoiceModify | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Record<string, unknown>;
+  const result: MiniMaxVoiceModify = {};
+  const pitch = clampNumber(input.pitch, -12, 12);
+  const intensity = clampNumber(input.intensity, -10, 10);
+  const timbre = clampNumber(input.timbre, -10, 10);
+  const rawSoundEffects = input.soundEffects ?? input.sound_effects;
+  const soundEffects = Array.isArray(rawSoundEffects)
+    ? rawSoundEffects
+        .map((item) => typeof item === "string" ? item.trim() : "")
+        .filter(Boolean)
+        .slice(0, 4)
+    : undefined;
+  if (pitch !== undefined) result.pitch = pitch;
+  if (intensity !== undefined) result.intensity = intensity;
+  if (timbre !== undefined) result.timbre = timbre;
+  if (soundEffects && soundEffects.length > 0) result.soundEffects = soundEffects;
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function normalizeRuntimeVoiceId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 120) return undefined;
+  return trimmed.replace(/^minimax/i, "").trim();
+}
+
+function normalizeRuntimeLanguageBoost(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!/^[a-zA-Z_ -]{2,40}$/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+function normalizeRuntimePronunciationTone(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const tones = value
+    .map((item) => typeof item === "string" ? item.trim() : "")
+    .filter((item) => item.length > 0 && item.length <= 80)
+    .slice(0, 12);
+  return tones.length > 0 ? tones : undefined;
+}
+
+function defaultsForTTSEmotion(emotion: TTSRuntimeOverrides["emotion"]): Partial<Pick<TTSConfig, "speed" | "pitch" | "vol">> {
+  switch (emotion) {
+    case "happy":
+    case "amused":
+      return { speed: 1.08, pitch: 1, vol: 1 };
+    case "sleepy":
+      return { speed: 0.86, pitch: -1, vol: 0.9 };
+    case "shy":
+    case "soft":
+    case "gentle":
+      return { speed: 0.94, pitch: 0.3, vol: 0.95 };
+    case "relieved":
+      return { speed: 0.92, pitch: -0.2, vol: 0.95 };
+    case "serious":
+      return { speed: 0.92, pitch: -0.8, vol: 1 };
+    default:
+      return {};
+  }
+}
+
+export function applyTTSRuntimeOverrides(base: TTSConfig, overrides?: TTSRuntimeOverrides | null): TTSConfig {
+  if (!overrides || typeof overrides !== "object") return base;
+  const emotionDefaults = defaultsForTTSEmotion(overrides.emotion);
+  const voice = normalizeRuntimeVoiceId(overrides.voice);
+  const speed = clampNumber(overrides.speed ?? emotionDefaults.speed, 0.5, 2);
+  const vol = clampNumber(overrides.vol ?? emotionDefaults.vol, 0, 10);
+  const pitch = clampNumber(overrides.pitch ?? emotionDefaults.pitch, -12, 12);
+  const languageBoost = normalizeRuntimeLanguageBoost(overrides.languageBoost);
+  const voiceModify = normalizeMiniMaxVoiceModify(overrides.voiceModify);
+  const pronunciationTone = normalizeRuntimePronunciationTone(overrides.pronunciationTone);
+
+  return {
+    ...base,
+    ...(voice ? { voice } : {}),
+    ...(speed !== undefined ? { speed } : {}),
+    ...(vol !== undefined ? { vol } : {}),
+    ...(pitch !== undefined ? { pitch } : {}),
+    ...(languageBoost ? { languageBoost } : {}),
+    ...(voiceModify ? { voiceModify } : {}),
+    ...(pronunciationTone ? { pronunciationTone } : {}),
+  };
 }
 
 /**
@@ -232,10 +413,180 @@ function buildTTSRequest(ttsCfg: TTSConfig): { url: string; headers: Record<stri
   return { url, headers };
 }
 
+function isMiniMaxTTSConfig(ttsCfg: TTSConfig): boolean {
+  return ttsCfg.provider === "minimax"
+    || /minimax/i.test(ttsCfg.baseUrl)
+    || /^speech-/i.test(ttsCfg.model);
+}
+
+function enforceTTSRequestLimits(text: string, ttsCfg: TTSConfig): void {
+  const maxInputChars = ttsCfg.maxInputChars ?? DEFAULT_TTS_MAX_INPUT_CHARS;
+  if (text.length > maxInputChars) {
+    throw new Error(`TTS input too long: ${text.length}/${maxInputChars} chars`);
+  }
+
+  const cooldownMs = Math.max(0, ttsCfg.cooldownMs ?? 0);
+  if (cooldownMs <= 0) return;
+
+  const key = `${ttsCfg.provider ?? "default"}:${ttsCfg.model}:${ttsCfg.voice}`;
+  const now = Date.now();
+  const last = ttsLastRequestByKey.get(key) ?? 0;
+  const remainingMs = cooldownMs - (now - last);
+  if (remainingMs > 0) {
+    throw new Error(`TTS cooldown active: wait ${Math.ceil(remainingMs / 1000)}s`);
+  }
+  ttsLastRequestByKey.set(key, now);
+}
+
+function normalizeMiniMaxSpeed(speed?: number): number {
+  if (speed === undefined || Number.isNaN(speed)) return 1;
+  return Math.min(2, Math.max(0.5, speed));
+}
+
+function normalizeMiniMaxPitch(pitch?: number): number {
+  if (pitch === undefined || Number.isNaN(pitch)) return 0;
+  return Math.min(12, Math.max(-12, pitch));
+}
+
+function decodeMiniMaxAudioHex(response: any): Buffer {
+  const audio = response?.data?.audio ?? response?.audio ?? response?.data?.audio_hex;
+  if (typeof audio !== "string" || !audio.trim()) {
+    throw new Error(`MiniMax TTS response did not contain audio`);
+  }
+  const normalized = audio.trim().replace(/\s+/g, "");
+  if (!/^[0-9a-f]+$/i.test(normalized) || normalized.length % 2 !== 0) {
+    throw new Error(`MiniMax TTS audio was not valid hex`);
+  }
+  return Buffer.from(normalized, "hex");
+}
+
+async function textToSpeechPCMMiniMax(
+  text: string,
+  ttsCfg: TTSConfig,
+): Promise<{ pcmBuffer: Buffer; sampleRate: number }> {
+  const sampleRate = ttsCfg.sampleRate ?? 24000;
+  const maxOutputBytes = ttsCfg.maxOutputBytes ?? DEFAULT_TTS_MAX_OUTPUT_BYTES;
+  const url = `${ttsCfg.baseUrl}/t2a_v2`;
+  const controller = new AbortController();
+  const ttsTimeout = setTimeout(() => controller.abort(), 120000);
+  const startTime = Date.now();
+
+  const body: Record<string, unknown> = {
+    model: ttsCfg.model || DEFAULT_MINIMAX_TTS_MODEL,
+    text,
+    stream: false,
+    output_format: "hex",
+    voice_setting: {
+      voice_id: ttsCfg.voice,
+      speed: normalizeMiniMaxSpeed(ttsCfg.speed),
+      vol: ttsCfg.vol ?? 1,
+      pitch: normalizeMiniMaxPitch(ttsCfg.pitch),
+    },
+    audio_setting: {
+      sample_rate: sampleRate,
+      bitrate: ttsCfg.bitrate ?? 128000,
+      format: ttsCfg.audioFormat ?? "wav",
+      channel: ttsCfg.channel ?? 1,
+    },
+  };
+  if (ttsCfg.languageBoost) {
+    body.language_boost = ttsCfg.languageBoost;
+  }
+  if (ttsCfg.pronunciationTone && ttsCfg.pronunciationTone.length > 0) {
+    body.pronunciation_dict = ttsCfg.pronunciationTone.map((item) => {
+      const [textPart, tonePart] = item.split("/");
+      return {
+        text: textPart?.trim() || item,
+        tone: tonePart?.trim() || item,
+      };
+    });
+  }
+  if (ttsCfg.voiceModify) {
+    body.voice_modify = {
+      ...(ttsCfg.voiceModify.pitch !== undefined ? { pitch: ttsCfg.voiceModify.pitch } : {}),
+      ...(ttsCfg.voiceModify.intensity !== undefined ? { intensity: ttsCfg.voiceModify.intensity } : {}),
+      ...(ttsCfg.voiceModify.timbre !== undefined ? { timbre: ttsCfg.voiceModify.timbre } : {}),
+      ...(ttsCfg.voiceModify.soundEffects ? { sound_effects: ttsCfg.voiceModify.soundEffects } : {}),
+    };
+  }
+
+  try {
+    console.log(`[tts] MiniMax request: model=${ttsCfg.model}, voice=${ttsCfg.voice}, url=${url}`);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${ttsCfg.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(ttsTimeout));
+
+    const detail = await resp.text();
+    let parsed: any = {};
+    try {
+      parsed = detail ? JSON.parse(detail) : {};
+    } catch {
+      parsed = { text: detail };
+    }
+
+    const statusCode = Number(parsed?.base_resp?.status_code ?? 0);
+    if (!resp.ok || statusCode !== 0) {
+      const message = parsed?.base_resp?.status_msg
+        || parsed?.error?.message
+        || parsed?.message
+        || parsed?.text
+        || detail
+        || resp.statusText;
+      throw new Error(`MiniMax TTS failed (HTTP ${resp.status}): ${String(message).slice(0, 300)}`);
+    }
+
+    const audioBuffer = decodeMiniMaxAudioHex(parsed);
+    if (audioBuffer.length > maxOutputBytes) {
+      throw new Error(`MiniMax TTS audio too large: ${audioBuffer.length}/${maxOutputBytes} bytes`);
+    }
+
+    const format = (ttsCfg.audioFormat ?? "wav").toLowerCase();
+    if (format === "wav") {
+      const pcmBuffer = parseWavFallback(audioBuffer);
+      if (!pcmBuffer) throw new Error("MiniMax TTS wav response could not be parsed as PCM");
+      console.log(`[tts] MiniMax done: wav→PCM ${pcmBuffer.length} bytes, total=${Date.now() - startTime}ms`);
+      return { pcmBuffer, sampleRate: 24000 };
+    }
+
+    if (format === "mp3") {
+      const ffmpegCmd = await checkFfmpeg();
+      if (ffmpegCmd) {
+        const tmpDir = path.join(fs.mkdtempSync(path.join(require("node:os").tmpdir(), "tts-")));
+        const tmpMp3 = path.join(tmpDir, "tts.mp3");
+        fs.writeFileSync(tmpMp3, audioBuffer);
+        try {
+          const pcmBuffer = await ffmpegToPCM(ffmpegCmd, tmpMp3, sampleRate);
+          return { pcmBuffer, sampleRate };
+        } finally {
+          try { fs.unlinkSync(tmpMp3); fs.rmdirSync(tmpDir); } catch {}
+        }
+      }
+      const pcmBuffer = await wasmDecodeMp3ToPCM(audioBuffer, sampleRate);
+      if (pcmBuffer) return { pcmBuffer, sampleRate };
+    }
+
+    throw new Error(`MiniMax TTS audio format is not supported locally: ${format}`);
+  } catch (err) {
+    clearTimeout(ttsTimeout);
+    throw err;
+  }
+}
+
 export async function textToSpeechPCM(
   text: string,
   ttsCfg: TTSConfig,
 ): Promise<{ pcmBuffer: Buffer; sampleRate: number }> {
+  enforceTTSRequestLimits(text, ttsCfg);
+  if (isMiniMaxTTSConfig(ttsCfg)) {
+    return textToSpeechPCMMiniMax(text, ttsCfg);
+  }
+
   const sampleRate = 24000;
   const { url, headers } = buildTTSRequest(ttsCfg);
 
@@ -735,4 +1086,3 @@ function parseWavFallback(buf: Buffer): Buffer | null {
 
   return null;
 }
-

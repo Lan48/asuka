@@ -11,13 +11,15 @@ import { getQQBotRuntime } from "./runtime.js";
 import { startImageServer, isImageServerRunning, downloadFile, type ImageServerConfig } from "./image-server.js";
 import { getImageSize, formatQQBotMarkdownImage, hasQQBotImageSize, DEFAULT_IMAGE_SIZE } from "./utils/image-size.js";
 import { parseQQBotPayload, recoverIncompleteSelfiePayload, isCronReminderPayload, isMediaPayload, isSelfiePayload, type MediaPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
-import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
+import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, applyTTSRuntimeOverrides, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
+import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
+import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
@@ -73,6 +75,25 @@ export function resolveCompanionThinkingLevel(_userText: string, _isGroupChat: b
 
 function getPromptTimeZone(account: ResolvedQQBotAccount): string {
   return account.config.proactiveQuietHours?.timezone?.trim() || "Asia/Shanghai";
+}
+
+function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
+  if (!tts) return text;
+  const clampPause = (value: unknown) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return Math.min(2, Math.max(0, value));
+  };
+  const presetPause = tts.pause === "light" ? 0.25
+    : tts.pause === "normal" ? 0.45
+      : tts.pause === "long" ? 0.8
+        : 0;
+  const before = clampPause(tts.pauseBeforeSeconds);
+  const after = clampPause(tts.pauseAfterSeconds ?? presetPause);
+  return [
+    before && before > 0 ? `<#${before.toFixed(1)}#>` : "",
+    text,
+    after && after > 0 ? `<#${after.toFixed(1)}#>` : "",
+  ].join("");
 }
 
 function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
@@ -546,8 +567,32 @@ function normalizeStudioImageSize(size?: string): string {
   return raw;
 }
 
+function normalizeMiniMaxAspectRatio(size?: string): string {
+  const raw = normalizeStudioImageSize(size);
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  const directRatios = new Set(["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"]);
+  if (directRatios.has(normalized)) return normalized;
+  const sizeToRatio: Record<string, string> = {
+    "1024x1024": "1:1",
+    "2048x2048": "1:1",
+    "1280x720": "16:9",
+    "1152x864": "4:3",
+    "1248x832": "3:2",
+    "832x1248": "2:3",
+    "864x1152": "3:4",
+    "720x1280": "9:16",
+    "1344x576": "21:9",
+  };
+  return sizeToRatio[normalized] ?? "1:1";
+}
+
 function buildStudioSelfiePrompt(prompt: string): string {
   return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
+}
+
+function buildMiniMaxImagePrompt(prompt: string): string {
+  const merged = buildStudioSelfiePrompt(prompt).trim();
+  return merged.length > 1500 ? `${merged.slice(0, 1499).trimEnd()}…` : merged;
 }
 
 function extractStudioImageUrl(response: any): string {
@@ -562,6 +607,68 @@ function extractStudioImageUrl(response: any): string {
   throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
 }
 
+function extractMiniMaxImageUrl(response: any): string {
+  const urls = Array.isArray(response?.data?.image_urls) ? response.data.image_urls : [];
+  for (const url of urls) {
+    if (typeof url === "string" && url) return url;
+  }
+  const base64Images = Array.isArray(response?.data?.image_base64) ? response.data.image_base64 : [];
+  for (const image of base64Images) {
+    if (typeof image === "string" && image) return `data:image/jpeg;base64,${image}`;
+  }
+  throw new Error(`MiniMax image response did not contain an image: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function isMiniMaxImageConfig(config: StudioSelfieConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^image-01(?:$|-)/i.test(config.modelId);
+}
+
+async function generateMiniMaxSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/image_generation`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      model: config.modelId || "image-01",
+      prompt: buildMiniMaxImagePrompt(prompt),
+      aspect_ratio: normalizeMiniMaxAspectRatio(size),
+      response_format: "url",
+      n: 1,
+      prompt_optimizer: true,
+      subject_reference: [
+        {
+          type: "character",
+          image_file: buildImageDataUrlFromFile(referenceImagePath),
+        },
+      ],
+    }),
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  const statusCode = Number(body?.base_resp?.status_code ?? 0);
+  if (!response.ok || statusCode !== 0) {
+    const statusMessage = body?.base_resp?.status_msg || body?.error?.message || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`MiniMax image generation failed: HTTP ${response.status}: ${String(statusMessage).slice(0, 500)}`);
+  }
+
+  return extractMiniMaxImageUrl(body);
+}
+
 async function generateStudioSelfieImageUrl(
   prompt: string,
   config: StudioSelfieConfig,
@@ -570,6 +677,10 @@ async function generateStudioSelfieImageUrl(
 ): Promise<string> {
   if (!fs.existsSync(referenceImagePath)) {
     throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  if (isMiniMaxImageConfig(config)) {
+    return generateMiniMaxSelfieImageUrl(prompt, config, referenceImagePath, size);
   }
 
   const form = new FormData();
@@ -1549,6 +1660,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         let attachmentInfo = "";
         const imageUrls: string[] = [];
         const imageMediaTypes: string[] = [];
+        const imageFilenames: string[] = [];
         const voiceAttachmentPaths: string[] = [];
         const voiceAttachmentUrls: string[] = [];
         const voiceAsrReferTexts: string[] = [];
@@ -1599,6 +1711,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               if (att.content_type?.startsWith("image/")) {
                 imageUrls.push(localPath);
                 imageMediaTypes.push(att.content_type);
+                imageFilenames.push(att.filename ?? path.basename(localPath));
               } else if (isVoice) {
                 voiceAttachmentPaths.push(localPath);
                 // 语音消息处理：先检查 STT 是否可用，避免无意义的转换开销
@@ -1680,6 +1793,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               if (att.content_type?.startsWith("image/")) {
                 imageUrls.push(attUrl);
                 imageMediaTypes.push(att.content_type);
+                imageFilenames.push(att.filename ?? "remote-image");
               } else if (isVoice && asrReferText) {
                 log?.info(`[qqbot:${account.accountId}] Voice attachment download failed, using asr_refer_text fallback`);
                 voiceTranscripts.push(asrReferText);
@@ -1714,6 +1828,24 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         const userContent = voiceText
           ? (parsedContent.trim() ? `${parsedContent}\n${voiceText}` : voiceText) + attachmentInfo
           : parsedContent + attachmentInfo;
+
+        const imageUnderstandingResults = await summarizeImagesForPrompt(
+          imageUrls.map((p, i) => ({
+            pathOrUrl: p,
+            contentType: imageMediaTypes[i],
+            filename: imageFilenames[i],
+          })),
+          resolveMiniMaxVisionConfig(cfg as Record<string, unknown>),
+        );
+        const imageUnderstandingPrompt = formatImageUnderstandingForPrompt(imageUnderstandingResults);
+        if (imageUnderstandingResults.length > 0) {
+          const summarized = imageUnderstandingResults.filter((item) => item.status === "summarized").length;
+          const skipped = imageUnderstandingResults.filter((item) => item.status === "skipped").length;
+          const failed = imageUnderstandingResults.filter((item) => item.status === "failed").length;
+          log?.info(
+            `[qqbot:${account.accountId}] Image understanding: summarized=${summarized}, skipped=${skipped}, failed=${failed}`
+          );
+        }
 
         const qualifiedTarget = event.type === "group"
           ? `qqbot:group:${event.groupOpenid}`
@@ -1892,29 +2024,51 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           dynamicPromptSections.push(asukaMemoryPrompt);
         }
 
-        // 语音能力说明：<qqvoice> 标签本身只负责发送已有的音频文件，不依赖插件 TTS。
-        // TTS 只是生成音频文件的一种方式，框架侧的 TTS 工具（如 audio_speech）也能生成。
-        // 因此始终暴露 <qqvoice> 能力，但根据 TTS 状态给出不同的使用指引。
+        // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
+        // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
-          ? `6. 🎤 插件 TTS 已启用: 如果你有 TTS 工具（如 audio_speech），可用它生成音频文件后用 <qqvoice> 发送`
-          : `6. ⚠️ 插件 TTS 未配置: 如果你有 TTS 工具（如 audio_speech），仍可用它生成音频文件后用 <qqvoice> 发送；若无 TTS 工具，则无法主动生成语音`;
+          ? `6. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":-0.5,"vol":1,"languageBoost":"Chinese"}}`
+          : `6. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
         const sttHint = hasSTT
           ? `\n7. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
           : `\n7. 插件侧 STT 未配置，插件不会自动转录语音消息`;
         const voiceSection = `
 
 【发送语音 - 必须遵守】
-1. 发语音方法: 在回复文本中写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
-2. 示例: "来听听吧！ <qqvoice>/tmp/tts/voice.mp3</qqvoice>"
-3. 支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
-4. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
-5. 发送语音时，不要重复输出语音中已朗读的文字内容；语音前后的文字应是补充信息而非语音的文字版重复
+1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
+2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":-0.5,"vol":1,"languageBoost":"Chinese"}}
+3. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
+4. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
+5. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
+6. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
+7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
+8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0.5；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0
+9. 停顿可以用 tts.pause 或直接写进朗读文本本身，用 MiniMax 停顿标记 <#0.3#> 到 <#1.5#>；不要滥用
 ${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0
           ? `\n- 语音ASR兜底文本:\n${uniqueVoiceAsrReferTexts.map((t, i) => `  ${i + 1}. ${t}`).join("\n")}`
           : "";
         const currentLocalTime = formatZonedDateTimeForPrompt(nowMs, getPromptTimeZone(account));
+        let searchPrompt = "";
+        const searchConfig = resolveMiniMaxSearchConfig(cfg as Record<string, unknown>);
+        if (searchConfig) {
+          const searchTrigger = await analyzeMiniMaxSearchIntent({
+            userText: userContent,
+            recentContext: recentChatTranscript,
+            currentLocalTime,
+            isProactive: false,
+          }, searchConfig);
+          if (searchTrigger.shouldSearch) {
+            const summary = await queryMiniMaxSearch(searchTrigger.query, searchConfig);
+            searchPrompt = formatSearchSummaryForPrompt(summary, new Date().toISOString());
+            log?.info(
+              `[qqbot:${account.accountId}] MiniMax search: reason=${searchTrigger.reason}, confidence=${searchTrigger.confidence ?? "n/a"}, query="${searchTrigger.query.slice(0, 80)}", results=${summary.results.length}, failed=${summary.failed === true}`
+            );
+          } else if (searchTrigger.reason === "intent-failed") {
+            log?.info(`[qqbot:${account.accountId}] MiniMax search intent unavailable, staying offline`);
+          }
+        }
         stablePromptSections.push(`你正在通过 QQ 与用户对话。
 
 【发送图片 - 必须遵守】
@@ -1960,6 +2114,8 @@ ${ttsHint}${sttHint}`;
         const currentTurnContext = [
           `- 当前本地时间: ${currentLocalTime}`,
           receivedMediaSection.trim() ? `- 本轮媒体附件:\n${receivedMediaSection.trim()}` : "",
+          imageUnderstandingPrompt.trim() ? imageUnderstandingPrompt.trim() : "",
+          searchPrompt.trim() ? searchPrompt.trim() : "",
           voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
         ].filter(Boolean).join("\n");
         dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
@@ -3134,19 +3290,21 @@ ${ttsHint}${sttHint}`;
                         }
                       } else if (parsedPayload.mediaType === "audio") {
                         // TTS 语音发送：文字 → PCM → SILK → QQ 语音
+                        const ttsText = mergedCaption || parsedPayload.path;
                         try {
-                          const ttsText = mergedCaption || parsedPayload.path;
                           if (!ttsText?.trim()) {
                             await sendErrorMessage(`[QQBot] 语音消息缺少文本内容`);
                           } else {
-                            const ttsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
-                            if (!ttsCfg) {
+                            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
+                            if (!baseTtsCfg) {
                               log?.error(`[qqbot:${account.accountId}] TTS not configured (channels.qqbot.tts in openclaw.json)`);
-                              await sendErrorMessage(`[QQBot] TTS 未配置，请在 openclaw.json 的 channels.qqbot.tts 中配置`);
+                              await sendVisibleReplyText(ttsText);
                             } else {
-                              log?.info(`[qqbot:${account.accountId}] TTS: "${ttsText.slice(0, 50)}..." via ${ttsCfg.model}`);
+                              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, parsedPayload.tts);
+                              const spokenText = applyTTSPauseHints(ttsText, parsedPayload.tts);
+                              log?.info(`[qqbot:${account.accountId}] TTS: "${ttsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
                               const ttsDir = getQQBotDataDir("tts");
-                              const { silkBase64, duration } = await textToSilk(ttsText, ttsCfg, ttsDir);
+                              const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
                               log?.info(`[qqbot:${account.accountId}] TTS done: ${formatDuration(duration)}, uploading voice...`);
 
                               await sendWithTokenRetry(async (token) => {
@@ -3163,7 +3321,7 @@ ${ttsHint}${sttHint}`;
                           }
                         } catch (err) {
                           log?.error(`[qqbot:${account.accountId}] TTS/voice send failed: ${err}`);
-                          await sendErrorMessage(`[QQBot] 语音发送失败: ${err}`);
+                          await sendVisibleReplyText(ttsText);
                         }
                       } else if (parsedPayload.mediaType === "video") {
                         // 视频发送：支持公网 URL 和本地文件

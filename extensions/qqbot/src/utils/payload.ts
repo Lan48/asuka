@@ -78,6 +78,25 @@ export interface MediaPayload {
   path: string;
   /** 媒体描述（可选） */
   caption?: string;
+  /** TTS 动态配置（仅 mediaType=audio 时使用） */
+  tts?: {
+    voice?: string;
+    speed?: number;
+    vol?: number;
+    pitch?: number;
+    languageBoost?: string;
+    emotion?: 'neutral' | 'gentle' | 'soft' | 'happy' | 'amused' | 'shy' | 'sleepy' | 'relieved' | 'serious';
+    pause?: 'none' | 'light' | 'normal' | 'long';
+    pauseBeforeSeconds?: number;
+    pauseAfterSeconds?: number;
+    voiceModify?: {
+      pitch?: number;
+      intensity?: number;
+      timbre?: number;
+      soundEffects?: string[];
+    };
+    pronunciationTone?: string[];
+  };
 }
 
 /**

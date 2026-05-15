@@ -15,6 +15,8 @@ node --check dist/src/asuka-memory.js
 node --check dist/src/gateway.js
 node --check dist/src/outbound.js
 node --check dist/src/utils/media-caption.js
+node --check dist/src/utils/minimax-vision.js
+node --check dist/src/utils/minimax-search.js
 node --check dist/src/utils/narration-segments.js
 node --check dist/src/runtime-diagnostics.js
 
@@ -27,6 +29,9 @@ node tests/asuka-scheduling.test.mjs
 node tests/asuka-repair.test.mjs
 node tests/asuka-scene-v2.test.mjs
 node tests/asuka-runtime.test.mjs
+node tests/asuka-tts.test.mjs
+node tests/asuka-vision.test.mjs
+node tests/asuka-search.test.mjs
 node tests/asuka-time-context.test.mjs
 node tests/gateway-prompt-order.test.mjs
 node tests/message-buffer.test.mjs

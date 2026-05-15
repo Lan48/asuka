@@ -714,6 +714,46 @@ interface PromiseTextGenerationConfig {
   systemPrompt?: string;
 }
 
+type ChatCompletionMessage = {
+  role: "system" | "user";
+  content: string;
+};
+
+function isMiniMaxTextGenerationConfig(config: PromiseTextGenerationConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^minimax[-/]/i.test(config.model) || /^MiniMax-/i.test(config.model);
+}
+
+function buildChatCompletionTokenLimit(config: PromiseTextGenerationConfig, maxTokens: number): Record<string, number> {
+  return isMiniMaxTextGenerationConfig(config)
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
+}
+
+function buildTextGenerationMessages(
+  config: PromiseTextGenerationConfig,
+  systemPrompts: Array<string | undefined>,
+  userPrompt: string
+): ChatCompletionMessage[] {
+  const cleanedSystemPrompts = systemPrompts
+    .map((item) => item?.trim() ?? "")
+    .filter(Boolean);
+  const cleanedUserPrompt = userPrompt.trim();
+
+  if (isMiniMaxTextGenerationConfig(config)) {
+    return [
+      ...(cleanedSystemPrompts.length
+        ? [{ role: "system" as const, content: cleanedSystemPrompts.join("\n\n") }]
+        : []),
+      { role: "user" as const, content: cleanedUserPrompt },
+    ];
+  }
+
+  return [
+    ...cleanedSystemPrompts.map((content) => ({ role: "system" as const, content })),
+    { role: "user" as const, content: cleanedUserPrompt },
+  ];
+}
+
 function trimDeliveryText(text: string, limit = MAX_DYNAMIC_PROMISE_TEXT_CHARS): string {
   const cleaned = sanitizeSelfieContextText(text)
     .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
@@ -1025,6 +1065,11 @@ function getImageMimeType(imagePath: string): string {
   return "image/png";
 }
 
+function buildImageDataUrlFromFile(imagePath: string): string {
+  const base64 = fs.readFileSync(imagePath).toString("base64");
+  return `data:${getImageMimeType(imagePath)};base64,${base64}`;
+}
+
 function normalizeStudioImageSize(size?: string): string {
   const raw = (size || "1024x1024").trim();
   if (/^1k$/i.test(raw)) return "1024x1024";
@@ -1032,8 +1077,32 @@ function normalizeStudioImageSize(size?: string): string {
   return raw;
 }
 
+function normalizeMiniMaxAspectRatio(size?: string): string {
+  const raw = normalizeStudioImageSize(size);
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  const directRatios = new Set(["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"]);
+  if (directRatios.has(normalized)) return normalized;
+  const sizeToRatio: Record<string, string> = {
+    "1024x1024": "1:1",
+    "2048x2048": "1:1",
+    "1280x720": "16:9",
+    "1152x864": "4:3",
+    "1248x832": "3:2",
+    "832x1248": "2:3",
+    "864x1152": "3:4",
+    "720x1280": "9:16",
+    "1344x576": "21:9",
+  };
+  return sizeToRatio[normalized] ?? "1:1";
+}
+
 function buildStudioSelfiePrompt(prompt: string): string {
   return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
+}
+
+function buildMiniMaxImagePrompt(prompt: string): string {
+  const merged = buildStudioSelfiePrompt(prompt).trim();
+  return merged.length > 1500 ? `${merged.slice(0, 1499).trimEnd()}…` : merged;
 }
 
 function extractStudioImageUrl(response: any): string {
@@ -1048,6 +1117,68 @@ function extractStudioImageUrl(response: any): string {
   throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
 }
 
+function extractMiniMaxImageUrl(response: any): string {
+  const urls = Array.isArray(response?.data?.image_urls) ? response.data.image_urls : [];
+  for (const url of urls) {
+    if (typeof url === "string" && url) return url;
+  }
+  const base64Images = Array.isArray(response?.data?.image_base64) ? response.data.image_base64 : [];
+  for (const image of base64Images) {
+    if (typeof image === "string" && image) return `data:image/jpeg;base64,${image}`;
+  }
+  throw new Error(`MiniMax image response did not contain an image: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function isMiniMaxImageConfig(config: StudioSelfieConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^image-01(?:$|-)/i.test(config.modelId);
+}
+
+async function generateMiniMaxSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/image_generation`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      model: config.modelId || "image-01",
+      prompt: buildMiniMaxImagePrompt(prompt),
+      aspect_ratio: normalizeMiniMaxAspectRatio(size),
+      response_format: "url",
+      n: 1,
+      prompt_optimizer: true,
+      subject_reference: [
+        {
+          type: "character",
+          image_file: buildImageDataUrlFromFile(referenceImagePath),
+        },
+      ],
+    }),
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  const statusCode = Number(body?.base_resp?.status_code ?? 0);
+  if (!response.ok || statusCode !== 0) {
+    const statusMessage = body?.base_resp?.status_msg || body?.error?.message || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`MiniMax image generation failed: HTTP ${response.status}: ${String(statusMessage).slice(0, 500)}`);
+  }
+
+  return extractMiniMaxImageUrl(body);
+}
+
 async function generateStudioSelfieImageUrl(
   prompt: string,
   config: StudioSelfieConfig,
@@ -1056,6 +1187,10 @@ async function generateStudioSelfieImageUrl(
 ): Promise<string> {
   if (!fs.existsSync(referenceImagePath)) {
     throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  if (isMiniMaxImageConfig(config)) {
+    return generateMiniMaxSelfieImageUrl(prompt, config, referenceImagePath, size);
   }
 
   const form = new FormData();
@@ -1445,18 +1580,15 @@ async function renderDeliveryTextFromSharedSession(
         model: generationConfig.model,
         ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
         temperature: 0.55,
-        max_tokens: 160,
-        messages: [
-          ...(generationConfig.systemPrompt ? [{ role: "system", content: generationConfig.systemPrompt }] : []),
-          {
-            role: "system",
-            content: "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        ...buildChatCompletionTokenLimit(generationConfig, 160),
+        messages: buildTextGenerationMessages(
+          generationConfig,
+          [
+            generationConfig.systemPrompt,
+            "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
+          ],
+          prompt
+        ),
       }),
     });
     const detail = await response.text();
@@ -1514,18 +1646,15 @@ async function renderPromiseDeliveryText(
         model: generationConfig.model,
         ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
         temperature: 0.55,
-        max_tokens: 160,
-        messages: [
-          ...(generationConfig.systemPrompt ? [{ role: "system", content: generationConfig.systemPrompt }] : []),
-          {
-            role: "system",
-            content: `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        ...buildChatCompletionTokenLimit(generationConfig, 160),
+        messages: buildTextGenerationMessages(
+          generationConfig,
+          [
+            generationConfig.systemPrompt,
+            `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
+          ],
+          prompt
+        ),
       }),
     });
     const detail = await response.text();
