@@ -54,5 +54,35 @@ assert.match(
   /Dispatch completed without deliver[\s\S]{0,800}readLatestAssistantTextFromSessionTranscript/,
   "QQBot should recover generated text when dispatch completes without deliver"
 );
+assert.match(
+  source,
+  /const flushAllBufferedMessages[\s\S]{0,500}flushBufferedMessage/,
+  "gateway should provide a way to flush buffered messages"
+);
+assert.match(
+  source,
+  /abortSignal\.addEventListener\("abort"[\s\S]{0,500}flushAllBufferedMessages/,
+  "channel abort should flush buffered messages before cleanup"
+);
+assert.match(
+  source,
+  /onStatus\?: \(status: Record<string, unknown>\) => void/,
+  "gateway should expose runtime status patches to the channel host"
+);
+assert.match(
+  source,
+  /const publishRuntimeStatus[\s\S]{0,500}connected: true/,
+  "runtime status activity patches should mark the channel connected"
+);
+assert.match(
+  source,
+  /const publishQueueStatus[\s\S]{0,900}publishRuntimeStatus/,
+  "buffered and queued messages should keep the runtime channel status connected"
+);
+assert.match(
+  source,
+  /t === "RESUMED"[\s\S]{0,500}publishRuntimeStatus/,
+  "resumed gateway sessions should refresh connected runtime status"
+);
 
 console.log("[qqbot:test] gateway prompt order fixtures passed");

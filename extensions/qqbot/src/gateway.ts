@@ -1066,6 +1066,7 @@ export interface GatewayContext {
   cfg: unknown;
   onReady?: (data: unknown) => void;
   onError?: (error: Error) => void;
+  onStatus?: (status: Record<string, unknown>) => void;
   log?: {
     info: (msg: string) => void;
     error: (msg: string) => void;
@@ -1236,7 +1237,7 @@ async function ensureImageServer(log?: GatewayContext["log"], publicBaseUrl?: st
  * 支持流式消息发送
  */
 export async function startGateway(ctx: GatewayContext): Promise<void> {
-  const { account, abortSignal, cfg, onReady, onError, log } = ctx;
+  const { account, abortSignal, cfg, onReady, onError, onStatus, log } = ctx;
 
   if (!account.appId || !account.clientSecret) {
     throw new Error("QQBot not configured (missing appId or clientSecret)");
@@ -1357,6 +1358,44 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
 
+  const countBufferedMessages = (): number => {
+    let count = 0;
+    for (const batch of messageBuffers.values()) count += batch.messages.length;
+    return count;
+  };
+
+  const countQueuedMessages = (): number => {
+    let count = 0;
+    for (const queue of userQueues.values()) count += queue.length;
+    return count;
+  };
+
+  const publishRuntimeStatus = (patch: Record<string, unknown>): void => {
+    try {
+      onStatus?.({
+        running: true,
+        connected: true,
+        lastActivityAt: Date.now(),
+        ...patch,
+      });
+    } catch (err) {
+      log?.debug?.(`[qqbot:${account.accountId}] Failed to publish runtime status: ${err}`);
+    }
+  };
+
+  const publishQueueStatus = (patch: Record<string, unknown> = {}): void => {
+    const bufferedMessages = countBufferedMessages();
+    const queuedMessages = countQueuedMessages();
+    const activeRuns = activeUsers.size;
+    publishRuntimeStatus({
+      busy: bufferedMessages > 0 || queuedMessages > 0 || activeRuns > 0,
+      bufferedMessages,
+      queuedMessages,
+      activeRuns,
+      ...patch,
+    });
+  };
+
   // 获取消息的路由 key（决定并发隔离粒度）
   const getMessagePeerId = (msg: QueuedMessage): string => {
     if (msg.type === "guild") return `guild:${msg.channelId ?? "unknown"}`;
@@ -1404,6 +1443,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
     queue.push(msg);
     log?.debug?.(`[qqbot:${account.accountId}] Message enqueued for ${peerId}, user queue: ${queue.length}, active users: ${activeUsers.size}`);
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "queued" });
 
     // 如果该用户没有正在处理的消息，立即启动处理
     drainUserQueue(peerId);
@@ -1434,11 +1474,20 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     return dropped;
   };
 
+  const flushAllBufferedMessages = (reason: string): number => {
+    const bufferKeys = [...messageBuffers.keys()];
+    for (const bufferKey of bufferKeys) {
+      flushBufferedMessage(bufferKey, reason);
+    }
+    return bufferKeys.length;
+  };
+
   const enqueueMessage = (msg: QueuedMessage): void => {
     const peerId = getMessagePeerId(msg);
     const bufferKey = getMessageBufferKey(msg);
     const trimmedContent = (msg.content ?? "").trim();
     const lowerContent = trimmedContent.toLowerCase();
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
 
     // 检测是否为紧急命令
     const isUrgentCommand = URGENT_COMMANDS.some(cmd => lowerContent.startsWith(cmd.toLowerCase()));
@@ -1488,6 +1537,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     batch.messages.push(msg);
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "buffered" });
     const bufferedChars = batch.messages.reduce((sum, item) => sum + (item.content?.length ?? 0), 0);
     const shouldFlushNow = batch.messages.length >= MESSAGE_BUFFER_MAX_MESSAGES
       || bufferedChars >= MESSAGE_BUFFER_MAX_CONTENT_CHARS
@@ -1517,6 +1567,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     activeUsers.add(peerId);
+    publishQueueStatus({ queueState: "processing" });
 
     try {
       while (queue.length > 0 && !isAborted) {
@@ -1534,6 +1585,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     } finally {
       activeUsers.delete(peerId);
       userQueues.delete(peerId);
+      publishQueueStatus({ queueState: "idle" });
       // 处理完后，检查是否有等待并发槽位的用户
       for (const [waitingPeerId, waitingQueue] of userQueues) {
         if (waitingQueue.length > 0 && !activeUsers.has(waitingPeerId)) {
@@ -1550,6 +1602,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   };
 
   abortSignal.addEventListener("abort", () => {
+    const flushedBufferCount = flushAllBufferedMessages("channel abort");
+    if (flushedBufferCount > 0) {
+      log?.info(`[qqbot:${account.accountId}] Flushed ${flushedBufferCount} buffered message batch(es) before channel abort`);
+    }
     isAborted = true;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -3863,6 +3919,12 @@ ${ttsHint}${sttHint}`;
         isConnecting = false; // 连接完成，释放锁
         reconnectAttempts = 0; // 连接成功，重置重试计数
         lastConnectTime = Date.now(); // 记录连接时间
+        publishRuntimeStatus({
+          connected: true,
+          lastConnectedAt: lastConnectTime,
+          connectionState: "open",
+          lastError: null,
+        });
         // 启动消息处理器（异步处理，防止阻塞心跳）
         startMessageProcessor(handleMessage);
         // P1-1: 启动后台 Token 刷新
@@ -3958,6 +4020,12 @@ ${ttsHint}${sttHint}`;
                 onReady?.(d);
               } else if (t === "RESUMED") {
                 log?.info(`[qqbot:${account.accountId}] Session resumed`);
+                publishRuntimeStatus({
+                  connected: true,
+                  lastConnectedAt: Date.now(),
+                  connectionState: "resumed",
+                  lastError: null,
+                });
                 // P1-2: 更新 Session 连接时间
                 if (sessionId) {
                   saveSession({
@@ -3972,6 +4040,7 @@ ${ttsHint}${sttHint}`;
                 }
               } else if (t === "C2C_MESSAGE_CREATE") {
                 const event = d as C2CMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户
                 recordKnownUser({
                   openid: event.author.user_openid,
@@ -3995,6 +4064,7 @@ ${ttsHint}${sttHint}`;
                 });
               } else if (t === "AT_MESSAGE_CREATE") {
                 const event = d as GuildMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（频道用户）
                 recordKnownUser({
                   openid: event.author.id,
@@ -4019,6 +4089,7 @@ ${ttsHint}${sttHint}`;
                 });
               } else if (t === "DIRECT_MESSAGE_CREATE") {
                 const event = d as GuildMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（频道私信用户）
                 recordKnownUser({
                   openid: event.author.id,
@@ -4042,6 +4113,7 @@ ${ttsHint}${sttHint}`;
                 });
               } else if (t === "GROUP_AT_MESSAGE_CREATE") {
                 const event = d as GroupMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（群组用户）
                 recordKnownUser({
                   openid: event.author.member_openid,
