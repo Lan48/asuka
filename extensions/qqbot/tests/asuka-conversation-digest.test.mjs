@@ -238,6 +238,41 @@ try {
   });
   assert.match(fixedPrompt, /用户偏好\/边界: 无/, "empty digest fields should keep a stable prompt shape");
   assert.match(fixedPrompt, /临时指令\/待过期偏好: 无/, "empty temporary directive field should keep a stable prompt shape");
+
+  const upgradedPrompt = formatConversationDigestForPrompt({
+    version: 2,
+    peerKey: "default:direct:user-digest",
+    window: "7d",
+    updatedAt: now,
+    coveredUntil: now,
+    timeZone: "Asia/Shanghai",
+    weekly: {
+      relationshipContinuity: "旧 v2 摘要没有新增字段。",
+      recentEmotionalArc: "",
+      currentOpenLoops: ["旧问题已解决"],
+      userPreferences: [],
+      asukaSelfContinuity: "",
+      sceneContinuity: "",
+      importantRecentFacts: [],
+      thingsToAvoid: [],
+      lastSalientTurns: [],
+    },
+    daily: [{
+      date: "2026-05-12",
+      detailLevel: "brief",
+      relationshipContinuity: "普通日常，细节未记录。",
+      emotionalArc: "日常",
+      openLoops: [],
+      userPreferences: [],
+      asukaSelfContinuity: "日常在家",
+      sceneContinuity: "普通日常，无特殊事件记录。",
+      importantFacts: [],
+      thingsToAvoid: [],
+      salientTurns: [],
+    }],
+  });
+  assert.match(upgradedPrompt, /临时指令\/待过期偏好: 无/, "old v2 digests should format without missing-field crashes");
+  assert.doesNotMatch(upgradedPrompt, /2026-05-12/, "old empty daily placeholders should be pruned during upgrade");
 } finally {
   globalThis.fetch = originalFetch;
   fs.rmSync(tmpHome, { recursive: true, force: true });

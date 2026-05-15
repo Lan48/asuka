@@ -575,7 +575,18 @@ export function getConversationDigest(context: AsukaPeerContext): ConversationDi
 }
 
 function upgradeLegacyDigest(digest: ConversationDigest | LegacyConversationDigest): ConversationDigest {
-  if (digest.version === 2) return digest;
+  if (digest.version === 2) {
+    return {
+      version: 2,
+      peerKey: digest.peerKey,
+      window: digest.window,
+      updatedAt: digest.updatedAt,
+      coveredUntil: digest.coveredUntil,
+      timeZone: getStringValue(digest.timeZone, DEFAULT_DIGEST_TIME_ZONE),
+      weekly: normalizeWeeklyDigest(digest.weekly),
+      daily: normalizeDailyDigests(digest.daily),
+    };
+  }
   return {
     version: 2,
     peerKey: digest.peerKey,
@@ -588,8 +599,8 @@ function upgradeLegacyDigest(digest: ConversationDigest | LegacyConversationDige
   };
 }
 
-function formatList(items: string[]): string {
-  return items.length > 0 ? items.join("；") : "无";
+function formatList(items: string[] | undefined): string {
+  return items && items.length > 0 ? items.join("；") : "无";
 }
 
 export function formatConversationDigestForPrompt(digest: ConversationDigest | LegacyConversationDigest): string {
