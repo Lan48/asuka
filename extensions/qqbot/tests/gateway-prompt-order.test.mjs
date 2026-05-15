@@ -44,5 +44,15 @@ assert.match(
   /No response within timeout[\s\S]{0,500}sendErrorMessage/,
   "QQBot response timeout should send a user-facing fallback"
 );
+assert.match(
+  source,
+  /disableBlockStreaming:\s*true/,
+  "QQBot should wait for final text instead of relying on block streaming"
+);
+assert.match(
+  source,
+  /Dispatch completed without deliver[\s\S]{0,800}readLatestAssistantTextFromSessionTranscript/,
+  "QQBot should recover generated text when dispatch completes without deliver"
+);
 
 console.log("[qqbot:test] gateway prompt order fixtures passed");

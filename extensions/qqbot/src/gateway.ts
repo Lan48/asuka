@@ -156,6 +156,54 @@ async function clearCompanionSessionModeOverrides(
   }
 }
 
+async function readLatestAssistantTextFromSessionTranscript(
+  sessionKey: string | undefined,
+  agentId: string | undefined,
+  minTimestampMs: number,
+  log?: { warn?: (message: string) => void; error?: (message: string) => void; info?: (message: string) => void }
+): Promise<string> {
+  if (!sessionKey) return "";
+  const resolvedAgentId = (agentId?.trim() || "main").replace(/[\\/]/g, "_");
+  const sessionDir = path.join(resolveOpenClawStateDir(), "agents", resolvedAgentId, "sessions");
+  const storePath = path.join(sessionDir, "sessions.json");
+  try {
+    const rawStore = await fs.promises.readFile(storePath, "utf-8");
+    const store = JSON.parse(rawStore) as Record<string, { sessionId?: unknown } | undefined>;
+    const sessionId = String(store[sessionKey]?.sessionId || "").trim();
+    if (!sessionId || !/^[0-9a-f-]{20,}$/i.test(sessionId)) return "";
+
+    const transcriptPath = path.join(sessionDir, `${sessionId}.jsonl`);
+    const rawTranscript = await fs.promises.readFile(transcriptPath, "utf-8");
+    const lines = rawTranscript.trim().split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
+      const entryTime = Date.parse(String(entry.timestamp || ""));
+      if (Number.isFinite(entryTime) && entryTime + 1_000 < minTimestampMs) {
+        break;
+      }
+      const content = Array.isArray(entry.message?.content) ? entry.message.content : [];
+      const text = content
+        .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+        .map((block: any) => block.text)
+        .join("\n\n")
+        .trim();
+      const visible = filterInternalMarkers(text);
+      if (visible) return visible;
+    }
+  } catch (err) {
+    log?.warn?.(`[qqbot] failed to read latest assistant transcript fallback: ${err}`);
+  }
+  return "";
+}
+
 function loadAsukaVisualIdentityAnchor(): string {
   if (asukaVisualIdentityAnchorCache !== undefined) {
     return asukaVisualIdentityAnchorCache;
@@ -2522,6 +2570,8 @@ ${ttsHint}${sttHint}`;
             }
           };
 
+          const dispatchStartedAt = Date.now();
+          let dispatchCompleted = false;
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg: cfgForCompanionThinking,
@@ -3753,8 +3803,10 @@ ${ttsHint}${sttHint}`;
               },
             },
             replyOptions: {
-              disableBlockStreaming: false,
+              disableBlockStreaming: true,
             },
+          }).finally(() => {
+            dispatchCompleted = true;
           });
 
           // 等待分发完成或超时
@@ -3780,6 +3832,24 @@ ${ttsHint}${sttHint}`;
               log?.error(`[qqbot:${account.accountId}] Dispatch completed with ${toolDeliverCount} tool deliver(s) but no block deliver, sending fallback`);
               const fallback = formatToolFallback();
               await sendErrorMessage(fallback);
+            }
+            if (!hasResponse && dispatchCompleted) {
+              log?.error(`[qqbot:${account.accountId}] Dispatch completed without deliver; attempting transcript fallback`);
+              const transcriptFallback = await readLatestAssistantTextFromSessionTranscript(
+                route.sessionKey,
+                route.agentId,
+                dispatchStartedAt,
+                log,
+              );
+              if (transcriptFallback) {
+                hasResponse = await sendVisibleReplyText(transcriptFallback);
+                if (hasResponse) {
+                  log?.info(`[qqbot:${account.accountId}] Sent transcript fallback after missing deliver`);
+                }
+              }
+              if (!hasResponse) {
+                await sendErrorMessage("刚刚我已经想好要怎么回你了，但消息没有发出去。你再发一句，我会重新接住。");
+              }
             }
           }
         } catch (err) {
