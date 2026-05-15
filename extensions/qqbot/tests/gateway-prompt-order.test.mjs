@@ -71,6 +71,30 @@ assert.match(
 );
 assert.match(
   source,
+  /Treating <qqvoice> content as TTS text/,
+  "legacy qqvoice text should be spoken through TTS instead of being treated as a file path"
+);
+assert.match(
+  source,
+  /sendTTSReplyText\(item\.content\)/,
+  "legacy qqvoice text should use the same TTS sender as structured audio replies"
+);
+assert.ok(
+  source.includes(String.raw`text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "")`),
+  "internal marker filtering should remove escaped and unescaped bracket markers"
+);
+assert.match(
+  source,
+  /const sendVisibleReplyText = async[\s\S]{0,160}filterInternalMarkers\(text\)\.trim\(\)/,
+  "visible text sends should strip internal markers at the final send boundary"
+);
+assert.match(
+  source,
+  /sendQueue\.push\(\{ type: hasTTS \? "voiceText" : "text", content: mediaPath \}\)/,
+  "legacy qqvoice text should never be treated as an audio file path"
+);
+assert.match(
+  source,
   /disableBlockStreaming:\s*true/,
   "QQBot should wait for final text instead of relying on block streaming"
 );

@@ -1093,9 +1093,9 @@ function formatMediaErrorMessage(mediaType: string, err: unknown): string {
 function filterInternalMarkers(text: string): string {
   if (!text) return text;
   
-  // 过滤 [[xxx: yyy]] 格式的内部标记
-  // 例如: [[reply_to: ROBOT1.0_kbc...]]
-  let result = text.replace(/\[\[[a-z_]+:\s*[^\]]*\]\]/gi, "");
+  // 过滤内部控制标记，例如:
+  // [[reply_to: ROBOT1.0_kbc...]], [[reply_to_current]], \[[reply_to_current]\]
+  let result = text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "");
   
   // 清理可能产生的多余空行
   result = result.replace(/\n{3,}/g, "\n\n").trim();
@@ -2443,7 +2443,7 @@ ${ttsHint}${sttHint}`;
         };
 
         const sendVisibleReplyText = async (text: string): Promise<boolean> => {
-          const visibleText = text.trim();
+          const visibleText = filterInternalMarkers(text).trim();
           if (!visibleText) {
             return false;
           }
@@ -2889,7 +2889,7 @@ ${ttsHint}${sttHint}`;
                   log?.info(`[qqbot:${account.accountId}] Detected media tags: ${imgCount} <qqimg>, ${voiceCount} <qqvoice>, ${videoCount} <qqvideo>, ${fileCount} <qqfile>`);
                   
                   // 构建发送队列
-                  const sendQueue: Array<{ type: "text" | "image" | "voice" | "video" | "file"; content: string }> = [];
+                  const sendQueue: Array<{ type: "text" | "image" | "voice" | "voiceText" | "video" | "file"; content: string }> = [];
                   
                   let lastIndex = 0;
                   const mediaTagRegexWithIndex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
@@ -2955,8 +2955,14 @@ ${ttsHint}${sttHint}`;
 
                     if (mediaPath) {
                       if (tagName === "qqvoice") {
-                        sendQueue.push({ type: "voice", content: mediaPath });
-                        log?.info(`[qqbot:${account.accountId}] Found voice path in <qqvoice>: ${mediaPath}`);
+                        const looksLikeAudioPath = isAudioFile(mediaPath) || /^[a-zA-Z]:[\\/]/.test(mediaPath) || mediaPath.startsWith("/") || mediaPath.startsWith("~/");
+                        if (!looksLikeAudioPath) {
+                          sendQueue.push({ type: hasTTS ? "voiceText" : "text", content: mediaPath });
+                          log?.info(`[qqbot:${account.accountId}] Treating <qqvoice> content as TTS text: ${mediaPath.slice(0, 60)}...`);
+                        } else {
+                          sendQueue.push({ type: "voice", content: mediaPath });
+                          log?.info(`[qqbot:${account.accountId}] Found voice path in <qqvoice>: ${mediaPath}`);
+                        }
                       } else if (tagName === "qqvideo") {
                         sendQueue.push({ type: "video", content: mediaPath });
                         log?.info(`[qqbot:${account.accountId}] Found video URL in <qqvideo>: ${mediaPath}`);
@@ -3090,6 +3096,11 @@ ${ttsHint}${sttHint}`;
                           }
                           continue;
                         }
+                      }
+                    } else if (item.type === "voiceText") {
+                      const sentVoice = await sendTTSReplyText(item.content);
+                      if (!sentVoice) {
+                        await sendVisibleReplyText(item.content);
                       }
                     } else if (item.type === "voice") {
                       // 发送语音文件（展开 ~ 路径）
