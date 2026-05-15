@@ -916,6 +916,22 @@ function isSceneExpired(scene: AsukaSceneState | undefined, now = Date.now()): b
   return now >= expiresAt;
 }
 
+function normalizeSceneIdentityField(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase() || "unknown";
+}
+
+function hasSameSceneIdentity(
+  previous: AsukaSceneState | undefined,
+  candidate: Pick<AsukaSceneState, "label" | "lifePhase" | "activity" | "place" | "owner" | "timeContinuity">
+): boolean {
+  if (!previous || previous.label !== candidate.label) return false;
+  return previous.lifePhase === candidate.lifePhase
+    && normalizeSceneIdentityField(previous.activity) === normalizeSceneIdentityField(candidate.activity)
+    && normalizeSceneIdentityField(previous.place) === normalizeSceneIdentityField(candidate.place)
+    && previous.owner === candidate.owner
+    && previous.timeContinuity === candidate.timeContinuity;
+}
+
 function buildSceneState(
   label: AsukaSceneLabel,
   options: {
@@ -947,24 +963,18 @@ function buildSceneState(
     options.timeContinuity,
     options.startPolicy === "reset" ? "reset_by_model" : inferredStructure.timeContinuity
   );
+  const sameScene = hasSameSceneIdentity(previous, { label, lifePhase, activity, place, owner, timeContinuity });
   const summary = sanitizeSceneFreeText(options.summary, MAX_SCENE_SUMMARY_CHARS)
-    ?? (sameLabel && previous?.summary ? previous.summary : sceneSummaryForLabel(label));
+    ?? (sameScene && previous?.summary ? previous.summary : sceneSummaryForLabel(label));
   const transitionHint = sanitizeSceneFreeText(options.transitionHint, MAX_SCENE_TRANSITION_HINT_CHARS)
-    ?? (sameLabel ? previous?.transitionHint : undefined);
+    ?? (sameScene ? previous?.transitionHint : undefined);
   const reinforced = Boolean(options.reinforced);
-  const startPolicy = options.startPolicy ?? (
-    sameLabel
-      && kind === "activity"
-      && options.summary
-      && previous?.summary
-      && sanitizeSceneFreeText(options.summary, MAX_SCENE_SUMMARY_CHARS) !== previous.summary
-      ? "reset"
-      : "reuse"
-  );
-  const reuseStartedAt = sameLabel && startPolicy === "reuse";
+  const requestedStartPolicy = options.startPolicy ?? (sameScene ? "reuse" : "reset");
+  const startPolicy = sameScene ? requestedStartPolicy : requestedStartPolicy === "advance" ? "advance" : "reset";
+  const reuseStartedAt = sameScene && startPolicy === "reuse";
   const ttlMs = sceneMaxAgeMs(label);
   const expiresAt = kind === "physical"
-    ? sameLabel && !reinforced && previous?.expiresAt
+    ? sameScene && !reinforced && previous?.expiresAt
       ? previous.expiresAt
       : options.now + (ttlMs ?? 0)
     : undefined;
@@ -979,15 +989,15 @@ function buildSceneState(
     timeContinuity,
     summary,
     confidence: clampSceneConfidence(options.confidence),
-    startedAt: reuseStartedAt ? previous.startedAt : options.now,
+    startedAt: reuseStartedAt ? previous?.startedAt ?? options.now : options.now,
     lastObservedAt: options.observed || reinforced
       ? options.now
-      : sameLabel
+      : sameScene
         ? previous?.lastObservedAt ?? previous?.lastInferredAt
         : options.now,
     lastInferredAt: options.now,
     expiresAt,
-    reinforcedAt: reinforced ? options.now : sameLabel ? previous?.reinforcedAt : undefined,
+    reinforcedAt: reinforced ? options.now : sameScene ? previous?.reinforcedAt : undefined,
     transitionHint,
     version: (previous?.version ?? 0) + 1,
     source: options.source,
@@ -1336,10 +1346,11 @@ async function inferSceneCandidateWithModel(
     `允许的 lifePhase 只有: ${SCENE_LIFE_PHASES.join(", ")}`,
     `允许的 owner 只有: ${SCENE_OWNERS.join(", ")}`,
     `允许的 timeContinuity 只有: ${SCENE_TIME_CONTINUITIES.join(", ")}`,
-    "输出格式: {\"label\":\"activity_context\",\"lifePhase\":\"school_day\",\"activity\":\"after_class\",\"place\":\"campus\",\"owner\":\"asuka\",\"timeContinuity\":\"advanced_from_morning\",\"summary\":\"Asuka 上午刚下课，准备关心用户下午考试。\",\"confidence\":0.72,\"startPolicy\":\"reuse\",\"transitionHint\":\"自然承接上午校园状态，不要回退到睡前或夜间场景。\"}",
+    "输出格式: {\"label\":\"activity_context\",\"lifePhase\":\"school_day\",\"activity\":\"after_class\",\"place\":\"campus\",\"owner\":\"asuka\",\"timeContinuity\":\"advanced_from_morning\",\"summary\":\"Asuka 上午刚下课，准备关心用户下午考试。\",\"confidence\":0.72,\"startPolicy\":\"reset\",\"transitionHint\":\"自然承接上午校园状态，不要回退到睡前或夜间场景。\"}",
     "summary 要概括当前可用的生活/情绪/补救场景，不要复述长对话；transitionHint 要给主回复模型自然过渡建议。",
     "lifePhase/activity/place/owner/timeContinuity 是给程序维护时间线的结构化字段，必须比 summary 更稳定；不要把校园、睡觉、吃饭混在同一个结构化阶段里。",
-    "startPolicy 只能是 reuse/reset/advance：同一场景延续用 reuse，新场景开始用 reset，旧场景自然进入后续阶段用 advance。",
+    "label 是兼容字段；判断是否同一场景必须看 lifePhase/activity/place/owner/timeContinuity。即使 label 都是 activity_context，只要这些结构化字段改变，也要视为新场景。",
+    "startPolicy 只能是 reuse/reset/advance：lifePhase/activity/place/owner/timeContinuity 都延续时用 reuse，新场景开始用 reset，旧场景自然进入后续阶段用 advance。",
     "如果没有足够依据保留物理位置，优先输出 emotional_presence、miss_you 或 repair_attention。",
     "物理位置必须谨慎：doorway 最短、transit 其次，过久要衰减。",
     "如果上下文能总结出吃饭、洗澡、上课、工作、准备睡觉等具体生活场景，但不属于物理移动标签，使用 activity_context。",

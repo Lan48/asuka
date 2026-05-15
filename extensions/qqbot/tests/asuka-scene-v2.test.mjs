@@ -84,6 +84,11 @@ try {
   const continued = applySceneProgressionRules({
     kind: "activity",
     label: "activity_context",
+    lifePhase: "meal",
+    activity: "dinner",
+    place: "home",
+    owner: "user",
+    timeContinuity: "same_moment",
     summary: "用户刚才像是在吃晚饭，语境偏日常陪伴。",
     confidence: 0.74,
     startedAt: base,
@@ -109,12 +114,46 @@ try {
   });
 
   assert.equal(continued.kind, "activity", "activity_context should render as an activity scene");
-  assert.equal(continued.startedAt, base, "reuse start policy should preserve original scene start time");
+  assert.equal(continued.startedAt, base + 30 * 60 * 1000, "changed structured scene identity should reset scene start time even when the coarse label is reused");
   assert.equal(continued.lifePhase, "school_day", "candidate lifePhase should be retained as structured scene state");
   assert.equal(continued.activity, "after_class", "candidate activity should be retained as structured scene state");
   assert.equal(continued.place, "campus", "candidate place should be retained as structured scene state");
   assert.equal(continued.owner, "asuka", "candidate owner should be retained as structured scene state");
   assert.equal(continued.timeContinuity, "advanced_from_morning", "candidate continuity should be retained as structured scene state");
+
+  const stillDinner = applySceneProgressionRules({
+    kind: "activity",
+    label: "activity_context",
+    lifePhase: "meal",
+    activity: "dinner",
+    place: "home",
+    owner: "user",
+    timeContinuity: "same_moment",
+    summary: "用户刚才像是在吃晚饭，语境偏日常陪伴。",
+    confidence: 0.74,
+    startedAt: base,
+    lastObservedAt: base,
+    lastInferredAt: base,
+    transitionHint: "如果已经过去一两个小时，应自然过渡到饭后休息、收拾或普通聊天，不要断言仍在吃。",
+    version: 1,
+    source: "scene_model",
+  }, {
+    label: "activity_context",
+    lifePhase: "meal",
+    activity: "dinner",
+    place: "home",
+    owner: "user",
+    timeContinuity: "same_moment",
+    summary: "用户还在饭后聊刚才那顿晚饭。",
+    confidence: 0.7,
+    source: "scene_model",
+    startPolicy: "reuse",
+  }, {
+    fallbackLabel: "emotional_presence",
+    now: base + 45 * 60 * 1000,
+  });
+
+  assert.equal(stillDinner.startedAt, base, "unchanged structured scene identity should preserve original scene start time");
 
   console.log("[qqbot:test] asuka scene-v2 fixtures passed");
 } finally {

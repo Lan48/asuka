@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "path";
 import type { ResolvedQQBotAccount } from "./types.js";
-import { decodeCronPayload } from "./utils/payload.js";
+import { decodeCronPayload, parseQQBotPayload, isMediaPayload, isSelfiePayload, wrapExactMessageForAgentTurn, type MediaPayload } from "./utils/payload.js";
 import {
   getAccessToken, 
   sendC2CMessage, 
@@ -22,10 +22,10 @@ import {
   sendC2CFileMessage,
   sendGroupFileMessage,
 } from "./api.js";
-import { isAudioFile, audioFileToSilkBase64, waitForFile } from "./utils/audio-convert.js";
+import { isAudioFile, audioFileToSilkBase64, waitForFile, resolveTTSConfig, applyTTSRuntimeOverrides, textToSilk, formatDuration } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
-import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName } from "./utils/platform.js";
+import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName, getQQBotDataDir } from "./utils/platform.js";
 import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, getPromiseRenderContext, markPromiseDelivered, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
@@ -33,10 +33,10 @@ import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
 import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
-import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
+import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -663,9 +663,133 @@ function parseTarget(to: string): { type: "c2c" | "group" | "channel"; id: strin
 }
 
 export function looksLikeInternalDeliveryLeak(text: string): boolean {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+  const cleaned = extractOutboundVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   return INTERNAL_DELIVERY_LEAK_RE.test(cleaned);
+}
+
+function extractOutboundVisibleTextForLeakInspection(text: string): string {
+  const payloadResult = parseQQBotPayload(text);
+  if (!payloadResult.isPayload || payloadResult.error || !payloadResult.payload) return text;
+  return [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+}
+
+function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
+  if (!tts) return text;
+  const clampPause = (value: unknown) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return Math.min(2, Math.max(0, value));
+  };
+  const presetPause = tts.pause === "light" ? 0.25
+    : tts.pause === "normal" ? 0.45
+      : tts.pause === "long" ? 0.8
+        : 0;
+  const before = clampPause(tts.pauseBeforeSeconds);
+  const after = clampPause(tts.pauseAfterSeconds ?? presetPause);
+  return [
+    before && before > 0 ? `<#${before.toFixed(1)}#>` : "",
+    text,
+    after && after > 0 ? `<#${after.toFixed(1)}#>` : "",
+  ].join("");
+}
+
+async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<OutboundResult | null> {
+  const payloadResult = parseQQBotPayload(ctx.text);
+  if (!payloadResult.isPayload) return null;
+  if (payloadResult.error || !payloadResult.payload) {
+    console.warn(`[qqbot] sendText: invalid QQBOT_PAYLOAD, leaving for leak suppression: ${payloadResult.error ?? "missing payload"}`);
+    return null;
+  }
+
+  const visibleText = [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+  const parsedPayload = payloadResult.payload;
+
+  if (isMediaPayload(parsedPayload)) {
+    const mergedCaption = mergeVisibleTextAndCaption(visibleText, parsedPayload.caption);
+
+    if (parsedPayload.mediaType !== "audio") {
+      return await sendMedia({
+        ...ctx,
+        text: mergedCaption,
+        mediaUrl: parsedPayload.path,
+      });
+    }
+
+    const mediaPath = normalizePath(parsedPayload.path);
+    const pathLooksLikeAudioFile = parsedPayload.source === "url"
+      || (parsedPayload.source === "file" && (isLocalFilePath(mediaPath) || isAudioFile(mediaPath)));
+
+    if (pathLooksLikeAudioFile) {
+      return await sendMedia({
+        ...ctx,
+        text: mergedCaption,
+        mediaUrl: mediaPath,
+      });
+    }
+
+    const ttsText = mergedCaption || parsedPayload.path;
+    const baseTtsCfg = resolveTTSConfig(loadOpenClawConfig() ?? {});
+    if (!baseTtsCfg) {
+      console.warn("[qqbot] sendText: structured audio payload received but TTS is not configured; falling back to text");
+      return await sendText({ ...ctx, text: ttsText });
+    }
+    if (!ctx.account.appId || !ctx.account.clientSecret) {
+      return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
+    }
+
+    try {
+      const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, parsedPayload.tts);
+      const spokenText = applyTTSPauseHints(ttsText, parsedPayload.tts);
+      console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
+      const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
+      console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
+
+      const accessToken = await getAccessToken(ctx.account.appId!, ctx.account.clientSecret!);
+      const target = parseTarget(ctx.to);
+
+      let result: { id: string; timestamp: number | string };
+      if (target.type === "c2c") {
+        result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+      } else if (target.type === "group") {
+        result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+      } else {
+        result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${ttsText}`, ctx.replyToId ?? undefined);
+      }
+
+      return { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[qqbot] sendText: structured audio payload failed, falling back to text: ${message}`);
+      return await sendText({ ...ctx, text: ttsText });
+    }
+  }
+
+  if (isSelfiePayload(parsedPayload)) {
+    const target = parseTarget(ctx.to);
+    if (target.type !== "c2c") {
+      console.warn("[qqbot] sendText: structured selfie payload ignored because target is not c2c");
+      return { channel: "qqbot" };
+    }
+    const caption = mergeVisibleTextAndCaption(visibleText, parsedPayload.caption) || "刚拍好。";
+    const selfiePayload: DecodedCronPayload = {
+      type: "cron_reminder",
+      mode: "promise",
+      content: caption,
+      targetType: "c2c",
+      targetAddress: target.id,
+      selfiePrompt: parsedPayload.prompt || caption,
+      selfieCaption: caption,
+    };
+    return await runDirectSelfieFlowForCron(ctx.account, selfiePayload, caption);
+  }
+
+  return null;
 }
 
 function looksLikeDebugProbeText(text: string): boolean {
@@ -1807,6 +1931,13 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   console.log("[qqbot] sendText ctx:", JSON.stringify({ to, text: text?.slice(0, 50), replyToId, accountId: account.accountId }, null, 2));
 
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
+
+  if (typeof text === "string" && !cronProbe.isCronPayload) {
+    const structuredResult = await sendStructuredPayloadFromOutbound({ to, text, accountId: ctx.accountId, replyToId, account });
+    if (structuredResult) {
+      return structuredResult;
+    }
+  }
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed internal delivery leak: ${text.slice(0, 160)}`);

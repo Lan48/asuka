@@ -72,6 +72,18 @@ assert.equal(
   "valid payloads should not hide actual internal-process wording in visible text",
 );
 
+assert.equal(
+  looksLikeInternalDeliveryLeak('QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。","tts":{"emotion":"soft"}}'),
+  false,
+  "valid structured payloads should be routed as media instead of suppressed as delivery leaks",
+);
+
+assert.equal(
+  looksLikeInternalDeliveryLeak('QQBOT_PAYLOAD: {"internal":true}'),
+  true,
+  "invalid structured payload artifacts should still be suppressed in outbound delivery",
+);
+
 for (const leakedOutboundText of [
   'Reasoning:\n_The user is reacting with "?" to my previous silent acknowledgement._',
   "⏳ 已收到，正在处理中…",
