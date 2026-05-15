@@ -1022,6 +1022,17 @@ function parseFaceTags(text: string): string {
   });
 }
 
+export function parseVoiceReplySuffix(text: string): { text: string; forceVoiceReply: boolean } {
+  const trimmedEnd = text.trimEnd();
+  if (!trimmedEnd.endsWith("~")) {
+    return { text, forceVoiceReply: false };
+  }
+  return {
+    text: trimmedEnd.slice(0, -1).trimEnd(),
+    forceVoiceReply: true,
+  };
+}
+
 // ============ 媒体发送友好错误提示 ============
 
 /**
@@ -1937,10 +1948,12 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
 
         // 解析 QQ 表情标签，将 <faceType=...,ext="base64"> 替换为 【表情: 中文名】
-        const parsedContent = parseFaceTags(event.content);
+        const parsedUserText = parseVoiceReplySuffix(parseFaceTags(event.content));
+        const parsedContent = parsedUserText.text;
         const userContent = voiceText
           ? (parsedContent.trim() ? `${parsedContent}\n${voiceText}` : voiceText) + attachmentInfo
           : parsedContent + attachmentInfo;
+        const userRequestedVoiceReply = parsedUserText.forceVoiceReply && !parsedContent.trim().startsWith("/");
 
         const imageUnderstandingResults = await summarizeImagesForPrompt(
           imageUrls.map((p, i) => ({
@@ -2161,6 +2174,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
 8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
 9. 停顿可以用 tts.pause 或直接写进朗读文本本身，用 MiniMax 停顿标记 <#0.3#> 到 <#1.5#>；不要滥用
+10. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0
@@ -2234,6 +2248,7 @@ ${ttsHint}${sttHint}`;
           imageUnderstandingPrompt.trim() ? imageUnderstandingPrompt.trim() : "",
           searchPrompt.trim() ? searchPrompt.trim() : "",
           voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
+          userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 结尾，表示本轮希望听语音回答。不要把 `~` 当作正文，也不要向用户解释这个触发规则。" : "",
         ].filter(Boolean).join("\n");
         dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
         if (hasAsrReferFallback) {
@@ -2630,6 +2645,40 @@ ${ttsHint}${sttHint}`;
                   await sendChannelMessage(token, event.channelId, segment, event.messageId, ref);
                 }
               });
+            }
+          };
+          const sendTTSReplyText = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
+            const ttsText = filterInternalMarkers(text).trim();
+            if (!ttsText) {
+              return false;
+            }
+            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
+            if (!baseTtsCfg) {
+              log?.error(`[qqbot:${account.accountId}] TTS not configured (channels.qqbot.tts in openclaw.json)`);
+              return false;
+            }
+            try {
+              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, tts);
+              const spokenText = applyTTSPauseHints(ttsText, tts);
+              log?.info(`[qqbot:${account.accountId}] TTS reply: "${ttsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
+              const ttsDir = getQQBotDataDir("tts");
+              const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
+              log?.info(`[qqbot:${account.accountId}] TTS reply done: ${formatDuration(duration)}, uploading voice...`);
+
+              await sendWithTokenRetry(async (token) => {
+                if (event.type === "c2c") {
+                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
+                } else if (event.type === "group" && event.groupOpenid) {
+                  await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
+                } else if (event.channelId) {
+                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${ttsText}`, event.messageId);
+                }
+              });
+              log?.info(`[qqbot:${account.accountId}] TTS reply voice message sent`);
+              return true;
+            } catch (err) {
+              log?.error(`[qqbot:${account.accountId}] TTS reply send failed: ${err}`);
+              return false;
             }
           };
 
@@ -3420,28 +3469,9 @@ ${ttsHint}${sttHint}`;
                           if (!ttsText?.trim()) {
                             await sendErrorMessage(`[QQBot] 语音消息缺少文本内容`);
                           } else {
-                            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
-                            if (!baseTtsCfg) {
-                              log?.error(`[qqbot:${account.accountId}] TTS not configured (channels.qqbot.tts in openclaw.json)`);
+                            const sentVoice = await sendTTSReplyText(ttsText, parsedPayload.tts);
+                            if (!sentVoice) {
                               await sendVisibleReplyText(ttsText);
-                            } else {
-                              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, parsedPayload.tts);
-                              const spokenText = applyTTSPauseHints(ttsText, parsedPayload.tts);
-                              log?.info(`[qqbot:${account.accountId}] TTS: "${ttsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
-                              const ttsDir = getQQBotDataDir("tts");
-                              const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
-                              log?.info(`[qqbot:${account.accountId}] TTS done: ${formatDuration(duration)}, uploading voice...`);
-
-                              await sendWithTokenRetry(async (token) => {
-                                if (event.type === "c2c") {
-                                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
-                                } else if (event.type === "group" && event.groupOpenid) {
-                                  await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
-                                } else if (event.channelId) {
-                                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${ttsText}`, event.messageId);
-                                }
-                              });
-                              log?.info(`[qqbot:${account.accountId}] Voice message sent`);
                             }
                           }
                         } catch (err) {
@@ -3687,6 +3717,21 @@ ${ttsHint}${sttHint}`;
                 // 🎯 过滤内部标记（如 [[reply_to: xxx]]）
                 // 这些标记可能被 AI 错误地学习并输出
                 textWithoutImages = filterInternalMarkers(textWithoutImages);
+                if (userRequestedVoiceReply && imageUrls.length === 0 && textWithoutImages.trim()) {
+                  const sentVoice = await sendTTSReplyText(textWithoutImages, {
+                    languageBoost: "Chinese",
+                    pause: "normal",
+                  });
+                  if (sentVoice) {
+                    pluginRuntime.channel.activity.record({
+                      channel: "qqbot",
+                      accountId: account.accountId,
+                      direction: "outbound",
+                    });
+                    return;
+                  }
+                  log?.info(`[qqbot:${account.accountId}] Falling back to text after forced TTS reply failed`);
+                }
                 
                 // 根据模式处理图片
                 if (useMarkdown) {

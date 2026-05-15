@@ -7,7 +7,7 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-message-buffer-test
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
-const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages } = await import("../dist/src/gateway.js");
+const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseVoiceReplySuffix } = await import("../dist/src/gateway.js");
 const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
 
 const first = {
@@ -41,6 +41,18 @@ assert.equal(merged.attachments.length, 1, "merged event should carry attachment
 assert.equal(merged.bufferedMessages.length, 2, "merged event should keep source messages for ref-index caching");
 assert.equal(merged.bufferedMessages[0].msgIdx, "REFIDX_1");
 assert.equal(merged.bufferedMessages[1].msgIdx, "REFIDX_2");
+
+assert.deepEqual(
+  parseVoiceReplySuffix("想听你说晚安~"),
+  { text: "想听你说晚安", forceVoiceReply: true },
+  "ASCII tilde suffix should request a voice reply and be stripped from user text",
+);
+
+assert.deepEqual(
+  parseVoiceReplySuffix("普通波浪号～"),
+  { text: "普通波浪号～", forceVoiceReply: false },
+  "fullwidth wave dash should remain normal text",
+);
 
 assert.throws(
   () => mergeBufferedQueuedMessages([]),
