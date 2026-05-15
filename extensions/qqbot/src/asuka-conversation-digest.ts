@@ -237,6 +237,26 @@ function normalizeStringArray(value: unknown): string[] {
     .slice(0, MAX_ARRAY_ITEMS);
 }
 
+function isTemporaryDirectiveText(text: string): boolean {
+  return /(临时|暂时|接下来|后面\s*\d*\s*轮|[一二三四五六七八九十百\d]+\s*轮|直到|本轮|这轮|下一轮|今晚|今天.*语音|语音回答|用语音回答)/i.test(text);
+}
+
+function normalizeStablePreferences(value: unknown): string[] {
+  return normalizeStringArray(value)
+    .filter((item) => !isTemporaryDirectiveText(item))
+    .slice(0, MAX_ARRAY_ITEMS);
+}
+
+function normalizeTemporaryDirectives(...values: unknown[]): string[] {
+  const items: string[] = [];
+  for (const value of values) {
+    for (const item of normalizeStringArray(value)) {
+      if (Array.isArray(value) || isTemporaryDirectiveText(item)) items.push(item);
+    }
+  }
+  return [...new Set(items)].slice(0, MAX_ARRAY_ITEMS);
+}
+
 function normalizeOpenLoops(value: unknown): string[] {
   return normalizeStringArray(value)
     .map((item) => {
@@ -260,8 +280,8 @@ function normalizeWeeklyDigest(value: unknown): ConversationWeeklyDigest {
     relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, 520),
     recentEmotionalArc: sanitizeDigestText(input.recentEmotionalArc, 420),
     currentOpenLoops: normalizeOpenLoops(input.currentOpenLoops),
-    userPreferences: normalizeStringArray(input.userPreferences),
-    temporaryDirectives: normalizeStringArray(input.temporaryDirectives ?? input.temporaryPreferences),
+    userPreferences: normalizeStablePreferences(input.userPreferences),
+    temporaryDirectives: normalizeTemporaryDirectives(input.temporaryDirectives ?? input.temporaryPreferences, normalizeStringArray(input.userPreferences).filter(isTemporaryDirectiveText)),
     asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, 420),
     sceneContinuity: sanitizeDigestText(input.sceneContinuity, 420),
     importantRecentFacts: normalizeStringArray(input.importantRecentFacts),
@@ -298,8 +318,8 @@ function normalizeDailyDigest(value: unknown, fallbackDate: string, fallbackLeve
     relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, fieldLimit),
     emotionalArc: sanitizeDigestText(input.emotionalArc ?? input.recentEmotionalArc, fieldLimit),
     openLoops: normalizeOpenLoops(input.openLoops ?? input.currentOpenLoops).slice(0, arrayLimit),
-    userPreferences: clampArray(input.userPreferences),
-    temporaryDirectives: clampArray(input.temporaryDirectives ?? input.temporaryPreferences),
+    userPreferences: normalizeStablePreferences(input.userPreferences).slice(0, arrayLimit),
+    temporaryDirectives: normalizeTemporaryDirectives(input.temporaryDirectives ?? input.temporaryPreferences, normalizeStringArray(input.userPreferences).filter(isTemporaryDirectiveText)).slice(0, arrayLimit),
     asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, fieldLimit),
     sceneContinuity: sanitizeDigestText(input.sceneContinuity, fieldLimit),
     importantFacts: clampArray(input.importantFacts ?? input.importantRecentFacts),

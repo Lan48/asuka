@@ -197,11 +197,14 @@ try {
   assert.equal(digest.version, 2);
   assert.equal(digest.weekly.currentOpenLoops[0], "继续优化主回复上下文负担");
   assert.equal(digest.weekly.currentOpenLoops.some((item) => item.includes("愧疚")), false, "resolved emotional topics should not remain open loops");
+  assert.equal(digest.weekly.userPreferences.some((item) => item.includes("十轮")), false, "temporary directives should not remain stable weekly preferences");
   assert.equal(digest.weekly.temporaryDirectives[0].includes("十轮"), true, "temporary directives should be kept separately from stable preferences");
   assert.equal(digest.weekly.evidenceNotes.length > 0, true, "digest should keep evidence notes");
   assert.equal(digest.daily.some((day) => day.date === "2026-05-10"), false, "empty no-record daily placeholders should be pruned");
   assert.equal(digest.daily.at(-1).date, "2026-05-15");
   assert.equal(digest.daily.at(-1).detailLevel, "detailed");
+  assert.equal(digest.daily.at(-1).userPreferences.some((item) => item.includes("十轮")), false, "temporary directives should not remain stable daily preferences");
+  assert.equal(digest.daily.at(-1).temporaryDirectives.some((item) => item.includes("十轮")), true, "temporary daily directives should be preserved with expiry context");
   assert.equal(digest.daily[0].detailLevel, "brief");
 
   const prompt = buildConversationDigestPrompt(context);
