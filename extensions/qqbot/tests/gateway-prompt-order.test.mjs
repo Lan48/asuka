@@ -66,8 +66,8 @@ assert.match(
 );
 assert.match(
   source,
-  /payload\.audioAsVoice[\s\S]{0,120}hasResponse = true/,
-  "internal audio final deliver should count as a response and avoid transcript fallback"
+  /"audioAsVoice" in payload[\s\S]{0,160}hasResponse = true/,
+  "internal media final deliver should count as a response by payload shape and avoid transcript fallback"
 );
 assert.match(
   source,
