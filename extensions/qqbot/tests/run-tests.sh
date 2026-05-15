@@ -12,6 +12,7 @@ npx tsc
 
 echo "[qqbot:test] syntax check"
 node --check dist/src/asuka-memory.js
+node --check dist/src/asuka-conversation-digest.js
 node --check dist/src/gateway.js
 node --check dist/src/outbound.js
 node --check dist/src/utils/media-caption.js
@@ -24,6 +25,7 @@ echo "[qqbot:test] behavior fixtures"
 node tests/asuka-media-caption.test.mjs
 node tests/asuka-narration.test.mjs
 node tests/asuka-memory.test.mjs
+node tests/asuka-conversation-digest.test.mjs
 node tests/asuka-promise.test.mjs
 node tests/asuka-scheduling.test.mjs
 node tests/asuka-repair.test.mjs

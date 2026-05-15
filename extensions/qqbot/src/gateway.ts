@@ -23,6 +23,7 @@ import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxS
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
+import { buildConversationDigestPrompt, scheduleConversationDigestUpdate } from "./asuka-conversation-digest.js";
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
@@ -62,8 +63,8 @@ const MAX_SELFIE_RECENT_CONTEXT_CHARS = 640;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_CHAT_CONTEXT_DAYS = 7;
 const MAX_CHAT_RECENT_ENTRY_CHARS = 500;
-const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 40_000;
-const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 2_000;
+const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 12_000;
+const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 24;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
 const MAX_SELFIE_PROMPT_CHARS = 1400;
 const MAX_SELFIE_CAPTION_CHARS = 240;
@@ -333,7 +334,7 @@ function trimTranscriptLinesByChars(lines: string[], maxChars: number): string {
   ].join("\n");
 }
 
-function buildRecentConversationTranscript(peerId: string, currentUserText: string, currentMessageTimestamp?: number): string {
+export function buildRecentConversationTranscript(peerId: string, currentUserText: string, currentMessageTimestamp?: number): string {
   const normalizedCurrent = currentUserText.trim();
   const sinceMs = Date.now() - RECENT_CHAT_CONTEXT_DAYS * ONE_DAY_MS;
   const recentLines = getEntriesForPeerSince(peerId, sinceMs, MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES)
@@ -2115,6 +2116,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
         const asukaStatePrompt = shouldForceFreshSession ? "" : buildAsukaStatePrompt(asukaPeerContext);
         const asukaMemoryPrompt = shouldForceFreshSession ? "" : buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
+        const asukaConversationDigestPrompt = shouldForceFreshSession ? "" : buildConversationDigestPrompt(asukaPeerContext);
         const eventTimestampMs = new Date(event.timestamp).getTime();
         const recentChatTranscript = shouldForceFreshSession
           ? ""
@@ -2134,6 +2136,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
         if (asukaMemoryPrompt) {
           dynamicPromptSections.push(asukaMemoryPrompt);
+        }
+        if (asukaConversationDigestPrompt) {
+          dynamicPromptSections.push(asukaConversationDigestPrompt);
         }
 
         // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
@@ -2758,6 +2763,12 @@ ${ttsHint}${sttHint}`;
                 });
                 const loggedPromises = recordAssistantReply(asukaPeerContext, replyText, parsedPromises);
                 recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, replyText);
+                scheduleConversationDigestUpdate(asukaPeerContext, {
+                  rootConfig: cfg as Record<string, unknown>,
+                  userText: userContent,
+                  assistantText: replyText,
+                  log,
+                });
                 await refreshSceneState(asukaPeerContext, {
                   trigger: "assistant",
                   text: replyText,
