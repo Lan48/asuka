@@ -359,10 +359,10 @@ export function buildRecentConversationTranscript(peerId: string, currentUserTex
 }
 
 function normalizeRecentConversationText(text: string): string {
-  return truncateForSelfiePrompt(
+  return cleanOutgoingTextSegment(truncateForSelfiePrompt(
     sanitizeSelfieContextText(text).replace(/\s+/g, " ").trim(),
     MAX_SELFIE_RECENT_ENTRY_CHARS,
-  );
+  ));
 }
 
 function detectReplyLoop(peerId: string): { repeatedReply: string } | null {
@@ -1101,6 +1101,14 @@ function filterInternalMarkers(text: string): string {
   result = result.replace(/\n{3,}/g, "\n\n").trim();
   
   return result;
+}
+
+function cleanOutgoingTextSegment(text: string): string {
+  const visibleText = filterInternalMarkers(text).trim();
+  if (/^\\+$/.test(visibleText)) {
+    return "";
+  }
+  return visibleText;
 }
 
 export interface GatewayContext {
@@ -2148,26 +2156,21 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         const hasTTS = !!resolveTTSConfig(cfg as Record<string, unknown>);
         const hasSTT = !!resolveSTTConfig(cfg as Record<string, unknown>);
         const replyLoop = !isGroupChat ? detectReplyLoop(asukaPeerContext.peerId) : null;
-        const shouldForceFreshSession = Boolean(replyLoop);
-        if (!shouldForceFreshSession) {
-          await refreshSceneState(asukaPeerContext, {
-            trigger: "inbound",
-            text: userContent,
-            at: nowMs,
-          });
-        }
-        const asukaStatePrompt = shouldForceFreshSession ? "" : buildAsukaStatePrompt(asukaPeerContext);
-        const asukaMemoryPrompt = shouldForceFreshSession ? "" : buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
-        const asukaConversationDigestPrompt = shouldForceFreshSession ? "" : buildConversationDigestPrompt(asukaPeerContext);
+        await refreshSceneState(asukaPeerContext, {
+          trigger: "inbound",
+          text: userContent,
+          at: nowMs,
+        });
+        const asukaStatePrompt = buildAsukaStatePrompt(asukaPeerContext);
+        const asukaMemoryPrompt = buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
+        const asukaConversationDigestPrompt = buildConversationDigestPrompt(asukaPeerContext);
         const eventTimestampMs = new Date(event.timestamp).getTime();
-        const recentChatTranscript = shouldForceFreshSession
-          ? ""
-          : buildRecentConversationTranscript(asukaPeerContext.peerId, userContent, eventTimestampMs);
+        const recentChatTranscript = buildRecentConversationTranscript(asukaPeerContext.peerId, userContent, eventTimestampMs);
         stablePromptSections.push(buildPersonaPromptForChat(isGroupChat));
         const dynamicPromptSections: string[] = [];
         if (replyLoop) {
           log?.info?.(
-            `[qqbot:${account.accountId}] Reply loop detected for ${asukaPeerContext.peerId}, forcing fresh session. repeatedReply="${replyLoop.repeatedReply}"`
+            `[qqbot:${account.accountId}] Reply loop detected for ${asukaPeerContext.peerId}, adding correction while preserving context. repeatedReply="${replyLoop.repeatedReply}"`
           );
           dynamicPromptSections.push(
             "【回复纠偏】上一轮对话已经卡在固定句式里了。这一轮不要沿用上一句原话，直接根据用户最新这句重新组织自然回复。"
@@ -2343,12 +2346,10 @@ ${ttsHint}${sttHint}`;
           }
         }
 
-        const commandBody = shouldForceFreshSession
-          ? `/new ${event.content}`.trim()
-          : event.content;
+        const commandBody = event.content;
         const companionThinkingLevel = resolveCompanionThinkingLevel(userContent, isGroupChat);
         log?.info?.(`[qqbot:${account.accountId}] companion thinking level=${companionThinkingLevel}`);
-        const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/") && !shouldForceFreshSession;
+        const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/");
         if (shouldApplyCompanionThinkingPolicy) {
           await clearCompanionSessionModeOverrides(route.sessionKey, route.agentId, log);
         }
@@ -2443,7 +2444,7 @@ ${ttsHint}${sttHint}`;
         };
 
         const sendVisibleReplyText = async (text: string): Promise<boolean> => {
-          const visibleText = filterInternalMarkers(text).trim();
+          const visibleText = cleanOutgoingTextSegment(text);
           if (!visibleText) {
             return false;
           }
@@ -2652,7 +2653,9 @@ ${ttsHint}${sttHint}`;
             return undefined;
           };
           const sendReplyTextSegments = async (text: string): Promise<void> => {
-            const segments = splitAsukaNarrationSegments(text);
+            const visibleText = cleanOutgoingTextSegment(text);
+            if (!visibleText) return;
+            const segments = splitAsukaNarrationSegments(visibleText);
             for (const segment of segments) {
               await sendWithTokenRetry(async (token) => {
                 const ref = consumeQuoteRef();
@@ -2897,9 +2900,9 @@ ${ttsHint}${sttHint}`;
                   
                   while ((match = mediaTagRegexWithIndex.exec(replyText)) !== null) {
                     // 添加标签前的文本
-                    const textBefore = replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n").trim();
+                    const textBefore = cleanOutgoingTextSegment(replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n"));
                     if (textBefore) {
-                      sendQueue.push({ type: "text", content: filterInternalMarkers(textBefore) });
+                      sendQueue.push({ type: "text", content: textBefore });
                     }
                     
                     const tagName = match[1]!.toLowerCase(); // "qqimg" or "qqvoice" or "qqfile"
@@ -2979,9 +2982,9 @@ ${ttsHint}${sttHint}`;
                   }
                   
                   // 添加最后一个标签后的文本
-                  const textAfter = replyText.slice(lastIndex).replace(/\n{3,}/g, "\n\n").trim();
+                  const textAfter = cleanOutgoingTextSegment(replyText.slice(lastIndex).replace(/\n{3,}/g, "\n\n"));
                   if (textAfter) {
-                    sendQueue.push({ type: "text", content: filterInternalMarkers(textAfter) });
+                    sendQueue.push({ type: "text", content: textAfter });
                   }
                   
                   log?.info(`[qqbot:${account.accountId}] Send queue: ${sendQueue.map(item => item.type).join(" -> ")}`);

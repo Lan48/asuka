@@ -85,13 +85,27 @@ assert.ok(
 );
 assert.match(
   source,
-  /const sendVisibleReplyText = async[\s\S]{0,160}filterInternalMarkers\(text\)\.trim\(\)/,
+  /const sendVisibleReplyText = async[\s\S]{0,160}cleanOutgoingTextSegment\(text\)/,
   "visible text sends should strip internal markers at the final send boundary"
+);
+assert.match(
+  source,
+  /function cleanOutgoingTextSegment[\s\S]{0,220}\^\\\\\+\$/,
+  "outgoing text cleanup should drop lone markdown escape artifacts"
 );
 assert.match(
   source,
   /sendQueue\.push\(\{ type: hasTTS \? "voiceText" : "text", content: mediaPath \}\)/,
   "legacy qqvoice text should never be treated as an audio file path"
+);
+assert.ok(
+  !source.includes("shouldForceFreshSession"),
+  "reply loop correction should not strip conversation context or force /new sessions"
+);
+assert.match(
+  source,
+  /adding correction while preserving context/,
+  "reply loop correction should preserve context when adding anti-loop guidance"
 );
 assert.match(
   source,
