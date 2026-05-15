@@ -303,13 +303,19 @@ function clampNumber(value: unknown, min: number, max: number): number | undefin
   return Math.min(max, Math.max(min, numberValue));
 }
 
+function clampInteger(value: unknown, min: number, max: number): number | undefined {
+  const numberValue = asFiniteNumber(value);
+  if (numberValue === undefined) return undefined;
+  return Math.trunc(Math.min(max, Math.max(min, numberValue)));
+}
+
 function normalizeMiniMaxVoiceModify(value: unknown): MiniMaxVoiceModify | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const input = value as Record<string, unknown>;
   const result: MiniMaxVoiceModify = {};
-  const pitch = clampNumber(input.pitch, -12, 12);
-  const intensity = clampNumber(input.intensity, -10, 10);
-  const timbre = clampNumber(input.timbre, -10, 10);
+  const pitch = clampInteger(input.pitch, -12, 12);
+  const intensity = clampInteger(input.intensity, -10, 10);
+  const timbre = clampInteger(input.timbre, -10, 10);
   const rawSoundEffects = input.soundEffects ?? input.sound_effects;
   const soundEffects = Array.isArray(rawSoundEffects)
     ? rawSoundEffects
@@ -357,11 +363,11 @@ function defaultsForTTSEmotion(emotion: TTSRuntimeOverrides["emotion"]): Partial
     case "shy":
     case "soft":
     case "gentle":
-      return { speed: 0.94, pitch: 0.3, vol: 0.95 };
+      return { speed: 0.94, pitch: 0, vol: 0.95 };
     case "relieved":
-      return { speed: 0.92, pitch: -0.2, vol: 0.95 };
+      return { speed: 0.92, pitch: 0, vol: 0.95 };
     case "serious":
-      return { speed: 0.92, pitch: -0.8, vol: 1 };
+      return { speed: 0.92, pitch: -1, vol: 1 };
     default:
       return {};
   }
@@ -445,7 +451,7 @@ function normalizeMiniMaxSpeed(speed?: number): number {
 
 function normalizeMiniMaxPitch(pitch?: number): number {
   if (pitch === undefined || Number.isNaN(pitch)) return 0;
-  return Math.min(12, Math.max(-12, pitch));
+  return Math.trunc(Math.min(12, Math.max(-12, pitch)));
 }
 
 function decodeMiniMaxAudioHex(response: any): Buffer {

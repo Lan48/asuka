@@ -2139,7 +2139,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
         // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
-          ? `6. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":-0.5,"vol":1,"languageBoost":"Chinese"}}`
+          ? `6. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
           : `6. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
         const sttHint = hasSTT
           ? `\n7. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
@@ -2148,13 +2148,13 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
 【发送语音 - 必须遵守】
 1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
-2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":-0.5,"vol":1,"languageBoost":"Chinese"}}
+2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
 3. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
 4. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
 5. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
 6. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
 7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
-8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0.5；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0
+8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
 9. 停顿可以用 tts.pause 或直接写进朗读文本本身，用 MiniMax 停顿标记 <#0.3#> 到 <#1.5#>；不要滥用
 ${ttsHint}${sttHint}`;
 

@@ -144,13 +144,53 @@ try {
   await textToSpeechPCM("带一点停顿<#0.4#>和语气", dynamicTtsConfig);
   assert.equal(capturedBody.voice_setting.voice_id, "Chinese (Mandarin)_Soft_Girl");
   assert.equal(capturedBody.voice_setting.speed, 0.94);
-  assert.equal(capturedBody.voice_setting.pitch, 0.3);
+  assert.equal(capturedBody.voice_setting.pitch, 0);
   assert.equal(capturedBody.voice_setting.vol, 1.2);
   assert.equal(capturedBody.language_boost, "Chinese");
   assert.deepEqual(capturedBody.pronunciation_dict, [{ text: "Asuka", tone: "阿斯卡" }]);
   assert.equal(capturedBody.voice_modify.intensity, -1);
   assert.equal(capturedBody.voice_modify.timbre, 1);
   assert.deepEqual(capturedBody.voice_modify.sound_effects, ["soft"]);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+const fractionalPitchTtsConfig = applyTTSRuntimeOverrides(ttsConfig, {
+  speed: 0.95,
+  pitch: -0.5,
+  voiceModify: {
+    pitch: 1.8,
+    intensity: -1.2,
+    timbre: 0.9,
+  },
+});
+
+globalThis.fetch = async (url, init) => {
+  capturedUrl = String(url);
+  capturedHeaders = init?.headers ?? {};
+  capturedBody = JSON.parse(String(init?.body ?? "{}"));
+  return new Response(JSON.stringify({
+    data: {
+      audio: makePcmWavHex(),
+    },
+    base_resp: {
+      status_code: 0,
+      status_msg: "success",
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+};
+
+try {
+  await textToSpeechPCM("小数音高会被规整", fractionalPitchTtsConfig);
+  assert.equal(Number.isInteger(capturedBody.voice_setting.pitch), true);
+  assert.equal(capturedBody.voice_setting.pitch, 0);
+  assert.equal(Number.isInteger(capturedBody.voice_modify.pitch), true);
+  assert.equal(capturedBody.voice_modify.pitch, 1);
+  assert.equal(capturedBody.voice_modify.intensity, -1);
+  assert.equal(capturedBody.voice_modify.timbre, 0);
 } finally {
   globalThis.fetch = originalFetch;
 }
