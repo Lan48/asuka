@@ -165,7 +165,7 @@ try {
   assert.ok(digest, "digest update should write normalized digest");
   assert.equal(capturedUrl, "https://api.minimaxi.com/anthropic/v1/messages");
   assert.equal(capturedBody.model, "MiniMax-M2.7");
-  assert.equal(capturedBody.max_tokens, 2400, "digest curator should leave room for MiniMax text after thinking blocks");
+  assert.equal(capturedBody.max_tokens, 6000, "digest curator should leave room for MiniMax text after thinking blocks");
   assert.deepEqual(capturedBody.thinking, { type: "disabled" }, "digest curator should disable provider thinking output");
   assert.equal(capturedBody.system.includes("不能生成用户可见回复"), true, "digest curator must be explicitly non-user-facing");
   assert.equal(capturedBody.system.includes("daily 日摘要"), true, "digest curator should produce daily summaries");
