@@ -36,6 +36,7 @@ try {
     recordInboundInteraction,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
+  const { resolveCronDeliveryFallbackText } = await import("../dist/src/outbound.js");
 
   const parse = (text) => parseAssistantPromises(text, {
     now: new Date(base),
@@ -109,6 +110,17 @@ try {
   recordInboundInteraction(ambientContext, "早安，醒了吗", base + 40_000);
   const firstAmbient = prepareAmbientLifePayload(ambientContext, base + 41_000);
   assert.equal(firstAmbient.stage, 0, "new ambient thread should start at stage zero");
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。"),
+    firstAmbient.content,
+    "ambient fallback should prefer the current payload seed over transcript template text",
+  );
   markProactiveDelivered("acct-test:direct:user-ambient-advance", {
     at: base + 42_000,
     content: "早，已经醒了。我先去把窗帘拉开。",

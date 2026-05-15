@@ -834,6 +834,7 @@ const MAX_DYNAMIC_PROMISE_RECENT_CONTEXT_CHARS = 520;
 interface PromiseTextGenerationConfig {
   baseUrl: string;
   apiKey: string;
+  api: "openai-completions" | "anthropic-messages";
   model: string;
   systemPrompt?: string;
 }
@@ -876,6 +877,54 @@ function buildTextGenerationMessages(
     ...cleanedSystemPrompts.map((content) => ({ role: "system" as const, content })),
     { role: "user" as const, content: cleanedUserPrompt },
   ];
+}
+
+function buildCleanedSystemPrompt(systemPrompts: Array<string | undefined>): string {
+  return systemPrompts
+    .map((item) => item?.trim() ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function fetchTextGenerationResponse(
+  config: PromiseTextGenerationConfig,
+  systemPrompts: Array<string | undefined>,
+  userPrompt: string,
+  maxTokens: number,
+): Promise<Response> {
+  if (config.api === "anthropic-messages") {
+    const system = buildCleanedSystemPrompt(systemPrompts);
+    return await fetch(`${config.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0.55,
+        max_tokens: Math.max(maxTokens, 512),
+        ...(system ? { system } : {}),
+        messages: [{ role: "user", content: userPrompt.trim() }],
+      }),
+    });
+  }
+
+  return await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: config.model,
+      ...getOpenAICompletionsThinkingParams(config.model, "off"),
+      temperature: 0.55,
+      ...buildChatCompletionTokenLimit(config, maxTokens),
+      messages: buildTextGenerationMessages(config, systemPrompts, userPrompt),
+    }),
+  });
 }
 
 function trimDeliveryText(text: string, limit = MAX_DYNAMIC_PROMISE_TEXT_CHARS): string {
@@ -1362,6 +1411,12 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   if (!providers || typeof providers !== "object") {
     return null;
   }
+  const isSupportedTextProvider = (candidateProvider: any): boolean => {
+    if (!candidateProvider?.baseUrl || !candidateProvider?.apiKey) return false;
+    return !candidateProvider.api
+      || candidateProvider.api === "openai-completions"
+      || candidateProvider.api === "anthropic-messages";
+  };
 
   const primary = String(root?.agents?.defaults?.model?.primary || "").trim();
   const [primaryProviderId, ...primaryModelParts] = primary.split("/");
@@ -1369,7 +1424,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   let modelId = primaryModelParts.join("/");
 
   let provider = providerId ? providers?.[providerId] : undefined;
-  if (!provider || !provider.baseUrl || !provider.apiKey || (provider.api && provider.api !== "openai-completions")) {
+  if (!isSupportedTextProvider(provider)) {
     providerId = "";
     modelId = "";
     provider = undefined;
@@ -1377,8 +1432,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
 
   if (!provider) {
     for (const [candidateProviderId, candidateProvider] of Object.entries<any>(providers)) {
-      if (!candidateProvider?.baseUrl || !candidateProvider?.apiKey) continue;
-      if (candidateProvider.api && candidateProvider.api !== "openai-completions") continue;
+      if (!isSupportedTextProvider(candidateProvider)) continue;
       providerId = candidateProviderId;
       provider = candidateProvider;
       modelId = String(candidateProvider?.models?.[0]?.id || "").trim();
@@ -1395,6 +1449,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   return {
     baseUrl: String(provider.baseUrl).replace(/\/+$/, ""),
     apiKey: String(provider.apiKey),
+    api: provider.api === "anthropic-messages" ? "anthropic-messages" : "openai-completions",
     model: modelId,
     systemPrompt: typeof root?.channels?.qqbot?.systemPrompt === "string" ? root.channels.qqbot.systemPrompt : undefined,
   };
@@ -1470,6 +1525,27 @@ function extractAssistantTextFromCompletion(raw: any): string {
       .trim();
   }
   return "";
+}
+
+function extractAssistantTextFromAnthropicMessage(raw: any): string {
+  const content = raw?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item?.type === "text" && typeof item.text === "string") return item.text;
+      if (typeof item?.text === "string" && item?.type !== "thinking") return item.text;
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+function extractAssistantTextFromTextGeneration(config: PromiseTextGenerationConfig, raw: any): string {
+  return config.api === "anthropic-messages"
+    ? extractAssistantTextFromAnthropicMessage(raw)
+    : extractAssistantTextFromCompletion(raw);
 }
 
 function buildPromiseDeliveryPrompt(
@@ -1675,6 +1751,17 @@ function buildTranscriptAnchoredFallbackText(
   return "（把刚才那点没说完的心思轻轻拢了拢）……就是忽然又想到你了，所以想来和你说句话。";
 }
 
+export function resolveCronDeliveryFallbackText(
+  payload: DecodedCronPayload,
+  transcriptAnchoredFallback?: string | null,
+): string {
+  const candidates = payload.mode === "ambient"
+    ? [payload.content, payload.selfieCaption, transcriptAnchoredFallback]
+    : [payload.selfieCaption, payload.content, transcriptAnchoredFallback];
+  const fallback = candidates.find((item) => typeof item === "string" && item.trim());
+  return trimDeliveryText(fallback || "");
+}
+
 async function renderDeliveryTextFromSharedSession(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -1694,27 +1781,15 @@ async function renderDeliveryTextFromSharedSession(
   }
 
   try {
-    const response = await fetch(`${generationConfig.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${generationConfig.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: generationConfig.model,
-        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
-        temperature: 0.55,
-        ...buildChatCompletionTokenLimit(generationConfig, 160),
-        messages: buildTextGenerationMessages(
-          generationConfig,
-          [
-            generationConfig.systemPrompt,
-            "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
-          ],
-          prompt
-        ),
-      }),
-    });
+    const response = await fetchTextGenerationResponse(
+      generationConfig,
+      [
+        generationConfig.systemPrompt,
+        "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
+      ],
+      prompt,
+      160,
+    );
     const detail = await response.text();
     if (!response.ok) {
       console.warn(`[qqbot] renderDeliveryTextFromSharedSession: HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 240)}`);
@@ -1722,7 +1797,7 @@ async function renderDeliveryTextFromSharedSession(
     }
 
     const parsed = JSON.parse(detail);
-    const latestText = extractAssistantTextFromCompletion(parsed);
+    const latestText = extractAssistantTextFromTextGeneration(generationConfig, parsed);
     const normalized = trimDeliveryText(normalizeMediaTags(latestText));
     if (!normalized || looksLikeInternalDeliveryLeak(normalized) || containsUnsupportedCronMarkup(normalized) || isTimeContradictoryDeliveryText(normalized, promptTimeZone)) {
       console.warn(
@@ -1745,7 +1820,7 @@ async function renderPromiseDeliveryText(
   const transcriptAnchoredFallback = payload.mode === "ambient"
     ? buildTranscriptAnchoredFallbackText(account, payload)
     : null;
-  const fallbackText = trimDeliveryText(transcriptAnchoredFallback || payload.selfieCaption || payload.content || "");
+  const fallbackText = resolveCronDeliveryFallbackText(payload, transcriptAnchoredFallback);
   const sharedSessionText = await renderDeliveryTextFromSharedSession(account, payload);
   if (sharedSessionText) {
     console.log(`[qqbot] renderPromiseDeliveryText: using shared session text "${sharedSessionText.slice(0, 160)}"`);
@@ -1760,27 +1835,15 @@ async function renderPromiseDeliveryText(
   const promptTimeZone = getPromptTimeZone(account);
 
   try {
-    const response = await fetch(`${generationConfig.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${generationConfig.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: generationConfig.model,
-        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
-        temperature: 0.55,
-        ...buildChatCompletionTokenLimit(generationConfig, 160),
-        messages: buildTextGenerationMessages(
-          generationConfig,
-          [
-            generationConfig.systemPrompt,
-            `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
-          ],
-          prompt
-        ),
-      }),
-    });
+    const response = await fetchTextGenerationResponse(
+      generationConfig,
+      [
+        generationConfig.systemPrompt,
+        `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
+      ],
+      prompt,
+      160,
+    );
     const detail = await response.text();
     if (!response.ok) {
       console.warn(`[qqbot] renderPromiseDeliveryText: HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 240)}`);
@@ -1788,7 +1851,7 @@ async function renderPromiseDeliveryText(
     }
 
     const parsed = JSON.parse(detail);
-    const rendered = trimDeliveryText(normalizeMediaTags(extractAssistantTextFromCompletion(parsed)));
+    const rendered = trimDeliveryText(normalizeMediaTags(extractAssistantTextFromTextGeneration(generationConfig, parsed)));
     if (!rendered || looksLikeInternalDeliveryLeak(rendered) || containsUnsupportedCronMarkup(rendered) || isTimeContradictoryDeliveryText(rendered, promptTimeZone)) {
       return fallbackText;
     }
