@@ -66,6 +66,11 @@ assert.match(
 );
 assert.match(
   source,
+  /payload\.audioAsVoice[\s\S]{0,120}hasResponse = true/,
+  "internal audio final deliver should count as a response and avoid transcript fallback"
+);
+assert.match(
+  source,
   /disableBlockStreaming:\s*true/,
   "QQBot should wait for final text instead of relying on block streaming"
 );

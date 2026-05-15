@@ -42,6 +42,7 @@ type ReplyDeliverPayload = {
   isError?: boolean;
   isReasoning?: boolean;
   isCompactionNotice?: boolean;
+  audioAsVoice?: boolean;
 };
 
 interface StudioSelfieConfig {
@@ -2711,6 +2712,10 @@ ${ttsHint}${sttHint}`;
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
 
                 if (looksLikeInternalOnlyDeliver(payload)) {
+                  if (payload.audioAsVoice || payload.mediaUrl || payload.mediaUrls?.length) {
+                    hasResponse = true;
+                    hasBlockResponse = true;
+                  }
                   log?.info(`[qqbot:${account.accountId}] Suppressed internal-only deliver: ${Object.keys(payload).join(", ")}`);
                   return;
                 }
