@@ -34,4 +34,15 @@ assert.match(clearModeSnippet, /"thinkingLevel"/, "companion mode reset should c
 assert.match(clearModeSnippet, /"reasoningLevel"/, "companion mode reset should clear persisted reasoning mode");
 assert.match(clearModeSnippet, /"verboseLevel"/, "companion mode reset should clear persisted verbose mode");
 
+assert.equal(
+  source.includes("Timeout fallback kept silent"),
+  false,
+  "QQBot response timeout must not stay silent"
+);
+assert.match(
+  source,
+  /No response within timeout[\s\S]{0,500}sendErrorMessage/,
+  "QQBot response timeout should send a user-facing fallback"
+);
+
 console.log("[qqbot:test] gateway prompt order fixtures passed");

@@ -3766,7 +3766,7 @@ ${ttsHint}${sttHint}`;
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
-              log?.info(`[qqbot:${account.accountId}] Timeout fallback kept silent to avoid leaking processing status`);
+              await sendErrorMessage("刚刚我这边想久了一点，消息没有稳稳发出去。你再发一句，我会重新接住。");
             }
           } finally {
             // 清理 tool-only 兜底定时器
