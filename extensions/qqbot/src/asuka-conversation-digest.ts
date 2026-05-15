@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
-import { getEntriesForPeerSince } from "./ref-index-store.js";
+import { formatRefEntryForAgent, getEntriesForPeerSince } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 
 const DIGEST_DIR = getQQBotDataDir("data", "asuka-conversation-digest");
@@ -462,7 +462,7 @@ function formatLocalDate(timestamp: number, timeZone = DEFAULT_DIGEST_TIME_ZONE)
 function formatDailyHistory(entries: ReturnType<typeof getEntriesForPeerSince>, maxChars: number, timeZone = DEFAULT_DIGEST_TIME_ZONE): string {
   const groups = new Map<string, string[]>();
   for (const entry of entries) {
-    const content = sanitizeDigestText(entry.content, 500);
+    const content = sanitizeDigestText(formatRefEntryForAgent(entry), 500);
     if (!content) continue;
     const date = formatLocalDate(entry.timestamp, timeZone);
     const lines = groups.get(date) ?? [];
@@ -503,7 +503,7 @@ function buildDigestPrompt(input: {
   const previousJson = input.previous ? JSON.stringify(input.previous, null, 2) : "{}";
   return [
     `当前时间(ms): ${input.now}`,
-    "上一版 digest JSON:",
+    "上一版 digest JSON（只是可修改草稿，不是事实来源；不要机械继承）:",
     previousJson,
     "",
     "近一周对话节选（越靠后越新）:",
@@ -512,6 +512,13 @@ function buildDigestPrompt(input: {
     "本轮新增:",
     `用户: ${sanitizeDigestText(input.userText, 700) || "（空）"}`,
     `Asuka: ${sanitizeDigestText(input.assistantText, 700) || "（空）"}`,
+    "",
+    "更新方式:",
+    "- 输出必须是完整替换版 digest，不是 patch，也不是只追加本轮新增。",
+    "- 近一周对话节选和本轮新增优先级高于上一版 digest；如果旧摘要被新上下文纠正、补全、完成或过期，必须改写 weekly 和对应 daily 的旧内容。",
+    "- 对 daily 也要做回溯维护：今天的新事实可以修正昨天/更早日期里的误记、未闭环、避免项和临时指令，不要只更新最新一天。",
+    "- 临时指令必须按当前上下文更新状态；如果已经满足、被用户取消、超过轮数/时段、或最近历史能证明已完成，就从 temporaryDirectives 和 thingsToAvoid 中移除，而不是继续写'仍在生效'。",
+    "- 不要因为上一版 digest 里有某条信息就继续保留；保留每条重要信息都要能从近一周历史、本轮新增或明确证据说明中得到支持。",
     "",
     "输出 JSON schema:",
     JSON.stringify({
@@ -546,7 +553,7 @@ function buildDigestPrompt(input: {
     }),
     "",
     "daily 只为近一周对话节选里实际出现的本地自然日生成，不要为无记录日期生成'普通日常/细节未记录'占位。今天和昨天要详细，前 2-3 天适中，更早日期简略。",
-    "weekly 必须从 daily 和本轮新增汇总，不要和 daily 互相矛盾。已完成、已和解、只需避免的事项不要进入 openLoops；临时要求必须进入 temporaryDirectives，并写明过期条件或计数状态。",
+    "weekly 必须从更新后的 daily 和本轮新增重新汇总，不要和 daily 互相矛盾。已完成、已和解、只需避免的事项不要进入 openLoops；临时要求必须进入 temporaryDirectives，并写明过期条件或计数状态；已过期/已满足的临时要求必须删除。",
   ].join("\n");
 }
 
@@ -569,9 +576,11 @@ async function requestDigestFromMiniMax(prompt: string, config: MiniMaxDigestCon
           "你只能维护内部摘要 JSON，不能生成用户可见回复，不能调用任何外部消息发送能力。",
           "保留会影响下一轮自然陪伴、关系连续性、场景连续性和用户偏好的信息；删除闲聊噪声。",
           "摘要要分为 weekly 总览和 daily 日摘要；越近的 daily 越详细，越远越简略。",
+          "每次更新都要基于旧摘要、近一周历史和本轮新增重新生成完整摘要；旧摘要只是草稿，不能只追加最新内容。",
+          "如果当前上下文修正、完成或废弃了旧摘要里的内容，要同步改写 weekly 和相关 daily，而不是继续继承旧说法。",
           "daily 只能覆盖近一周历史中实际有记录的日期，不能补写没有记录的日期。",
           "openLoops 只放仍需继续承接的事项；已解决旧话题放 thingsToAvoid 或省略。",
-          "有轮数、时段、直到某事件为止的临时要求放 temporaryDirectives，不要混入稳定偏好。",
+          "有轮数、时段、直到某事件为止且仍在生效的临时要求放 temporaryDirectives，不要混入稳定偏好；已满足、已过期或被取消的临时要求必须移除。",
           "重要事实、偏好和推断要用 evidenceNotes 标出证据强度或来源。",
           "字段顺序和 schema 必须稳定；只输出一个 JSON 对象。",
         ].join("\n"),

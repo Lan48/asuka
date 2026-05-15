@@ -80,6 +80,19 @@ for (let day = 0; day < 7; day++) {
     isBot: false,
   });
 }
+setRefIndex("REFIDX_DIGEST_TTS", {
+  content: "",
+  senderId: "bot",
+  peerId: "user-digest",
+  senderName: "Asuka",
+  timestamp: now - 5_000,
+  isBot: true,
+  attachments: [{
+    type: "voice",
+    transcript: "这是已经成功发出的语音回复",
+    transcriptSource: "tts",
+  }],
+});
 
 const recentTranscript = buildRecentConversationTranscript("user-digest", "当前消息", now);
 assert.ok(recentTranscript.length <= 12_080, "main reply recent transcript should be capped near 12k chars");
@@ -192,8 +205,13 @@ try {
   assert.deepEqual(capturedBody.thinking, { type: "disabled" }, "digest curator should disable provider thinking output");
   assert.equal(capturedBody.system.includes("不能生成用户可见回复"), true, "digest curator must be explicitly non-user-facing");
   assert.equal(capturedBody.system.includes("daily 日摘要"), true, "digest curator should produce daily summaries");
+  assert.equal(capturedBody.system.includes("完整摘要"), true, "digest curator should rewrite the whole digest, not append only");
+  assert.equal(capturedBody.system.includes("旧摘要只是草稿"), true, "digest curator should treat previous digest as editable context");
   assert.equal(String(capturedBody.messages[0].content).includes("### 2026-05-15"), true, "digest prompt should group history by local day");
   assert.equal(String(capturedBody.messages[0].content).includes("QQBOT_PAYLOAD"), false, "digest prompt should remove structured payload artifacts");
+  assert.equal(String(capturedBody.messages[0].content).includes("完整替换版 digest"), true, "digest prompt should require full replacement updates");
+  assert.equal(String(capturedBody.messages[0].content).includes("如果旧摘要被新上下文纠正、补全、完成或过期"), true, "digest prompt should require revising stale prior summaries");
+  assert.equal(String(capturedBody.messages[0].content).includes("已经成功发出的语音回复"), true, "digest prompt should include outbound TTS voice transcripts for counting temporary voice directives");
   assert.equal(digest.version, 2);
   assert.equal(digest.weekly.currentOpenLoops[0], "继续优化主回复上下文负担");
   assert.equal(digest.weekly.currentOpenLoops.some((item) => item.includes("愧疚")), false, "resolved emotional topics should not remain open loops");
