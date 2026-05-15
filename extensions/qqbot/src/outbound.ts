@@ -733,7 +733,7 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
       });
     }
 
-    const ttsText = mergedCaption || parsedPayload.path;
+    const ttsText = parsedPayload.path;
     const baseTtsCfg = resolveTTSConfig(loadOpenClawConfig() ?? {});
     if (!baseTtsCfg) {
       console.warn("[qqbot] sendText: structured audio payload received but TTS is not configured; falling back to text");
@@ -755,7 +755,7 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
 
       let result: { id: string; timestamp: number | string };
       if (target.type === "c2c") {
-        result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+        result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, ttsText);
       } else if (target.type === "group") {
         result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
       } else {

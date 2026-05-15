@@ -44,6 +44,26 @@ assert.match(
   /No response within timeout[\s\S]{0,500}sendErrorMessage/,
   "QQBot response timeout should send a user-facing fallback"
 );
+assert.equal(
+  source.includes("消息没有稳稳发出去"),
+  false,
+  "QQBot timeout fallback should not expose delivery mechanics"
+);
+assert.equal(
+  source.includes("内部错误发出来"),
+  false,
+  "QQBot fallbacks should not mention suppressed internal errors"
+);
+assert.match(
+  source,
+  /parsedPayload\.mediaType === "audio"[\s\S]{0,300}const ttsText = parsedPayload\.path/,
+  "structured audio should speak the model-generated payload path, not the caption"
+);
+assert.match(
+  source,
+  /sendC2CVoiceMessage\(token, event\.senderId, silkBase64, event\.messageId, ttsText\)/,
+  "structured audio should persist the spoken TTS text for voice refs"
+);
 assert.match(
   source,
   /disableBlockStreaming:\s*true/,

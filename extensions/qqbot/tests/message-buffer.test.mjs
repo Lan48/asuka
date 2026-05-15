@@ -85,6 +85,27 @@ assert.equal(
 );
 
 assert.equal(
+  looksLikeInternalProcessLeak(`# 2026-05-15 周五
+
+## 日常
+- 早上睡醒黏在一起
+
+## 记忆整理
+- 用户说过一些需要长期保留的事
+
+## 待办
+- 明天继续整理`),
+  true,
+  "memory maintenance markdown should be suppressed as an internal leak",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak("写入 memory/2026-05-15.md"),
+  true,
+  "memory write status should be suppressed as an internal leak",
+);
+
+assert.equal(
   looksLikeInternalDeliveryLeak('QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。","tts":{"emotion":"soft"}}'),
   false,
   "valid structured payloads should be routed as media instead of suppressed as delivery leaks",

@@ -30,7 +30,7 @@ import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 
-const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
+const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
@@ -448,6 +448,7 @@ export function looksLikeInternalProcessLeak(text: string): boolean {
   const cleaned = extractVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   if (INTERNAL_PROCESS_LEAK_RE.test(cleaned)) return true;
+  if (looksLikeMemoryMaintenanceLeak(cleaned)) return true;
   if (cleaned.includes("/Users/") || cleaned.includes("openclaw-asuka/skills/")) return true;
   return false;
 }
@@ -455,7 +456,17 @@ export function looksLikeInternalProcessLeak(text: string): boolean {
 function looksLikeSilentInternalStatus(text: string): boolean {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned || cleaned.length > 160) return false;
-  return INTERNAL_SILENT_STATUS_RE.test(cleaned);
+  return INTERNAL_SILENT_STATUS_RE.test(cleaned) || looksLikeMemoryMaintenanceLeak(cleaned);
+}
+
+function looksLikeMemoryMaintenanceLeak(text: string): boolean {
+  const cleaned = text.replace(/\r/g, "").trim();
+  if (!cleaned) return false;
+  if (/(?:^|\n)\s*写入\s*memory\/\d{4}-\d{2}-\d{2}\.md\s*$/i.test(cleaned)) return true;
+  if (/Pre-compaction memory flush|memory\/\d{4}-\d{2}-\d{2}\.md/i.test(cleaned)) return true;
+  if (/^#\s*\d{4}-\d{2}-\d{2}\s+周[一二三四五六日天]\s*\n+##\s*(?:日常|记忆整理|待办)/.test(cleaned)) return true;
+  if (/##\s*记忆整理[\s\S]{0,1200}##\s*待办/.test(cleaned)) return true;
+  return false;
 }
 
 function looksLikeInternalOnlyDeliver(payload: ReplyDeliverPayload): boolean {
@@ -523,6 +534,23 @@ function buildLeakRewriteFallback(userText: string, peerId: string): string {
   return recentContext
     ? "我刚刚那句没落稳，我自己重新说。还是接着我们刚才这段，不让它掉下去。"
     : "我刚刚那句没落稳，我自己重新说。";
+}
+
+function buildNaturalTimeoutFallbackText(userText: string): string {
+  const cleanedUser = userText.trim().replace(/\s+/g, " ");
+  if (/(饿|饭|吃|面|菜|煮|厨房|晚饭|午饭|早饭|夜宵)/.test(cleanedUser)) {
+    return "我在。先不绕了，吃的这件事我接住，我们把晚饭定下来。";
+  }
+  if (/(语音|声音|听你|说给我听)/.test(cleanedUser)) {
+    return "我在。刚才那句没落稳，我重新用声音接你。";
+  }
+  if (/(抱|亲|贴|想你|陪我|难受|委屈|不开心|生气|烦)/.test(cleanedUser)) {
+    return "我在呢。刚才那句没接稳，但我没有走开，重新抱住你。";
+  }
+  if (/[?？]$/.test(cleanedUser)) {
+    return "我在。刚才那句没接稳，你这个问题我重新认真接。";
+  }
+  return "我在。刚才那句没接稳，我重新接你。";
 }
 
 function buildPersonaPromptForChat(isGroupChat: boolean): string {
@@ -2591,19 +2619,9 @@ ${ttsHint}${sttHint}`;
           let timeoutId: ReturnType<typeof setTimeout> | null = null;
           let toolOnlyTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
-          // 格式化 tool 兜底消息：极简，只展示工具原始参数
+          // 工具卡住时只能发自然兜底，不能暴露工具参数或内部状态。
           const formatToolFallback = (): string => {
-            if (toolTexts.length === 0) {
-              return "🔧 调用工具中…";
-            }
-            const recentTools = toolTexts.slice(-3);
-            const totalLen = recentTools.reduce((s, t) => s + t.length, 0);
-            if (totalLen > 1800) {
-              const last = recentTools[recentTools.length - 1]!;
-              return `🔧 调用工具中…\n\`\`\`\n${last.slice(0, 1500)}\n\`\`\``;
-            }
-            const toolBlock = recentTools.join("\n---\n");
-            return `🔧 调用工具中…\n\`\`\`\n${toolBlock}\n\`\`\``;
+            return buildNaturalTimeoutFallbackText(userContent);
           };
 
           const timeoutPromise = new Promise<void>((_, reject) => {
@@ -2667,7 +2685,7 @@ ${ttsHint}${sttHint}`;
 
               await sendWithTokenRetry(async (token) => {
                 if (event.type === "c2c") {
-                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
+                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId, ttsText);
                 } else if (event.type === "group" && event.groupOpenid) {
                   await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
                 } else if (event.channelId) {
@@ -2768,12 +2786,17 @@ ${ttsHint}${sttHint}`;
 
                 if (payload.isError || looksLikeModelProviderError(replyText)) {
                   log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
-                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                   return;
                 }
 
                 if (looksLikeSilentInternalStatus(replyText)) {
                   log?.info(`[qqbot:${account.accountId}] Suppressed silent internal status reply: ${replyText.slice(0, 160)}`);
+                  return;
+                }
+
+                if (looksLikeMemoryMaintenanceLeak(replyText)) {
+                  log?.info(`[qqbot:${account.accountId}] Suppressed memory maintenance leak in user-facing block reply: ${replyText.slice(0, 160)}`);
                   return;
                 }
 
@@ -2791,7 +2814,7 @@ ${ttsHint}${sttHint}`;
                     log?.info(`[qqbot:${account.accountId}] Rewrote internal leak reply into user-facing text: ${rewrittenReply.slice(0, 160)}`);
                     replyText = rewrittenReply;
                   } else {
-                    await sendErrorMessage("我刚刚那句没落稳，我重新说。");
+                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                     return;
                   }
                 }
@@ -3464,7 +3487,7 @@ ${ttsHint}${sttHint}`;
                         }
                       } else if (parsedPayload.mediaType === "audio") {
                         // TTS 语音发送：文字 → PCM → SILK → QQ 语音
-                        const ttsText = mergedCaption || parsedPayload.path;
+                        const ttsText = parsedPayload.path;
                         try {
                           if (!ttsText?.trim()) {
                             await sendErrorMessage(`[QQBot] 语音消息缺少文本内容`);
@@ -3908,11 +3931,11 @@ ${ttsHint}${sttHint}`;
                 // 面向用户只发温和兜底，完整错误留在日志里。
                 const errMsg = String(err);
                 if (errMsg.includes("401") || errMsg.includes("key") || errMsg.includes("auth")) {
-                  await sendErrorMessage("⚠️ AI 服务认证失败，API Key 可能无效，请联系管理员检查配置。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 } else if (looksLikeModelProviderError(errMsg)) {
-                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 } else {
-                  await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 }
               },
             },
@@ -3932,7 +3955,7 @@ ${ttsHint}${sttHint}`;
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
-              await sendErrorMessage("刚刚我这边想久了一点，消息没有稳稳发出去。你再发一句，我会重新接住。");
+              await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
             }
           } finally {
             // 清理 tool-only 兜底定时器
@@ -3962,13 +3985,13 @@ ${ttsHint}${sttHint}`;
                 }
               }
               if (!hasResponse) {
-                await sendErrorMessage("刚刚我已经想好要怎么回你了，但消息没有发出去。你再发一句，我会重新接住。");
+                await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
               }
             }
           }
         } catch (err) {
           log?.error(`[qqbot:${account.accountId}] Message processing failed: ${err}`);
-          await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
+          await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
         }
       };
 
