@@ -61,8 +61,8 @@ assert.match(
 );
 assert.match(
   source,
-  /sendC2CVoiceMessage\(token, event\.senderId, silkBase64, event\.messageId, ttsText\)/,
-  "structured audio should persist the spoken TTS text for voice refs"
+  /sendC2CVoiceMessage\(token, event\.senderId, silkBase64, event\.messageId, visibleTtsText\)/,
+  "structured audio should persist the visible spoken TTS text for voice refs"
 );
 assert.match(
   source,
@@ -92,6 +92,20 @@ assert.match(
   source,
   /function cleanOutgoingTextSegment[\s\S]{0,220}\^\\\\\+\$/,
   "outgoing text cleanup should drop lone markdown escape artifacts"
+);
+assert.match(
+  source,
+  /function stripTTSPauseMarkers[\s\S]{0,160}<#\\s\*/,
+  "TTS pause markers should be stripped from visible text and transcript context"
+);
+assert.match(
+  source,
+  /attachment\.transcript = visibleTtsText/,
+  "saved voice transcripts should not contain raw TTS control markers"
+);
+assert.ok(
+  !source.includes("我在呢。<#0.4#>轻轻抱你一下。"),
+  "voice prompt examples should not teach the model to put pause markers in path"
 );
 assert.match(
   source,

@@ -98,6 +98,10 @@ function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
   ].join("");
 }
 
+function stripTTSPauseMarkers(text: string): string {
+  return text.replace(/<#\s*(?:[01](?:\.\d+)?|2(?:\.0+)?)\s*#>/g, "");
+}
+
 function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
   const agents = typeof cfg.agents === "object" && cfg.agents !== null && !Array.isArray(cfg.agents)
     ? cfg.agents as Record<string, unknown>
@@ -1104,7 +1108,7 @@ function filterInternalMarkers(text: string): string {
 }
 
 function cleanOutgoingTextSegment(text: string): string {
-  const visibleText = filterInternalMarkers(text).trim();
+  const visibleText = stripTTSPauseMarkers(filterInternalMarkers(text)).trim();
   if (/^\\+$/.test(visibleText)) {
     return "";
   }
@@ -1334,7 +1338,8 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   // 注册出站消息 refIdx 缓存钩子
   // 所有消息发送函数在拿到 QQ 回包后，如果含 ref_idx 则自动回调此处缓存
   onMessageSent((refIdx, meta) => {
-    log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${meta.ttsText?.slice(0, 30)}`);
+    const visibleTtsText = meta.ttsText ? cleanOutgoingTextSegment(meta.ttsText) : "";
+    log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${visibleTtsText.slice(0, 30)}`);
     const attachments: RefAttachmentSummary[] = [];
     if (meta.mediaType) {
       const localPath = meta.mediaLocalPath;
@@ -1345,10 +1350,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         ...(filename ? { filename } : {}),
         ...(meta.mediaUrl ? { url: meta.mediaUrl } : {}),
       };
-      if (meta.mediaType === "voice" && meta.ttsText) {
-        attachment.transcript = meta.ttsText;
+      if (meta.mediaType === "voice" && visibleTtsText) {
+        attachment.transcript = visibleTtsText;
         attachment.transcriptSource = "tts";
-        log?.info(`[qqbot:${account.accountId}] Saving voice transcript (TTS): ${meta.ttsText.slice(0, 50)}`);
+        log?.info(`[qqbot:${account.accountId}] Saving voice transcript (TTS): ${visibleTtsText.slice(0, 50)}`);
       }
       attachments.push(attachment);
     }
@@ -2198,14 +2203,14 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
 【发送语音 - 必须遵守】
 1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
-2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
+2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
 3. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
 4. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
 5. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
 6. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
 7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
 8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
-9. 停顿可以用 tts.pause 或直接写进朗读文本本身，用 MiniMax 停顿标记 <#0.3#> 到 <#1.5#>；不要滥用
+9. 停顿优先用 tts.pause，不要把 MiniMax 停顿标记写进 path 或 caption
 10. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
@@ -2670,8 +2675,9 @@ ${ttsHint}${sttHint}`;
             }
           };
           const sendTTSReplyText = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
-            const ttsText = filterInternalMarkers(text).trim();
-            if (!ttsText) {
+            const rawTtsText = filterInternalMarkers(text).trim();
+            const visibleTtsText = cleanOutgoingTextSegment(rawTtsText);
+            if (!visibleTtsText) {
               return false;
             }
             const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
@@ -2681,19 +2687,19 @@ ${ttsHint}${sttHint}`;
             }
             try {
               const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, tts);
-              const spokenText = applyTTSPauseHints(ttsText, tts);
-              log?.info(`[qqbot:${account.accountId}] TTS reply: "${ttsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
+              const spokenText = applyTTSPauseHints(rawTtsText, tts);
+              log?.info(`[qqbot:${account.accountId}] TTS reply: "${visibleTtsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
               const ttsDir = getQQBotDataDir("tts");
               const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
               log?.info(`[qqbot:${account.accountId}] TTS reply done: ${formatDuration(duration)}, uploading voice...`);
 
               await sendWithTokenRetry(async (token) => {
                 if (event.type === "c2c") {
-                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId, ttsText);
+                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId, visibleTtsText);
                 } else if (event.type === "group" && event.groupOpenid) {
                   await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
                 } else if (event.channelId) {
-                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${ttsText}`, event.messageId);
+                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${visibleTtsText}`, event.messageId);
                 }
               });
               log?.info(`[qqbot:${account.accountId}] TTS reply voice message sent`);
