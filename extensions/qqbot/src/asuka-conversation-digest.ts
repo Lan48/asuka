@@ -495,7 +495,7 @@ async function requestDigestFromMiniMax(prompt: string, config: MiniMaxDigestCon
       },
       body: JSON.stringify({
         model: config.model,
-        max_tokens: 900,
+        max_tokens: 2400,
         thinking: { type: "disabled" },
         system: [
           "你是陪伴型 agent 的近一周记忆摘要 curator。",
