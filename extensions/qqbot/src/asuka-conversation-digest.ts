@@ -372,6 +372,79 @@ function normalizeDailyDigests(value: unknown): ConversationDailyDigest[] {
   }));
 }
 
+function addDays(timestamp: number, days: number): number {
+  return timestamp + days * 24 * 60 * 60 * 1000;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function dateAliases(date: string): string[] {
+  const shortDate = date.slice(5);
+  return [date, shortDate];
+}
+
+function replaceDateAliases(text: string, aliases: string[], replacement: string): string {
+  let next = text;
+  for (const alias of aliases) {
+    next = next.replace(new RegExp(escapeRegExp(alias), "g"), replacement);
+  }
+  return next;
+}
+
+function normalizeFutureDateReferences(text: string, now: number): string {
+  if (!text) return text;
+  const tomorrow = formatLocalDate(addDays(now, 1), DEFAULT_DIGEST_TIME_ZONE);
+  const dayAfterTomorrow = formatLocalDate(addDays(now, 2), DEFAULT_DIGEST_TIME_ZONE);
+  return replaceDateAliases(
+    replaceDateAliases(text, dateAliases(dayAfterTomorrow), "后续"),
+    dateAliases(tomorrow),
+    "明天",
+  );
+}
+
+function normalizeFutureDateArray(items: string[], now: number): string[] {
+  return items.map((item) => normalizeFutureDateReferences(item, now));
+}
+
+function constrainDigestDates(digest: ConversationDigest, now: number): ConversationDigest {
+  const today = formatLocalDate(now, DEFAULT_DIGEST_TIME_ZONE);
+  const weekly = digest.weekly;
+  return {
+    ...digest,
+    weekly: {
+      relationshipContinuity: normalizeFutureDateReferences(weekly.relationshipContinuity, now),
+      recentEmotionalArc: normalizeFutureDateReferences(weekly.recentEmotionalArc, now),
+      currentOpenLoops: normalizeFutureDateArray(weekly.currentOpenLoops, now),
+      userPreferences: normalizeFutureDateArray(weekly.userPreferences, now),
+      temporaryDirectives: normalizeFutureDateArray(weekly.temporaryDirectives, now),
+      asukaSelfContinuity: normalizeFutureDateReferences(weekly.asukaSelfContinuity, now),
+      sceneContinuity: normalizeFutureDateReferences(weekly.sceneContinuity, now),
+      importantRecentFacts: normalizeFutureDateArray(weekly.importantRecentFacts, now),
+      thingsToAvoid: normalizeFutureDateArray(weekly.thingsToAvoid, now),
+      lastSalientTurns: normalizeFutureDateArray(weekly.lastSalientTurns, now),
+      evidenceNotes: normalizeFutureDateArray(weekly.evidenceNotes, now),
+    },
+    daily: digest.daily
+      .filter((day) => day.date <= today)
+      .map((day) => ({
+        ...day,
+        relationshipContinuity: normalizeFutureDateReferences(day.relationshipContinuity, now),
+        emotionalArc: normalizeFutureDateReferences(day.emotionalArc, now),
+        openLoops: normalizeFutureDateArray(day.openLoops, now),
+        userPreferences: normalizeFutureDateArray(day.userPreferences, now),
+        temporaryDirectives: normalizeFutureDateArray(day.temporaryDirectives, now),
+        asukaSelfContinuity: normalizeFutureDateReferences(day.asukaSelfContinuity, now),
+        sceneContinuity: normalizeFutureDateReferences(day.sceneContinuity, now),
+        importantFacts: normalizeFutureDateArray(day.importantFacts, now),
+        thingsToAvoid: normalizeFutureDateArray(day.thingsToAvoid, now),
+        salientTurns: normalizeFutureDateArray(day.salientTurns, now),
+        evidenceNotes: normalizeFutureDateArray(day.evidenceNotes, now),
+      })),
+  };
+}
+
 function normalizeDigest(value: unknown, peerKey: string, now: number, maxDigestChars: number, coveredUntil: number): ConversationDigest {
   const input = getObject(value) ?? {};
   const weeklyInput = getObject(input.weekly) ?? input;
@@ -385,7 +458,7 @@ function normalizeDigest(value: unknown, peerKey: string, now: number, maxDigest
     weekly: normalizeWeeklyDigest(weeklyInput),
     daily: normalizeDailyDigests(input.daily),
   };
-  return trimDigestToBudget(digest, maxDigestChars);
+  return trimDigestToBudget(constrainDigestDates(digest, now), maxDigestChars);
 }
 
 function digestPromptSize(digest: ConversationDigest): number {
@@ -501,8 +574,10 @@ function buildDigestPrompt(input: {
   now: number;
 }): string {
   const previousJson = input.previous ? JSON.stringify(input.previous, null, 2) : "{}";
+  const currentLocalDate = formatLocalDate(input.now, DEFAULT_DIGEST_TIME_ZONE);
   return [
     `当前时间(ms): ${input.now}`,
+    `当前本地日期: ${currentLocalDate}（${DEFAULT_DIGEST_TIME_ZONE}）`,
     "上一版 digest JSON（只是可修改草稿，不是事实来源；不要机械继承）:",
     previousJson,
     "",
@@ -516,6 +591,8 @@ function buildDigestPrompt(input: {
     "更新方式:",
     "- 输出必须是完整替换版 digest，不是 patch，也不是只追加本轮新增。",
     "- 近一周对话节选和本轮新增优先级高于上一版 digest；如果旧摘要被新上下文纠正、补全、完成或过期，必须改写 weekly 和对应 daily 的旧内容。",
+    "- 日期必须严格来自“近一周对话节选”的 ### YYYY-MM-DD 分组和当前本地日期；不要自行把今天改成明天，也不要把用户话里的“明天”换算成没有证据的后天日期。",
+    "- 如果要记录“明天/早上/中午”等相对时间，优先保留相对说法；只有在当前本地日期能直接换算时才写绝对日期，且不能超过当前日期 + 1 天。",
     "- 对 daily 也要做回溯维护：今天的新事实可以修正昨天/更早日期里的误记、未闭环、避免项和临时指令，不要只更新最新一天。",
     "- 临时指令必须按当前上下文更新状态；如果已经满足、被用户取消、超过轮数/时段、或最近历史能证明已完成，就从 temporaryDirectives 和 thingsToAvoid 中移除，而不是继续写'仍在生效'。",
     "- 不要因为上一版 digest 里有某条信息就继续保留；保留每条重要信息都要能从近一周历史、本轮新增或明确证据说明中得到支持。",

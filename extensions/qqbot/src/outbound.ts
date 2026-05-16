@@ -28,6 +28,7 @@ import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileS
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName, getQQBotDataDir } from "./utils/platform.js";
 import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, getPromiseRenderContext, markPromiseDelivered, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
+import { buildConversationDigestPrompt } from "./asuka-conversation-digest.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
@@ -1562,6 +1563,7 @@ function buildPromiseDeliveryPrompt(
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
   const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
   const recentContext = buildRecentConversationTranscript(payload.targetAddress, renderContext.peer?.lastUserText);
   const modeLabel = payload.mode === "repair"
     ? "补做之前没接住的约定"
@@ -1593,6 +1595,7 @@ function buildPromiseDeliveryPrompt(
     buildPersonaPromptForPromiseDelivery(isGroupChat),
     statePrompt,
     proactiveMemoryPrompt,
+    conversationDigestPrompt,
     "",
     "【生成任务】",
     "你现在不是在写提醒模板，而是在当前对话上下文里，以 Asuka 的口吻顺着前文自然发出这一句。",
@@ -1634,6 +1637,7 @@ function buildSharedSessionDeliveryPrompt(
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(payload.targetAddress);
   const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
   const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
   const promptTimeZone = getPromptTimeZone(account);
   const currentLocalTime = formatZonedDateTimeForPrompt(Date.now(), promptTimeZone);
   const sharedRules = [
@@ -1660,6 +1664,7 @@ function buildSharedSessionDeliveryPrompt(
       buildPersonaPromptForPromiseDelivery(false),
       statePrompt,
       proactiveMemoryPrompt,
+      conversationDigestPrompt,
       sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
       ...sharedRules,
       payload.mode === "followup" ? "这是追发，只轻轻碰一下门，不要催，不要解释流程。" : "",
@@ -1688,6 +1693,7 @@ function buildSharedSessionDeliveryPrompt(
     buildPersonaPromptForPromiseDelivery(false),
     statePrompt,
     proactiveMemoryPrompt,
+    conversationDigestPrompt,
     sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
     ...sharedRules,
     payload.mode === "ambient" ? "这次是你主动去碰一下门，要像顺着心里那点惦记自然冒出来，不要像定时问候。" : "",
@@ -1931,10 +1937,14 @@ async function refreshProactiveSceneAfterDelivery(
   if (!peerContext) return;
   const text = trimDeliveryText(deliveredText || payload.selfieCaption || payload.content || "");
   if (!text) return;
+  const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
+  const sceneText = conversationDigestPrompt
+    ? `${text}\n\n${conversationDigestPrompt}`
+    : text;
   try {
     const scene = await refreshSceneState(peerContext, {
       trigger: "proactive",
-      text,
+      text: sceneText,
       at: Date.now(),
       advancePolicy: "advance",
     });
@@ -3229,7 +3239,7 @@ export async function sendCronMessage(
         return { channel: "qqbot" };
       }
 
-      if (peerContext) {
+      if (peerContext && payload.mode !== "ambient") {
         await refreshSceneState(peerContext, {
           trigger: "proactive",
           text: payload.content,
