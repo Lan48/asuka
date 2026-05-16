@@ -11,6 +11,13 @@ function normalizeSegment(text: string): string {
   return text.replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function appendTextSegments(segments: string[], text: string): void {
+  for (const line of text.split(/\r?\n+/)) {
+    const segment = normalizeSegment(line);
+    if (segment) segments.push(segment);
+  }
+}
+
 export function splitAsukaNarrationSegments(text: string): string[] {
   const original = text ?? "";
   const trimmed = original.trim();
@@ -23,7 +30,7 @@ export function splitAsukaNarrationSegments(text: string): string[] {
   let match: RegExpExecArray | null;
   while ((match = FULL_WIDTH_PAREN_SEGMENT_RE.exec(trimmed)) !== null) {
     const before = normalizeSegment(trimmed.slice(lastIndex, match.index));
-    if (before) segments.push(before);
+    if (before) appendTextSegments(segments, before);
 
     const stageDirection = normalizeSegment(match[0]);
     if (stageDirection) segments.push(stageDirection);
@@ -32,7 +39,7 @@ export function splitAsukaNarrationSegments(text: string): string[] {
   }
 
   const after = normalizeSegment(trimmed.slice(lastIndex));
-  if (after) segments.push(after);
+  if (after) appendTextSegments(segments, after);
 
   return segments.length > 1 ? segments : [original];
 }

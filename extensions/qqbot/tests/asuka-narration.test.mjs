@@ -15,6 +15,18 @@ assert.deepEqual(
 );
 
 assert.deepEqual(
+  splitAsukaNarrationSegments("早安，我在。\n今天会好好陪你。"),
+  ["早安，我在。", "今天会好好陪你。"],
+  "newline-separated text should be sent as separate segments",
+);
+
+assert.deepEqual(
+  splitAsukaNarrationSegments("（坐到你旁边）我在。\n先抱一下你。"),
+  ["（坐到你旁边）", "我在。", "先抱一下你。"],
+  "stage directions and newline-separated text should both split in order",
+);
+
+assert.deepEqual(
   splitAsukaNarrationSegments("QQBOT_CRON:payload（不要拆）"),
   ["QQBOT_CRON:payload（不要拆）"],
   "structured cron payloads must not be split",
