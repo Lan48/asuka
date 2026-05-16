@@ -51,6 +51,57 @@ interface StudioSelfieConfig {
   modelId: string;
   quality: string;
 }
+
+interface DirectSelfieRuntimeConfig extends StudioSelfieConfig {
+  referenceImagePath?: string;
+}
+
+const DEFAULT_STUDIO_SELFIE_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
+const DEFAULT_STUDIO_SELFIE_MODEL = "third_party_media:gemini-3-pro-image-preview";
+const DEFAULT_MINIMAX_IMAGE_MODEL = "image-01";
+
+function getConfigString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>): DirectSelfieRuntimeConfig {
+  const skillCfg = rootConfig?.skills?.entries?.["asuka-selfie"] || {};
+  const skillEnv = skillCfg?.env || {};
+  const minimaxProvider = rootConfig?.models?.providers?.minimax || {};
+  const providerApiKey = getConfigString(minimaxProvider.apiKey);
+  const providerBaseUrl = getConfigString(minimaxProvider.baseUrl);
+  const apiKey = getConfigString(skillCfg.apiKey, skillEnv.STUDIO_API_KEY, skillEnv.DASHSCOPE_API_KEY, providerApiKey);
+  const baseUrl = getConfigString(
+    skillEnv.STUDIO_API_BASE_URL,
+    skillEnv.STUDIO_BASE_URL,
+    skillEnv.DASHSCOPE_BASE_URL,
+    apiKey === providerApiKey ? providerBaseUrl : "",
+    DEFAULT_STUDIO_SELFIE_BASE_URL,
+  );
+  const shouldUseMiniMaxDefaults = /minimax/i.test(baseUrl) || (/^sk-cp-/i.test(apiKey) && Boolean(providerApiKey));
+  const modelId = getConfigString(
+    skillEnv.STUDIO_IMAGE_EDIT_MODEL,
+    skillEnv.STUDIO_IMAGE_MODEL,
+    skillEnv.STUDIO_MODEL,
+    skillEnv.DASHSCOPE_MODEL,
+    shouldUseMiniMaxDefaults ? DEFAULT_MINIMAX_IMAGE_MODEL : "",
+    DEFAULT_STUDIO_SELFIE_MODEL,
+  );
+
+  return {
+    apiKey,
+    baseUrl,
+    modelId,
+    quality: getConfigString(skillEnv.STUDIO_IMAGE_QUALITY, "standard"),
+    referenceImagePath: getConfigString(skillEnv.ASUKA_REFERENCE_IMAGE_PATH),
+  };
+}
+
 const SELFIE_IDENTITY_LOCK_PROMPT = [
   "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
   "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
@@ -2506,16 +2557,12 @@ ${ttsHint}${sttHint}`;
         }
 
         const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
-          const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
-          const skillEnv = skillCfg?.env || {};
-          const apiKey = String(skillCfg?.apiKey || skillEnv.STUDIO_API_KEY || skillEnv.DASHSCOPE_API_KEY || "").trim();
-          const baseUrl = String(skillEnv.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim();
-          const modelId = String(skillEnv.STUDIO_IMAGE_EDIT_MODEL || skillEnv.STUDIO_IMAGE_MODEL || skillEnv.STUDIO_MODEL || skillEnv.DASHSCOPE_MODEL || "third_party_media:gemini-3-pro-image-preview").trim();
-          const quality = String(skillEnv.STUDIO_IMAGE_QUALITY || "standard").trim();
+          const selfieConfig = resolveDirectSelfieRuntimeConfig(cfg as Record<string, any>);
+          const { apiKey, baseUrl, modelId, quality } = selfieConfig;
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
-            const candidates = getSelfieFallbackImageCandidates(skillEnv.ASUKA_REFERENCE_IMAGE_PATH);
+            const candidates = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath);
             if (candidates.length === 0) {
               log?.info(`[qqbot:${account.accountId}] Selfie fallback skipped: no bundled images found`);
               return false;
@@ -2573,7 +2620,7 @@ ${ttsHint}${sttHint}`;
           };
 
           const generateAndSendSelfie = async (): Promise<boolean> => {
-            const referenceImagePath = getSelfieFallbackImageCandidates(skillEnv.ASUKA_REFERENCE_IMAGE_PATH)[0];
+            const referenceImagePath = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath)[0];
             if (!referenceImagePath) {
               throw new Error("no bundled reference image found");
             }
@@ -2583,7 +2630,7 @@ ${ttsHint}${sttHint}`;
           };
 
           if (!apiKey) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: STUDIO_API_KEY missing`);
+            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image API key missing`);
             return await sendFallbackSelfieImage();
           }
 

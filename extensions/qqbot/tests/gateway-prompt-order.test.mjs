@@ -155,6 +155,21 @@ assert.match(
   /sawTextualVoiceTag && hasTTS \? "voiceText" : "text", content: textAfter/,
   "text after a textual <qqvoice> tag should also be routed through mixed TTS"
 );
+assert.match(
+  source,
+  /function resolveDirectSelfieRuntimeConfig[\s\S]{0,900}models\?\.providers\?\.minimax/,
+  "direct selfie flow should resolve MiniMax provider config when skill-level image config is incomplete"
+);
+assert.match(
+  source,
+  /skillCfg\.apiKey[\s\S]{0,180}skillEnv\.STUDIO_API_KEY[\s\S]{0,180}providerApiKey/,
+  "direct selfie flow should use the unified MiniMax provider key if asuka-selfie key fields are absent"
+);
+assert.match(
+  source,
+  /shouldUseMiniMaxDefaults[\s\S]{0,260}DEFAULT_MINIMAX_IMAGE_MODEL/,
+  "direct selfie flow should default MiniMax provider-backed images to image-01"
+);
 assert.ok(
   !source.includes("shouldForceFreshSession"),
   "reply loop correction should not strip conversation context or force /new sessions"
