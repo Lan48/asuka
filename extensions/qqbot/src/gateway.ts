@@ -16,7 +16,7 @@ import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
-import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
@@ -2210,25 +2210,27 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
         // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
-          ? `6. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
-          : `6. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
+          ? `14. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本；如果有动作/旁白就单独写成（动作/旁白）","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
+          : `14. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
         const sttHint = hasSTT
-          ? `\n7. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
-          : `\n7. 插件侧 STT 未配置，插件不会自动转录语音消息`;
+          ? `\n15. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
+          : `\n15. 插件侧 STT 未配置，插件不会自动转录语音消息`;
         const voiceSection = `
 
 【发送语音 - 必须遵守】
 1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
-2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"(sighs)我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
-3. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
-4. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
-5. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
-6. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
-7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
-8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
-9. MiniMax TTS 可在 path 里插入停顿 <#0.4#> 和少量语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些只用于朗读控制，不要写进 caption
-10. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
-11. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
+2. 除了真正说出口的话，其余旁白、语气说明、神态、动作、环境描写都必须用全角括号 \`（...）\` 包起来；例如 \`（气息顿了一下，嘴角不自觉地弯起来）我在呢。\`
+3. 语音消息也遵守同一格式：\`（...）\` 是 QQ 文字旁白，不是 TTS 朗读文本；系统会把它作为文字单独发送，只有普通句子会转成语音。不要把“气息顿了一下”“声音软下来”“嘴角弯起来”这类旁白裸写进朗读句子里。
+4. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"（气息轻轻顿了一下）我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
+5. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
+6. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
+7. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
+8. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
+9. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户明确要求换音色，禁止覆盖 voice；不要在同一轮里切换多个 voice 或制造多人声
+10. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
+11. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量半角英文语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些是 TTS 控制标签，不等同于中文全角旁白 \`（...）\`，也不要写进 caption
+12. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
+13. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0
@@ -2726,6 +2728,28 @@ ${ttsHint}${sttHint}`;
               return false;
             }
           };
+          const sendMixedTTSReplySegments = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
+            const rawText = filterInternalMarkers(text).trim();
+            if (!cleanOutgoingTextSegment(rawText)) return false;
+
+            let sentAny = false;
+            for (const segment of splitAsukaNarrationSegments(rawText)) {
+              const visibleSegment = cleanOutgoingTextSegment(segment);
+              if (!visibleSegment) continue;
+              if (isAsukaNarrationSegment(visibleSegment)) {
+                await sendReplyTextSegments(visibleSegment);
+                sentAny = true;
+                continue;
+              }
+
+              const sentVoice = await sendTTSReplyText(segment, tts);
+              if (!sentVoice) {
+                await sendVisibleReplyText(visibleSegment);
+              }
+              sentAny = true;
+            }
+            return sentAny;
+          };
 
           const dispatchStartedAt = Date.now();
           let dispatchCompleted = false;
@@ -3124,7 +3148,7 @@ ${ttsHint}${sttHint}`;
                         }
                       }
                     } else if (item.type === "voiceText") {
-                      const sentVoice = await sendTTSReplyText(item.content);
+                      const sentVoice = await sendMixedTTSReplySegments(item.content);
                       if (!sentVoice) {
                         await sendVisibleReplyText(item.content);
                       }
@@ -3535,7 +3559,7 @@ ${ttsHint}${sttHint}`;
                           if (!ttsText?.trim()) {
                             await sendErrorMessage(`[QQBot] 语音消息缺少文本内容`);
                           } else {
-                            const sentVoice = await sendTTSReplyText(ttsText, parsedPayload.tts);
+                            const sentVoice = await sendMixedTTSReplySegments(ttsText, parsedPayload.tts);
                             if (!sentVoice) {
                               await sendVisibleReplyText(ttsText);
                             }

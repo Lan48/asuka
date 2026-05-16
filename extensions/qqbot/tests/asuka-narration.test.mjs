@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 
-const { splitAsukaNarrationSegments } = await import("../dist/src/utils/narration-segments.js");
+const {
+  isAsukaNarrationSegment,
+  splitAsukaNarrationSegments,
+} = await import("../dist/src/utils/narration-segments.js");
 
 assert.deepEqual(
   splitAsukaNarrationSegments("（低头看你）早安（轻轻笑了一下）今天也在。"),
@@ -37,5 +40,8 @@ assert.deepEqual(
   ["（看向镜头）<qqimg>/tmp/asuka.png</qqimg>给你。"],
   "media-tag messages must keep the media parser path intact",
 );
+
+assert.equal(isAsukaNarrationSegment("（气息顿了一下，嘴角弯起来）"), true);
+assert.equal(isAsukaNarrationSegment("我在呢。"), false);
 
 console.log("[qqbot:test] asuka-narration fixtures passed");

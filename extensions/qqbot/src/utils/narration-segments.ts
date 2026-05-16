@@ -2,6 +2,7 @@ const STRUCTURED_PAYLOAD_RE = /QQBOT_(?:PAYLOAD|CRON):/;
 const MEDIA_TAG_RE = /<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/i;
 const MARKDOWN_IMAGE_RE = /!\[[^\]]*]\([^)]+\)/;
 const FULL_WIDTH_PAREN_SEGMENT_RE = /（[^（）]*）/g;
+const FULL_WIDTH_PAREN_ONLY_RE = /^（[^（）]*）$/;
 
 function isProtectedMessage(text: string): boolean {
   return STRUCTURED_PAYLOAD_RE.test(text) || MEDIA_TAG_RE.test(text) || MARKDOWN_IMAGE_RE.test(text);
@@ -42,4 +43,8 @@ export function splitAsukaNarrationSegments(text: string): string[] {
   if (after) appendTextSegments(segments, after);
 
   return segments.length > 1 ? segments : [original];
+}
+
+export function isAsukaNarrationSegment(text: string): boolean {
+  return FULL_WIDTH_PAREN_ONLY_RE.test((text ?? "").trim());
 }

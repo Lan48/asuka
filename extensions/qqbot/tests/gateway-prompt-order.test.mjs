@@ -76,8 +76,18 @@ assert.match(
 );
 assert.match(
   source,
-  /sendTTSReplyText\(item\.content\)/,
-  "legacy qqvoice text should use the same TTS sender as structured audio replies"
+  /sendMixedTTSReplySegments\(item\.content\)/,
+  "legacy qqvoice text should use the same mixed TTS sender as structured audio replies"
+);
+assert.match(
+  source,
+  /isAsukaNarrationSegment\(visibleSegment\)[\s\S]{0,160}sendReplyTextSegments\(visibleSegment\)/,
+  "mixed voice replies should send full-width narration as text instead of TTS"
+);
+assert.match(
+  source,
+  /sendMixedTTSReplySegments\(ttsText, parsedPayload\.tts\)/,
+  "structured audio payloads should split narration text from spoken TTS"
 );
 assert.ok(
   source.includes(String.raw`text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "")`),
@@ -114,8 +124,12 @@ assert.match(
   "saved voice transcripts should not contain raw TTS control markers"
 );
 assert.ok(
-  source.includes("(sighs)我在呢。<#0.4#>轻轻抱你一下。"),
-  "voice prompt examples should teach MiniMax TTS controls only inside audio payload path"
+  source.includes("（气息轻轻顿了一下）我在呢。<#0.4#>轻轻抱你一下。"),
+  "voice prompt examples should teach narration splitting plus MiniMax TTS controls inside audio payload path"
+);
+assert.ok(
+  source.includes("不是 TTS 朗读文本"),
+  "voice prompt should clarify full-width narration is text, not TTS input"
 );
 assert.match(
   source,
