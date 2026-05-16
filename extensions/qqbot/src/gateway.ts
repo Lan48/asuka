@@ -2949,16 +2949,11 @@ ${ttsHint}${sttHint}`;
                   const sendQueue: Array<{ type: "text" | "image" | "voice" | "voiceText" | "video" | "file"; content: string }> = [];
                   
                   let lastIndex = 0;
+                  let sawTextualVoiceTag = false;
                   const mediaTagRegexWithIndex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
                   let match;
                   
                   while ((match = mediaTagRegexWithIndex.exec(replyText)) !== null) {
-                    // 添加标签前的文本
-                    const textBefore = cleanOutgoingTextSegment(replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n"));
-                    if (textBefore) {
-                      sendQueue.push({ type: "text", content: textBefore });
-                    }
-                    
                     const tagName = match[1]!.toLowerCase(); // "qqimg" or "qqvoice" or "qqfile"
                     
                     // 剥离 MEDIA: 前缀（框架可能注入），展开 ~ 路径
@@ -3010,9 +3005,20 @@ ${ttsHint}${sttHint}`;
                       log?.error(`[qqbot:${account.accountId}] Path decode error: ${decodeErr}`);
                     }
 
+                    const looksLikeAudioPath = tagName === "qqvoice"
+                      && (isAudioFile(mediaPath) || /^[a-zA-Z]:[\\/]/.test(mediaPath) || mediaPath.startsWith("/") || mediaPath.startsWith("~/"));
+                    const isTextualVoiceTag = tagName === "qqvoice" && Boolean(mediaPath) && !looksLikeAudioPath;
+                    if (isTextualVoiceTag) sawTextualVoiceTag = true;
+
+                    // 添加标签前的文本。若本标签是文本型 <qqvoice>，说明这一段回复希望走语音；
+                    // 前置普通句子也应进入混合 TTS 分发，只有（...）旁白留作文字。
+                    const textBefore = cleanOutgoingTextSegment(replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n"));
+                    if (textBefore) {
+                      sendQueue.push({ type: isTextualVoiceTag && hasTTS ? "voiceText" : "text", content: textBefore });
+                    }
+
                     if (mediaPath) {
                       if (tagName === "qqvoice") {
-                        const looksLikeAudioPath = isAudioFile(mediaPath) || /^[a-zA-Z]:[\\/]/.test(mediaPath) || mediaPath.startsWith("/") || mediaPath.startsWith("~/");
                         if (!looksLikeAudioPath) {
                           sendQueue.push({ type: hasTTS ? "voiceText" : "text", content: mediaPath });
                           log?.info(`[qqbot:${account.accountId}] Treating <qqvoice> content as TTS text: ${mediaPath.slice(0, 60)}...`);
@@ -3038,7 +3044,7 @@ ${ttsHint}${sttHint}`;
                   // 添加最后一个标签后的文本
                   const textAfter = cleanOutgoingTextSegment(replyText.slice(lastIndex).replace(/\n{3,}/g, "\n\n"));
                   if (textAfter) {
-                    sendQueue.push({ type: "text", content: textAfter });
+                    sendQueue.push({ type: sawTextualVoiceTag && hasTTS ? "voiceText" : "text", content: textAfter });
                   }
                   
                   log?.info(`[qqbot:${account.accountId}] Send queue: ${sendQueue.map(item => item.type).join(" -> ")}`);

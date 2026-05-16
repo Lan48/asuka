@@ -145,6 +145,16 @@ assert.match(
   /sendQueue\.push\(\{ type: hasTTS \? "voiceText" : "text", content: mediaPath \}\)/,
   "legacy qqvoice text should never be treated as an audio file path"
 );
+assert.match(
+  source,
+  /const isTextualVoiceTag[\s\S]{0,520}sendQueue\.push\(\{ type: isTextualVoiceTag && hasTTS \? "voiceText" : "text", content: textBefore \}\)/,
+  "text before a textual <qqvoice> tag should also be routed through mixed TTS"
+);
+assert.match(
+  source,
+  /sawTextualVoiceTag && hasTTS \? "voiceText" : "text", content: textAfter/,
+  "text after a textual <qqvoice> tag should also be routed through mixed TTS"
+);
 assert.ok(
   !source.includes("shouldForceFreshSession"),
   "reply loop correction should not strip conversation context or force /new sessions"
