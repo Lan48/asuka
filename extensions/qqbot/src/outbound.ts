@@ -697,6 +697,15 @@ function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
   ].join("");
 }
 
+const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
+
+function stripTTSControlMarkers(text: string): string {
+  return text
+    .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(MINIMAX_TTS_INTERJECTION_RE, "")
+    .trim();
+}
+
 async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<OutboundResult | null> {
   const payloadResult = parseQQBotPayload(ctx.text);
   if (!payloadResult.isPayload) return null;
@@ -735,10 +744,11 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
     }
 
     const ttsText = parsedPayload.path;
+    const visibleTtsText = stripTTSControlMarkers(ttsText);
     const baseTtsCfg = resolveTTSConfig(loadOpenClawConfig() ?? {});
     if (!baseTtsCfg) {
       console.warn("[qqbot] sendText: structured audio payload received but TTS is not configured; falling back to text");
-      return await sendText({ ...ctx, text: ttsText });
+      return await sendText({ ...ctx, text: visibleTtsText || ttsText });
     }
     if (!ctx.account.appId || !ctx.account.clientSecret) {
       return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
@@ -756,18 +766,18 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
 
       let result: { id: string; timestamp: number | string };
       if (target.type === "c2c") {
-        result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, ttsText);
+        result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleTtsText || ttsText);
       } else if (target.type === "group") {
         result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
       } else {
-        result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${ttsText}`, ctx.replyToId ?? undefined);
+        result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleTtsText || ttsText}`, ctx.replyToId ?? undefined);
       }
 
       return { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[qqbot] sendText: structured audio payload failed, falling back to text: ${message}`);
-      return await sendText({ ...ctx, text: ttsText });
+      return await sendText({ ...ctx, text: visibleTtsText || ttsText });
     }
   }
 

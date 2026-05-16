@@ -98,8 +98,12 @@ function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
   ].join("");
 }
 
-function stripTTSPauseMarkers(text: string): string {
-  return text.replace(/<#\s*(?:[01](?:\.\d+)?|2(?:\.0+)?)\s*#>/g, "");
+const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
+
+function stripTTSControlMarkers(text: string): string {
+  return text
+    .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(MINIMAX_TTS_INTERJECTION_RE, "");
 }
 
 function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
@@ -821,6 +825,18 @@ function resolveVisiblePayloadText(replyText: string, rawVisibleText: string): s
   return preferred || rawVisibleText;
 }
 
+function stripStructuredPayloadForVisibleText(text: string): string {
+  if (!hasStructuredPayloadPrefix(text)) return text;
+  const payloadResult = parseQQBotPayload(text);
+  if (payloadResult.isPayload && !payloadResult.error && payloadResult.payload) {
+    return [payloadResult.leadingText, payloadResult.trailingText]
+      .filter((part): part is string => Boolean(part && part.trim()))
+      .join("\n\n")
+      .trim();
+  }
+  return text.replace(/QQBOT_PAYLOAD:[\s\S]*$/gi, "").trim();
+}
+
 function getWsProxyAgent(): HttpsProxyAgent<string> | undefined {
   const proxyUrl =
     process.env.https_proxy ||
@@ -1108,7 +1124,7 @@ function filterInternalMarkers(text: string): string {
 }
 
 function cleanOutgoingTextSegment(text: string): string {
-  const visibleText = stripTTSPauseMarkers(filterInternalMarkers(text)).trim();
+  const visibleText = stripTTSControlMarkers(filterInternalMarkers(stripStructuredPayloadForVisibleText(text))).trim();
   if (/^\\+$/.test(visibleText)) {
     return "";
   }
@@ -2203,15 +2219,16 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
 【发送语音 - 必须遵守】
 1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
-2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
+2. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"(sighs)我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
 3. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
 4. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
 5. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
 6. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
 7. 你可以结合上下文给 audio payload 添加 tts 动态配置：voice、emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户要求换音色，通常不用覆盖
 8. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
-9. 停顿优先用 tts.pause，不要把 MiniMax 停顿标记写进 path 或 caption
-10. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
+9. MiniMax TTS 可在 path 里插入停顿 <#0.4#> 和少量语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些只用于朗读控制，不要写进 caption
+10. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
+11. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0

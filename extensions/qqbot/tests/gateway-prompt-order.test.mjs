@@ -95,8 +95,18 @@ assert.match(
 );
 assert.match(
   source,
-  /function stripTTSPauseMarkers[\s\S]{0,160}<#\\s\*/,
+  /function stripTTSControlMarkers[\s\S]{0,260}<#\\s\*/,
   "TTS pause markers should be stripped from visible text and transcript context"
+);
+assert.match(
+  source,
+  /MINIMAX_TTS_INTERJECTION_RE[\s\S]{0,220}sighs[\s\S]{0,120}emm/,
+  "MiniMax TTS interjection markers should be recognized for visible-text cleanup"
+);
+assert.match(
+  source,
+  /function stripStructuredPayloadForVisibleText[\s\S]{0,320}parseQQBotPayload/,
+  "final visible text cleanup should strip structured payload artifacts before sending transcript fallbacks"
 );
 assert.match(
   source,
@@ -104,8 +114,8 @@ assert.match(
   "saved voice transcripts should not contain raw TTS control markers"
 );
 assert.ok(
-  !source.includes("我在呢。<#0.4#>轻轻抱你一下。"),
-  "voice prompt examples should not teach the model to put pause markers in path"
+  source.includes("(sighs)我在呢。<#0.4#>轻轻抱你一下。"),
+  "voice prompt examples should teach MiniMax TTS controls only inside audio payload path"
 );
 assert.match(
   source,
