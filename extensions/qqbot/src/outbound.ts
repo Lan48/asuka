@@ -697,6 +697,12 @@ function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
   ].join("");
 }
 
+function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tts"] | undefined {
+  if (!tts) return undefined;
+  const { voice: _voice, voiceModify: _voiceModify, ...stableTts } = tts;
+  return stableTts;
+}
+
 const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
 
 function stripTTSControlMarkers(text: string): string {
@@ -755,7 +761,8 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
     }
 
     try {
-      const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, parsedPayload.tts);
+      const stableTts = stabilizeQQBotTTSOverrides(parsedPayload.tts);
+      const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
       const accessToken = await getAccessToken(ctx.account.appId!, ctx.account.clientSecret!);
       const target = parseTarget(ctx.to);
       const ttsSegments = splitAsukaNarrationSegments(ttsText);
@@ -777,7 +784,7 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
           continue;
         }
 
-        const spokenText = applyTTSPauseHints(segment, parsedPayload.tts);
+        const spokenText = applyTTSPauseHints(segment, stableTts);
         const visibleSpokenText = stripTTSControlMarkers(segment) || segment;
         console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
         const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));

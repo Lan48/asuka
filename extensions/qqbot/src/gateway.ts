@@ -98,6 +98,12 @@ function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
   ].join("");
 }
 
+function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tts"] | undefined {
+  if (!tts) return undefined;
+  const { voice: _voice, voiceModify: _voiceModify, ...stableTts } = tts;
+  return stableTts;
+}
+
 const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
 
 function stripTTSControlMarkers(text: string): string {
@@ -2226,7 +2232,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 6. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
 7. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
 8. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
-9. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost、voiceModify。默认 voice 是 Chinese (Mandarin)_Laid_BackGirl；除非用户明确要求换音色，禁止覆盖 voice；不要在同一轮里切换多个 voice 或制造多人声
+9. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost。默认 voice 固定是 Chinese (Mandarin)_Laid_BackGirl；禁止覆盖 voice 或使用 voiceModify；不要在同一轮里切换多个 voice、改变 timbre 或制造多人声
 10. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
 11. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量半角英文语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些是 TTS 控制标签，不等同于中文全角旁白 \`（...）\`，也不要写进 caption
 12. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
@@ -2705,8 +2711,9 @@ ${ttsHint}${sttHint}`;
               return false;
             }
             try {
-              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, tts);
-              const spokenText = applyTTSPauseHints(rawTtsText, tts);
+              const stableTts = stabilizeQQBotTTSOverrides(tts);
+              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
+              const spokenText = applyTTSPauseHints(rawTtsText, stableTts);
               log?.info(`[qqbot:${account.accountId}] TTS reply: "${visibleTtsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
               const ttsDir = getQQBotDataDir("tts");
               const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);

@@ -89,6 +89,15 @@ assert.match(
   /sendMixedTTSReplySegments\(ttsText, parsedPayload\.tts\)/,
   "structured audio payloads should split narration text from spoken TTS"
 );
+assert.match(
+  source,
+  /function stabilizeQQBotTTSOverrides[\s\S]{0,180}voiceModify/,
+  "QQBot TTS should ignore model-provided voice and voiceModify overrides to keep one stable timbre"
+);
+assert.ok(
+  source.includes("禁止覆盖 voice 或使用 voiceModify"),
+  "voice prompt should forbid model-driven voice/timbre switching"
+);
 assert.ok(
   source.includes(String.raw`text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "")`),
   "internal marker filtering should remove escaped and unescaped bracket markers"
