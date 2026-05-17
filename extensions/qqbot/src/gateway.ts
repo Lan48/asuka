@@ -2808,6 +2808,15 @@ ${ttsHint}${sttHint}`;
 
           const dispatchStartedAt = Date.now();
           let dispatchCompleted = false;
+          let userFacingDeliverClaimed = false;
+          const claimUserFacingDeliver = (kind: string, preview: string): boolean => {
+            if (userFacingDeliverClaimed) {
+              log?.info(`[qqbot:${account.accountId}] Skipping duplicate user-facing deliver, kind=${kind}, text=${preview.slice(0, 80)}`);
+              return false;
+            }
+            userFacingDeliverClaimed = true;
+            return true;
+          };
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg: cfgForCompanionThinking,
@@ -2897,6 +2906,7 @@ ${ttsHint}${sttHint}`;
 
                 if (payload.isError || looksLikeModelProviderError(replyText)) {
                   log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
+                  if (!claimUserFacingDeliver(info.kind, replyText)) return;
                   await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                   return;
                 }
@@ -2925,9 +2935,14 @@ ${ttsHint}${sttHint}`;
                     log?.info(`[qqbot:${account.accountId}] Rewrote internal leak reply into user-facing text: ${rewrittenReply.slice(0, 160)}`);
                     replyText = rewrittenReply;
                   } else {
+                    if (!claimUserFacingDeliver(info.kind, replyText)) return;
                     await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                     return;
                   }
+                }
+
+                if (!claimUserFacingDeliver(info.kind, replyText)) {
+                  return;
                 }
                 
                 // ============ 媒体标签解析 ============

@@ -201,6 +201,11 @@ assert.match(
 );
 assert.match(
   source,
+  /let userFacingDeliverClaimed = false[\s\S]{0,360}Skipping duplicate user-facing deliver/,
+  "QQBot should suppress duplicate final/user-facing delivers for the same inbound turn"
+);
+assert.match(
+  source,
   /const flushAllBufferedMessages[\s\S]{0,500}flushBufferedMessage/,
   "gateway should provide a way to flush buffered messages"
 );
