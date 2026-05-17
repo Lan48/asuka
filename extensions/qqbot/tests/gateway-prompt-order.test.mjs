@@ -91,6 +91,16 @@ assert.match(
 );
 assert.match(
   source,
+  /userRequestedVoiceReply[\s\S]{0,220}sendMixedTTSReplySegments\(textWithoutImages/,
+  "forced voice replies should also split narration text from spoken TTS"
+);
+assert.match(
+  source,
+  /const speechText = stripAsukaNarrationForSpeech\(rawTtsText\)/,
+  "low-level TTS sends should strip full-width narration as a final safety guard"
+);
+assert.match(
+  source,
   /function stabilizeQQBotTTSOverrides[\s\S]{0,180}voiceModify/,
   "QQBot TTS should ignore model-provided voice and voiceModify overrides to keep one stable timbre"
 );

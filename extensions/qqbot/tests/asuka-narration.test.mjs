@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 const {
   isAsukaNarrationSegment,
   splitAsukaNarrationSegments,
+  stripAsukaNarrationForSpeech,
 } = await import("../dist/src/utils/narration-segments.js");
 
 assert.deepEqual(
@@ -42,6 +43,31 @@ assert.deepEqual(
 );
 
 assert.equal(isAsukaNarrationSegment("（气息顿了一下，嘴角弯起来）"), true);
+assert.equal(isAsukaNarrationSegment("（气息顿了一下，嘴角弯起来"), true);
 assert.equal(isAsukaNarrationSegment("我在呢。"), false);
+
+assert.deepEqual(
+  splitAsukaNarrationSegments("（低头看你（指尖停了一下））我在。"),
+  ["（低头看你（指尖停了一下））", "我在。"],
+  "nested full-width narration should stay out of spoken text",
+);
+
+assert.deepEqual(
+  splitAsukaNarrationSegments("（低头看你\n我在。"),
+  ["（低头看你", "我在。"],
+  "unclosed full-width narration should stop at newline instead of being spoken",
+);
+
+assert.equal(
+  stripAsukaNarrationForSpeech("（低头看你）我在。<#0.4#>抱一下你。"),
+  "我在。<#0.4#>抱一下你。",
+  "TTS speech text should exclude full-width narration while keeping spoken pause markers",
+);
+
+assert.equal(
+  stripAsukaNarrationForSpeech("（低头看了一眼自己还剩小半杯的酒杯，没忍住笑出来）"),
+  "",
+  "pure narration should never be sent to TTS",
+);
 
 console.log("[qqbot:test] asuka-narration fixtures passed");

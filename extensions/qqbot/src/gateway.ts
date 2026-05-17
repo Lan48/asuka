@@ -16,7 +16,7 @@ import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
-import { isAsukaNarrationSegment, splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments, stripAsukaNarrationForSpeech } from "./utils/narration-segments.js";
 import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
@@ -2748,7 +2748,8 @@ ${ttsHint}${sttHint}`;
           };
           const sendTTSReplyText = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
             const rawTtsText = filterInternalMarkers(text).trim();
-            const visibleTtsText = cleanOutgoingTextSegment(rawTtsText);
+            const speechText = stripAsukaNarrationForSpeech(rawTtsText);
+            const visibleTtsText = cleanOutgoingTextSegment(speechText);
             if (!visibleTtsText) {
               return false;
             }
@@ -2760,7 +2761,7 @@ ${ttsHint}${sttHint}`;
             try {
               const stableTts = stabilizeQQBotTTSOverrides(tts);
               const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
-              const spokenText = applyTTSPauseHints(rawTtsText, stableTts);
+              const spokenText = applyTTSPauseHints(speechText, stableTts);
               log?.info(`[qqbot:${account.accountId}] TTS reply: "${visibleTtsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
               const ttsDir = getQQBotDataDir("tts");
               const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
@@ -3868,7 +3869,7 @@ ${ttsHint}${sttHint}`;
                 // 这些标记可能被 AI 错误地学习并输出
                 textWithoutImages = filterInternalMarkers(textWithoutImages);
                 if (userRequestedVoiceReply && imageUrls.length === 0 && textWithoutImages.trim()) {
-                  const sentVoice = await sendTTSReplyText(textWithoutImages, {
+                  const sentVoice = await sendMixedTTSReplySegments(textWithoutImages, {
                     languageBoost: "Chinese",
                     pause: "normal",
                   });
