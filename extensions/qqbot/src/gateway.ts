@@ -1130,7 +1130,7 @@ function parseFaceTags(text: string): string {
 
 export function parseVoiceReplySuffix(text: string): { text: string; forceVoiceReply: boolean } {
   const trimmedEnd = text.trimEnd();
-  if (!trimmedEnd.endsWith("~")) {
+  if (!/[~～]$/.test(trimmedEnd)) {
     return { text, forceVoiceReply: false };
   }
   return {
@@ -2374,7 +2374,7 @@ ${ttsHint}${sttHint}`;
           imageUnderstandingPrompt.trim() ? imageUnderstandingPrompt.trim() : "",
           searchPrompt.trim() ? searchPrompt.trim() : "",
           voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
-          userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 结尾，表示本轮希望听语音回答。不要把 `~` 当作正文，也不要向用户解释这个触发规则。" : "",
+          userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 或 `～` 结尾，表示本轮希望听语音回答；如果用户只发送了 `~` 或 `～`，表示希望你沿用当前上下文继续用语音回应。不要把触发符当作正文，也不要向用户解释这个触发规则。" : "",
         ].filter(Boolean).join("\n");
         dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
         if (hasAsrReferFallback) {

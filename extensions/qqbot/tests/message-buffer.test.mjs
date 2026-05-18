@@ -49,9 +49,21 @@ assert.deepEqual(
 );
 
 assert.deepEqual(
-  parseVoiceReplySuffix("普通波浪号～"),
-  { text: "普通波浪号～", forceVoiceReply: false },
-  "fullwidth wave dash should remain normal text",
+  parseVoiceReplySuffix("想听你说晚安～"),
+  { text: "想听你说晚安", forceVoiceReply: true },
+  "fullwidth wave suffix should request a voice reply and be stripped from user text",
+);
+
+assert.deepEqual(
+  parseVoiceReplySuffix("～"),
+  { text: "", forceVoiceReply: true },
+  "standalone fullwidth wave should request a contextual voice reply",
+);
+
+assert.deepEqual(
+  parseVoiceReplySuffix("普通～波浪号"),
+  { text: "普通～波浪号", forceVoiceReply: false },
+  "fullwidth wave inside normal text should remain normal text",
 );
 
 assert.equal(stripWrappingDialogueQuotes('"昨晚那酒喝得太急了。"'), "昨晚那酒喝得太急了。");
