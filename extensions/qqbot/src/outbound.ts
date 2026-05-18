@@ -703,11 +703,18 @@ function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tt
   return stableTts;
 }
 
-const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
+const MINIMAX_TTS_INTERJECTION_TAGS = "laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes";
+const MINIMAX_TTS_INTERJECTION_RE = new RegExp(`\\((?:${MINIMAX_TTS_INTERJECTION_TAGS})\\)`, "gi");
+const ASUKA_TTS_INTERJECTION_RE = new RegExp(`「\\s*(${MINIMAX_TTS_INTERJECTION_TAGS})\\s*」`, "gi");
+
+function normalizeTTSControlMarkersForSpeech(text: string): string {
+  return text.replace(ASUKA_TTS_INTERJECTION_RE, (_match, tag: string) => `(${tag.toLowerCase()})`);
+}
 
 function stripTTSControlMarkers(text: string): string {
   return text
     .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(ASUKA_TTS_INTERJECTION_RE, "")
     .replace(MINIMAX_TTS_INTERJECTION_RE, "")
     .trim();
 }
@@ -784,7 +791,7 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
           continue;
         }
 
-        const spokenText = applyTTSPauseHints(segment, stableTts);
+        const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(segment), stableTts);
         const visibleSpokenText = stripTTSControlMarkers(segment) || segment;
         console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
         const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));

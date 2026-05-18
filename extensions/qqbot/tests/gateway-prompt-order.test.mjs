@@ -143,8 +143,18 @@ assert.match(
 );
 assert.match(
   source,
-  /MINIMAX_TTS_INTERJECTION_RE[\s\S]{0,220}sighs[\s\S]{0,120}emm/,
+  /MINIMAX_TTS_INTERJECTION_TAGS[\s\S]{0,220}sighs[\s\S]{0,120}emm/,
   "MiniMax TTS interjection markers should be recognized for visible-text cleanup"
+);
+assert.match(
+  source,
+  /ASUKA_TTS_INTERJECTION_RE[\s\S]{0,220}MINIMAX_TTS_INTERJECTION_TAGS/,
+  "Japanese corner-bracket TTS markers should be recognized before MiniMax conversion"
+);
+assert.match(
+  source,
+  /normalizeTTSControlMarkersForSpeech[\s\S]{0,180}tag\.toLowerCase\(\)/,
+  "Japanese corner-bracket TTS markers should be converted to MiniMax parentheses only for speech"
 );
 assert.match(
   source,
@@ -157,8 +167,12 @@ assert.match(
   "saved voice transcripts should not contain raw TTS control markers"
 );
 assert.ok(
-  source.includes("（气息轻轻顿了一下）我在呢。<#0.4#>轻轻抱你一下。"),
-  "voice prompt examples should teach narration splitting plus MiniMax TTS controls inside audio payload path"
+  source.includes("（气息轻轻顿了一下）我在呢。<#0.4#>「breath」轻轻抱你一下。"),
+  "voice prompt examples should teach narration splitting plus Japanese-bracket MiniMax TTS controls inside audio payload path"
+);
+assert.ok(
+  source.includes("不要直接输出 (breath)"),
+  "voice prompt should avoid direct MiniMax parentheses in model output"
 );
 assert.ok(
   source.includes("不是 TTS 朗读文本"),

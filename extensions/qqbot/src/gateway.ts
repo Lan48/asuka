@@ -155,11 +155,18 @@ function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tt
   return stableTts;
 }
 
-const MINIMAX_TTS_INTERJECTION_RE = /\((?:laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes)\)/gi;
+const MINIMAX_TTS_INTERJECTION_TAGS = "laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes";
+const MINIMAX_TTS_INTERJECTION_RE = new RegExp(`\\((?:${MINIMAX_TTS_INTERJECTION_TAGS})\\)`, "gi");
+const ASUKA_TTS_INTERJECTION_RE = new RegExp(`「\\s*(${MINIMAX_TTS_INTERJECTION_TAGS})\\s*」`, "gi");
+
+function normalizeTTSControlMarkersForSpeech(text: string): string {
+  return text.replace(ASUKA_TTS_INTERJECTION_RE, (_match, tag: string) => `(${tag.toLowerCase()})`);
+}
 
 function stripTTSControlMarkers(text: string): string {
   return text
     .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(ASUKA_TTS_INTERJECTION_RE, "")
     .replace(MINIMAX_TTS_INTERJECTION_RE, "");
 }
 
@@ -2279,7 +2286,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
         // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
-          ? `14. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本；如果有动作/旁白就单独写成（动作/旁白）","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
+          ? `14. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本；如果有动作/旁白就单独写成（动作/旁白）；TTS 语气标记用「breath」这类日文角括号","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
           : `14. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
         const sttHint = hasSTT
           ? `\n15. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
@@ -2290,7 +2297,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
 2. 除了真正说出口的话，其余旁白、语气说明、神态、动作、环境描写都必须用全角括号 \`（...）\` 包起来；例如 \`（气息顿了一下，嘴角不自觉地弯起来）我在呢。\`
 3. 语音消息也遵守同一格式：\`（...）\` 是 QQ 文字旁白，不是 TTS 朗读文本；系统会把它作为文字单独发送，只有普通句子会转成语音。不要把“气息顿了一下”“声音软下来”“嘴角弯起来”这类旁白裸写进朗读句子里。
-4. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"（气息轻轻顿了一下）我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
+4. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"（气息轻轻顿了一下）我在呢。<#0.4#>「breath」轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
 5. 普通说出口的话直接写，不要用英文双引号或中文弯引号包起来；错误示例: "我在呢。"；正确示例: 我在呢。
 6. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
 7. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
@@ -2298,8 +2305,8 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 9. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
 10. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost。默认 voice 固定是 Chinese (Mandarin)_Laid_BackGirl；禁止覆盖 voice 或使用 voiceModify；不要在同一轮里切换多个 voice、改变 timbre 或制造多人声
 11. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
-12. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量半角英文语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些是 TTS 控制标签，不等同于中文全角旁白 \`（...）\`，也不要写进 caption
-13. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
+12. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量语气词标签。为了避免和旁白 \`（...）\` 冲突，生成回复时必须写成日文角括号标记，如 「laughs」、「sighs」、「emm」、「breath」；系统会在送入 MiniMax 前转换成 MiniMax 需要的半角圆括号。不要直接输出 (breath)，也不要把这些标记写进 caption
+13. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里。中文全角 \`（...）\` 永远是 QQ 文字旁白，不进入 TTS
 14. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
@@ -2776,7 +2783,7 @@ ${ttsHint}${sttHint}`;
             try {
               const stableTts = stabilizeQQBotTTSOverrides(tts);
               const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
-              const spokenText = applyTTSPauseHints(speechText, stableTts);
+              const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(speechText), stableTts);
               log?.info(`[qqbot:${account.accountId}] TTS reply: "${visibleTtsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
               const ttsDir = getQQBotDataDir("tts");
               const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
