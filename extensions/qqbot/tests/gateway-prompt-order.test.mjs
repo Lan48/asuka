@@ -14,6 +14,14 @@ assert.ok(dynamicIndex >= 0, "gateway should build a dynamic context section");
 assert.ok(agentBodyIndex >= 0, "gateway should assemble agentBody explicitly");
 assert.ok(ctxPayloadIndex >= 0, "gateway should assemble ctxPayload explicitly");
 assert.ok(stableIndex < dynamicIndex, "stable prompt section should be constructed before dynamic context");
+assert.ok(
+  source.includes("当前场景是两个人正在私聊，不是在写第三人称故事或摘要"),
+  "private chat persona should softly anchor replies as direct two-person conversation"
+);
+assert.ok(
+  source.includes("优先用自然口语里的“我/你/我们”"),
+  "chat persona should prefer first/second-person wording without hard rejection rules"
+);
 
 const agentBodySnippet = source.slice(agentBodyIndex, agentBodyIndex + 600);
 assert.doesNotMatch(agentBodySnippet, /stablePromptSections\.join/, "agentBody should not repeat stable prompt behind dynamic message metadata");
