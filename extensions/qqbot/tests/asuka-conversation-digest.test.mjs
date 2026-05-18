@@ -209,10 +209,14 @@ try {
   assert.equal(capturedBody.system.includes("旧摘要只是草稿"), true, "digest curator should treat previous digest as editable context");
   assert.equal(String(capturedBody.messages[0].content).includes("### 2026-05-15"), true, "digest prompt should group history by local day");
   assert.equal(String(capturedBody.messages[0].content).includes("QQBOT_PAYLOAD"), false, "digest prompt should remove structured payload artifacts");
+  assert.equal(String(capturedBody.messages[0].content).includes("用户:"), false, "digest prompt should avoid third-person user labels");
+  assert.equal(String(capturedBody.messages[0].content).includes("Asuka:"), false, "digest prompt should avoid third-person bot labels");
   assert.equal(String(capturedBody.messages[0].content).includes("完整替换版 digest"), true, "digest prompt should require full replacement updates");
   assert.equal(String(capturedBody.messages[0].content).includes("如果旧摘要被新上下文纠正、补全、完成或过期"), true, "digest prompt should require revising stale prior summaries");
   assert.equal(String(capturedBody.messages[0].content).includes("已经成功发出的语音回复"), true, "digest prompt should include outbound TTS voice transcripts for counting temporary voice directives");
   assert.equal(digest.version, 2);
+  assert.equal(JSON.stringify(digest).includes("用户"), false, "stored digest should normalize user perspective");
+  assert.equal(JSON.stringify(digest).includes("Asuka"), false, "stored digest should normalize bot perspective");
   assert.equal(digest.weekly.currentOpenLoops[0], "继续优化主回复上下文负担");
   assert.equal(digest.weekly.currentOpenLoops.some((item) => item.includes("愧疚")), false, "resolved emotional topics should not remain open loops");
   assert.equal(digest.weekly.userPreferences.some((item) => item.includes("十轮")), false, "temporary directives should not remain stable weekly preferences");

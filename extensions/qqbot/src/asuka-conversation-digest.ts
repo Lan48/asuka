@@ -229,10 +229,15 @@ function sanitizeDigestText(text: string | undefined, maxChars = MAX_FIELD_CHARS
   return truncate(sanitized, maxChars);
 }
 
+function sanitizeDigestPerspectiveText(text: string | undefined, maxChars = MAX_FIELD_CHARS): string {
+  const sanitized = sanitizeDigestText(text, maxChars);
+  return sanitized ? normalizePromptPerspective(sanitized) : "";
+}
+
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
-    .map((item) => sanitizeDigestText(typeof item === "string" ? item : "", MAX_FIELD_CHARS))
+    .map((item) => sanitizeDigestPerspectiveText(typeof item === "string" ? item : "", MAX_FIELD_CHARS))
     .filter(Boolean)
     .slice(0, MAX_ARRAY_ITEMS);
 }
@@ -277,13 +282,13 @@ function normalizeDetailLevel(value: unknown, fallback: ConversationDailyDigest[
 function normalizeWeeklyDigest(value: unknown): ConversationWeeklyDigest {
   const input = getObject(value) ?? {};
   return {
-    relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, 520),
-    recentEmotionalArc: sanitizeDigestText(input.recentEmotionalArc, 420),
+    relationshipContinuity: sanitizeDigestPerspectiveText(input.relationshipContinuity, 520),
+    recentEmotionalArc: sanitizeDigestPerspectiveText(input.recentEmotionalArc, 420),
     currentOpenLoops: normalizeOpenLoops(input.currentOpenLoops),
     userPreferences: normalizeStablePreferences(input.userPreferences),
     temporaryDirectives: normalizeTemporaryDirectives(input.temporaryDirectives ?? input.temporaryPreferences, normalizeStringArray(input.userPreferences).filter(isTemporaryDirectiveText)),
-    asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, 420),
-    sceneContinuity: sanitizeDigestText(input.sceneContinuity, 420),
+    asukaSelfContinuity: sanitizeDigestPerspectiveText(input.asukaSelfContinuity, 420),
+    sceneContinuity: sanitizeDigestPerspectiveText(input.sceneContinuity, 420),
     importantRecentFacts: normalizeStringArray(input.importantRecentFacts),
     thingsToAvoid: normalizeStringArray(input.thingsToAvoid),
     lastSalientTurns: normalizeStringArray(input.lastSalientTurns),
@@ -315,13 +320,13 @@ function normalizeDailyDigest(value: unknown, fallbackDate: string, fallbackLeve
   const normalized = {
     date,
     detailLevel,
-    relationshipContinuity: sanitizeDigestText(input.relationshipContinuity, fieldLimit),
-    emotionalArc: sanitizeDigestText(input.emotionalArc ?? input.recentEmotionalArc, fieldLimit),
+    relationshipContinuity: sanitizeDigestPerspectiveText(input.relationshipContinuity, fieldLimit),
+    emotionalArc: sanitizeDigestPerspectiveText(input.emotionalArc ?? input.recentEmotionalArc, fieldLimit),
     openLoops: normalizeOpenLoops(input.openLoops ?? input.currentOpenLoops).slice(0, arrayLimit),
     userPreferences: normalizeStablePreferences(input.userPreferences).slice(0, arrayLimit),
     temporaryDirectives: normalizeTemporaryDirectives(input.temporaryDirectives ?? input.temporaryPreferences, normalizeStringArray(input.userPreferences).filter(isTemporaryDirectiveText)).slice(0, arrayLimit),
-    asukaSelfContinuity: sanitizeDigestText(input.asukaSelfContinuity, fieldLimit),
-    sceneContinuity: sanitizeDigestText(input.sceneContinuity, fieldLimit),
+    asukaSelfContinuity: sanitizeDigestPerspectiveText(input.asukaSelfContinuity, fieldLimit),
+    sceneContinuity: sanitizeDigestPerspectiveText(input.sceneContinuity, fieldLimit),
     importantFacts: clampArray(input.importantFacts ?? input.importantRecentFacts),
     thingsToAvoid: clampArray(input.thingsToAvoid),
     salientTurns: clampArray(input.salientTurns ?? input.lastSalientTurns),
@@ -539,7 +544,7 @@ function formatDailyHistory(entries: ReturnType<typeof getEntriesForPeerSince>, 
     if (!content) continue;
     const date = formatLocalDate(entry.timestamp, timeZone);
     const lines = groups.get(date) ?? [];
-    lines.push(`${entry.isBot ? "Asuka" : "用户"}: ${content}`);
+    lines.push(`${entry.isBot ? "我" : "你"}: ${normalizePromptPerspective(content)}`);
     groups.set(date, lines);
   }
 
@@ -573,7 +578,7 @@ function buildDigestPrompt(input: {
   assistantText: string;
   now: number;
 }): string {
-  const previousJson = input.previous ? JSON.stringify(input.previous, null, 2) : "{}";
+  const previousJson = input.previous ? JSON.stringify(upgradeLegacyDigest(input.previous), null, 2) : "{}";
   const currentLocalDate = formatLocalDate(input.now, DEFAULT_DIGEST_TIME_ZONE);
   return [
     `当前时间(ms): ${input.now}`,
@@ -585,8 +590,8 @@ function buildDigestPrompt(input: {
     input.history || "（无历史）",
     "",
     "本轮新增:",
-    `用户: ${sanitizeDigestText(input.userText, 700) || "（空）"}`,
-    `Asuka: ${sanitizeDigestText(input.assistantText, 700) || "（空）"}`,
+    `你: ${sanitizeDigestPerspectiveText(input.userText, 700) || "（空）"}`,
+    `我: ${sanitizeDigestPerspectiveText(input.assistantText, 700) || "（空）"}`,
     "",
     "更新方式:",
     "- 输出必须是完整替换版 digest，不是 patch，也不是只追加本轮新增。",

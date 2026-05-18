@@ -1231,7 +1231,7 @@ function buildSceneInferenceTranscript(peerId: string, currentText?: string): st
       const content = normalizeSceneContextText(entry.content);
       if (!content) return null;
       if (normalizedCurrent && !entry.isBot && content === normalizedCurrent) return null;
-      return `${entry.isBot ? "Asuka" : "用户"}: ${content}`;
+      return `${entry.isBot ? "我" : "你"}: ${normalizePromptPerspective(content)}`;
     })
     .filter((item): item is string => Boolean(item));
   return recent.join("\n");

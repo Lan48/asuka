@@ -1149,7 +1149,7 @@ function formatRelativeConversationTime(timestampMs: number | null | undefined, 
 }
 
 function formatTimedConversationTurn(
-  speaker: "用户" | "Asuka",
+  speaker: "你" | "我",
   content: string,
   timestampMs?: number | null,
   now = Date.now()
@@ -1215,9 +1215,9 @@ function resolveRecentTranscriptFromNormalSession(targetAddress: string): string
           : null;
       if (role === "user") {
         const userText = extractUserMessageBody(text);
-        if (userText) turns.push(formatTimedConversationTurn("用户", userText, timestampMs, now));
+        if (userText) turns.push(formatTimedConversationTurn("你", userText, timestampMs, now));
       } else if (role === "assistant") {
-        turns.push(formatTimedConversationTurn("Asuka", text, timestampMs, now));
+        turns.push(formatTimedConversationTurn("我", text, timestampMs, now));
       }
     }
 
@@ -1508,7 +1508,7 @@ function buildRecentConversationContext(peerId: string, currentUserText: string)
       const content = sanitizeSelfieContextText(entry.content);
       if (!content) return null;
       if (!entry.isBot && content === currentUserText.trim()) return null;
-      return formatTimedConversationTurn(entry.isBot ? "Asuka" : "用户", content, entry.timestamp, now);
+      return formatTimedConversationTurn(entry.isBot ? "我" : "你", content, entry.timestamp, now);
     })
     .filter((item): item is string => Boolean(item))
     .slice(-4);
@@ -1523,7 +1523,7 @@ function buildRecentConversationTranscript(peerId: string, currentUserText?: str
       const content = sanitizeSelfieContextText(entry.content);
       if (!content) return null;
       if (current && !entry.isBot && content === current) return null;
-      return formatTimedConversationTurn(entry.isBot ? "Asuka" : "用户", content, entry.timestamp, now);
+      return formatTimedConversationTurn(entry.isBot ? "我" : "你", content, entry.timestamp, now);
     })
     .filter((item): item is string => Boolean(item))
     .slice(-6)
