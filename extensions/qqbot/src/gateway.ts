@@ -2747,14 +2747,16 @@ ${ttsHint}${sttHint}`;
             if (!visibleText) return;
             const segments = splitAsukaNarrationSegments(visibleText);
             for (const segment of segments) {
+              const visibleSegment = cleanOutgoingTextSegment(segment);
+              if (!visibleSegment) continue;
               await sendWithTokenRetry(async (token) => {
                 const ref = consumeQuoteRef();
                 if (event.type === "c2c") {
-                  await sendC2CMessage(token, event.senderId, segment, event.messageId, ref);
+                  await sendC2CMessage(token, event.senderId, visibleSegment, event.messageId, ref);
                 } else if (event.type === "group" && event.groupOpenid) {
-                  await sendGroupMessage(token, event.groupOpenid, segment, event.messageId, ref);
+                  await sendGroupMessage(token, event.groupOpenid, visibleSegment, event.messageId, ref);
                 } else if (event.channelId) {
-                  await sendChannelMessage(token, event.channelId, segment, event.messageId, ref);
+                  await sendChannelMessage(token, event.channelId, visibleSegment, event.messageId, ref);
                 }
               });
             }

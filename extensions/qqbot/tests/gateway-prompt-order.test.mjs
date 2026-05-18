@@ -110,6 +110,11 @@ assert.match(
 );
 assert.match(
   source,
+  /for \(const segment of segments\)[\s\S]{0,140}const visibleSegment = cleanOutgoingTextSegment\(segment\)/,
+  "split outgoing text segments should also remove wrapping dialogue quotes"
+);
+assert.match(
+  source,
   /function stabilizeQQBotTTSOverrides[\s\S]{0,180}voiceModify/,
   "QQBot TTS should ignore model-provided voice and voiceModify overrides to keep one stable timbre"
 );
