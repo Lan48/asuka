@@ -1180,8 +1180,20 @@ function filterInternalMarkers(text: string): string {
   return result;
 }
 
+export function stripWrappingDialogueQuotes(text: string): string {
+  let result = (text ?? "").trim();
+  if (!result) return result;
+
+  result = result
+    .replace(/^[ \t]*(?:"|“|”)+[ \t]*/u, "")
+    .replace(/[ \t]*(?:"|“|”)+[ \t]*$/u, "")
+    .trim();
+
+  return result;
+}
+
 function cleanOutgoingTextSegment(text: string): string {
-  const visibleText = stripTTSControlMarkers(filterInternalMarkers(stripStructuredPayloadForVisibleText(text))).trim();
+  const visibleText = stripWrappingDialogueQuotes(stripTTSControlMarkers(filterInternalMarkers(stripStructuredPayloadForVisibleText(text))).trim());
   if (/^\\+$/.test(visibleText)) {
     return "";
   }
@@ -2279,15 +2291,16 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 2. 除了真正说出口的话，其余旁白、语气说明、神态、动作、环境描写都必须用全角括号 \`（...）\` 包起来；例如 \`（气息顿了一下，嘴角不自觉地弯起来）我在呢。\`
 3. 语音消息也遵守同一格式：\`（...）\` 是 QQ 文字旁白，不是 TTS 朗读文本；系统会把它作为文字单独发送，只有普通句子会转成语音。不要把“气息顿了一下”“声音软下来”“嘴角弯起来”这类旁白裸写进朗读句子里。
 4. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"（气息轻轻顿了一下）我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
-5. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
-6. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
-7. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
-8. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
-9. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost。默认 voice 固定是 Chinese (Mandarin)_Laid_BackGirl；禁止覆盖 voice 或使用 voiceModify；不要在同一轮里切换多个 voice、改变 timbre 或制造多人声
-10. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
-11. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量半角英文语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些是 TTS 控制标签，不等同于中文全角旁白 \`（...）\`，也不要写进 caption
-12. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
-13. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
+5. 普通说出口的话直接写，不要用英文双引号或中文弯引号包起来；错误示例: "我在呢。"；正确示例: 我在呢。
+6. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
+7. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
+8. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
+9. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
+10. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost。默认 voice 固定是 Chinese (Mandarin)_Laid_BackGirl；禁止覆盖 voice 或使用 voiceModify；不要在同一轮里切换多个 voice、改变 timbre 或制造多人声
+11. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
+12. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量半角英文语气词标签，如 (laughs)、(sighs)、(emm)、(breath)；这些是 TTS 控制标签，不等同于中文全角旁白 \`（...）\`，也不要写进 caption
+13. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里
+14. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
 ${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0

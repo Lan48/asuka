@@ -7,7 +7,7 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-message-buffer-test
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
-const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseVoiceReplySuffix } = await import("../dist/src/gateway.js");
+const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseVoiceReplySuffix, stripWrappingDialogueQuotes } = await import("../dist/src/gateway.js");
 const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
 
 const first = {
@@ -52,6 +52,16 @@ assert.deepEqual(
   parseVoiceReplySuffix("普通波浪号～"),
   { text: "普通波浪号～", forceVoiceReply: false },
   "fullwidth wave dash should remain normal text",
+);
+
+assert.equal(stripWrappingDialogueQuotes('"昨晚那酒喝得太急了。"'), "昨晚那酒喝得太急了。");
+assert.equal(stripWrappingDialogueQuotes("“……还是先给你揉揉？”"), "……还是先给你揉揉？");
+assert.equal(stripWrappingDialogueQuotes('"……太暗了，拍出来不好看。'), "……太暗了，拍出来不好看。");
+assert.equal(stripWrappingDialogueQuotes("下次不会再让你等了。\""), "下次不会再让你等了。");
+assert.equal(
+  stripWrappingDialogueQuotes("她说“我在呢”。"),
+  "她说“我在呢”。",
+  "dialogue quote cleanup should only strip wrapping quotes",
 );
 
 assert.throws(

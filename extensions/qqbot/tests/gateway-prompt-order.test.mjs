@@ -99,6 +99,15 @@ assert.match(
   /const speechText = stripAsukaNarrationForSpeech\(rawTtsText\)/,
   "low-level TTS sends should strip full-width narration as a final safety guard"
 );
+assert.ok(
+  source.includes("普通说出口的话直接写，不要用英文双引号或中文弯引号包起来"),
+  "voice prompt should forbid wrapping spoken dialogue in quotes"
+);
+assert.match(
+  source,
+  /function cleanOutgoingTextSegment[\s\S]{0,220}stripWrappingDialogueQuotes/,
+  "outgoing text cleanup should remove unnecessary wrapping dialogue quotes"
+);
 assert.match(
   source,
   /function stabilizeQQBotTTSOverrides[\s\S]{0,180}voiceModify/,
