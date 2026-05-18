@@ -634,12 +634,22 @@ function formatMemoryFlags(item: AsukaMemoryItem): string {
   return flags.length > 0 ? `（${flags.join("，")}）` : "";
 }
 
+function normalizePromptPerspective(text: string): string {
+  return text
+    .replace(/Asuka\s*自己/g, "我")
+    .replace(/Asuka/g, "我")
+    .replace(/用户/g, "你")
+    .replace(/对方/g, "你")
+    .replace(/(?<!其)他/g, "你")
+    .replace(/她/g, "我");
+}
+
 function formatMemoryGroup(title: string, items: AsukaMemoryItem[], limit: number): string[] {
   const selected = items.slice(0, limit);
   if (selected.length === 0) return [];
   return [
     `${title}:`,
-    ...selected.map((item) => `- ${item.text}${formatMemoryFlags(item)}`),
+    ...selected.map((item) => `- ${normalizePromptPerspective(item.text)}${formatMemoryFlags(item)}`),
   ];
 }
 
@@ -949,10 +959,10 @@ export function buildAsukaLongTermMemoryPrompt(
     "- 使用原则: 只在和本轮自然相关时轻轻带上，不要像背档案，也不要逐条复述。",
     "- 自我生活线只作为轻量连续性线索；不要把它扩写成完整履历、固定日程或无关新设定。",
     "- 如果本轮涉及承诺/补救/用户明确请求，以承诺/补救/请求优先，自我生活线只能辅助语气。",
-    ...formatMemoryGroup("关于对方", userFacts, 5),
+    ...formatMemoryGroup("关于你", userFacts, 5),
     ...formatMemoryGroup("关系里的事", relationship, 3),
     ...formatMemoryGroup("未完话题", active, 2),
-    ...formatMemoryGroup("Asuka 自我生活线和稳定偏好", selfThreads, 2),
+    ...formatMemoryGroup("我的生活线和稳定偏好", selfThreads, 2),
   ];
 
   for (const item of memories.slice(0, 10)) {

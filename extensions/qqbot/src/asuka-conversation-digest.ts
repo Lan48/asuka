@@ -709,23 +709,41 @@ function formatList(items: string[] | undefined): string {
   return items && items.length > 0 ? items.join("；") : "无";
 }
 
+function normalizePromptPerspective(text: string): string {
+  return text
+    .replace(/Asuka\s*自己/g, "我")
+    .replace(/Asuka/g, "我")
+    .replace(/用户/g, "你")
+    .replace(/对方/g, "你")
+    .replace(/(?<!其)他/g, "你")
+    .replace(/她/g, "我");
+}
+
+function formatPromptText(text: string | undefined): string {
+  return text ? normalizePromptPerspective(text) : "无";
+}
+
+function formatPromptList(items: string[] | undefined): string {
+  return items && items.length > 0 ? items.map(normalizePromptPerspective).join("；") : "无";
+}
+
 export function formatConversationDigestForPrompt(digest: ConversationDigest | LegacyConversationDigest): string {
   const normalized = upgradeLegacyDigest(digest);
   const weekly = normalized.weekly;
   const lines = [
     "【近一周会话摘要】",
     `- 摘要窗口: ${normalized.window}（滚动最近七天，按 ${normalized.timeZone} 自然日分日摘要）`,
-    `- 七天关系连续性: ${weekly.relationshipContinuity || "无"}`,
-    `- 七天情绪线: ${weekly.recentEmotionalArc || "无"}`,
-    `- 当前未闭环事项: ${formatList(weekly.currentOpenLoops)}`,
-    `- 用户偏好/边界: ${formatList(weekly.userPreferences)}`,
-    `- 临时指令/待过期偏好: ${formatList(weekly.temporaryDirectives)}`,
-    `- Asuka 自我生活线: ${weekly.asukaSelfContinuity || "无"}`,
-    `- 场景连续性: ${weekly.sceneContinuity || "无"}`,
-    `- 重要近期事实: ${formatList(weekly.importantRecentFacts)}`,
-    `- 下一轮避免: ${formatList(weekly.thingsToAvoid)}`,
-    `- 关键近轮: ${formatList(weekly.lastSalientTurns)}`,
-    `- 证据/置信度: ${formatList(weekly.evidenceNotes)}`,
+    `- 七天关系连续性: ${formatPromptText(weekly.relationshipContinuity)}`,
+    `- 七天情绪线: ${formatPromptText(weekly.recentEmotionalArc)}`,
+    `- 当前未闭环事项: ${formatPromptList(weekly.currentOpenLoops)}`,
+    `- 你的偏好/边界: ${formatPromptList(weekly.userPreferences)}`,
+    `- 临时指令/待过期偏好: ${formatPromptList(weekly.temporaryDirectives)}`,
+    `- 我的生活线: ${formatPromptText(weekly.asukaSelfContinuity)}`,
+    `- 场景连续性: ${formatPromptText(weekly.sceneContinuity)}`,
+    `- 重要近期事实: ${formatPromptList(weekly.importantRecentFacts)}`,
+    `- 下一轮避免: ${formatPromptList(weekly.thingsToAvoid)}`,
+    `- 关键近轮: ${formatPromptList(weekly.lastSalientTurns)}`,
+    `- 证据/置信度: ${formatPromptList(weekly.evidenceNotes)}`,
   ];
 
   if (normalized.daily.length > 0) {
@@ -733,18 +751,18 @@ export function formatConversationDigestForPrompt(digest: ConversationDigest | L
     for (const day of normalized.daily) {
       const dayLines = [
         `- ${day.date}（${day.detailLevel}）`,
-        `  关系: ${day.relationshipContinuity || "无"}`,
-        `  情绪: ${day.emotionalArc || "无"}`,
-        `  未闭环: ${formatList(day.openLoops)}`,
-        `  场景: ${day.sceneContinuity || "无"}`,
-        `  Asuka 生活线: ${day.asukaSelfContinuity || "无"}`,
-        `  重要事实: ${formatList(day.importantFacts)}`,
+        `  关系: ${formatPromptText(day.relationshipContinuity)}`,
+        `  情绪: ${formatPromptText(day.emotionalArc)}`,
+        `  未闭环: ${formatPromptList(day.openLoops)}`,
+        `  场景: ${formatPromptText(day.sceneContinuity)}`,
+        `  我的生活线: ${formatPromptText(day.asukaSelfContinuity)}`,
+        `  重要事实: ${formatPromptList(day.importantFacts)}`,
       ];
-      if (day.userPreferences.length > 0) dayLines.push(`  偏好/边界: ${formatList(day.userPreferences)}`);
-      if (day.temporaryDirectives.length > 0) dayLines.push(`  临时指令: ${formatList(day.temporaryDirectives)}`);
-      if (day.thingsToAvoid.length > 0) dayLines.push(`  避免: ${formatList(day.thingsToAvoid)}`);
-      if (day.salientTurns.length > 0) dayLines.push(`  关键近轮: ${formatList(day.salientTurns)}`);
-      if (day.evidenceNotes.length > 0) dayLines.push(`  证据: ${formatList(day.evidenceNotes)}`);
+      if (day.userPreferences.length > 0) dayLines.push(`  偏好/边界: ${formatPromptList(day.userPreferences)}`);
+      if (day.temporaryDirectives.length > 0) dayLines.push(`  临时指令: ${formatPromptList(day.temporaryDirectives)}`);
+      if (day.thingsToAvoid.length > 0) dayLines.push(`  避免: ${formatPromptList(day.thingsToAvoid)}`);
+      if (day.salientTurns.length > 0) dayLines.push(`  关键近轮: ${formatPromptList(day.salientTurns)}`);
+      if (day.evidenceNotes.length > 0) dayLines.push(`  证据: ${formatPromptList(day.evidenceNotes)}`);
       lines.push(dayLines.join("\n"));
     }
   }

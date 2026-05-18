@@ -257,7 +257,7 @@ try {
     },
     daily: [],
   });
-  assert.match(fixedPrompt, /用户偏好\/边界: 无/, "empty digest fields should keep a stable prompt shape");
+  assert.match(fixedPrompt, /你的偏好\/边界: 无/, "empty digest fields should keep a stable prompt shape");
   assert.match(fixedPrompt, /临时指令\/待过期偏好: 无/, "empty temporary directive field should keep a stable prompt shape");
 
   const upgradedPrompt = formatConversationDigestForPrompt({

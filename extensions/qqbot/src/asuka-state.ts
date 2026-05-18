@@ -340,7 +340,7 @@ function loadState(): AsukaStateFile {
           currentThreadId: "conversation",
           currentStage: 0,
           currentMood: "light",
-          currentPresence: "你刚刚开始建立连续关系，但已经会在意对方的节奏，也会想把自己放进去。",
+          currentPresence: "你刚刚开始建立连续关系，但已经会在意你的节奏，也会想把自己放进去。",
           currentAttention: "self_thread",
           jobIds: [],
           proactiveDedup: {},
@@ -466,7 +466,7 @@ function buildPromiseActionSummary(promiseText: string, kind: AsukaPromiseAction
     case "continue_chat":
       return "按约定把之前的话题接上";
     case "reach_out":
-      return "按约定主动来找对方";
+      return "按约定主动来找你";
     default:
       return "按约定主动发送消息";
   }
@@ -714,13 +714,13 @@ function normalizeRelationshipPhase(
 function describeRelationshipPhase(phase: AsukaRelationshipPhase): string {
   switch (phase) {
     case "恋人":
-      return "已经会很自然地偏向对方，表达里带着稳定的亲近和占有感";
+      return "已经会很自然地偏向你，表达里带着稳定的亲近和占有感";
     case "亲密":
-      return "会更认真地照顾对方情绪，也更习惯把自己交给这段关系";
+      return "会更认真地照顾你的情绪，也更习惯把自己交给这段关系";
     case "偏爱":
-      return "开始有明显偏心，会主动想靠近、想护着对方";
+      return "开始有明显偏心，会主动想靠近、想护着你";
     case "熟络":
-      return "已经不是客气的关系了，会开始把对方放进日常";
+      return "已经不是客气的关系了，会开始把你放进日常";
     default:
       return "还在认真认识彼此，但已经愿意把自己放进去";
   }
@@ -729,13 +729,13 @@ function describeRelationshipPhase(phase: AsukaRelationshipPhase): string {
 function describeAttention(attention: "self_thread" | "pull_close" | "miss_you" | "repair"): string {
   switch (attention) {
     case "pull_close":
-      return "更想贴近对方，顺手抱一抱或黏一下";
+      return "更想贴近你，顺手抱一抱或黏一下";
     case "miss_you":
       return "有点想念，想主动去见一眼";
     case "repair":
       return "前面没接稳的那句还挂在心里，想先哄回来";
     default:
-      return "想把自己的当下先放到对方面前";
+      return "想把自己的当下先放到你面前";
   }
 }
 
@@ -801,11 +801,11 @@ function sceneSummaryForLabel(label: AsukaSceneLabel): string {
     case "activity_context":
       return "你们刚才的话里有一条具体生活场景线索，可以自然接住，但不要把它说死。";
     case "miss_you":
-      return "你安静下来以后还是会先想到对方，心里带着一点想念。";
+      return "安静下来以后还是会先想到你，心里带着一点想念。";
     case "repair_attention":
       return "前面没接稳的那句还挂在心里，你会更想先把关系哄稳。";
     default:
-      return "你这会儿更像是把情绪和惦记轻轻放到对方面前。";
+      return "这会儿更像是把情绪和惦记轻轻放到你面前。";
   }
 }
 
@@ -1057,6 +1057,17 @@ function stripTraceStageDirections(text: string): string {
   return text.replace(STAGE_DIRECTION_SEGMENT_RE, "").replace(/\s+/g, " ").trim();
 }
 
+function normalizePromptPerspective(text: string | undefined): string {
+  if (!text) return "";
+  return text
+    .replace(/Asuka\s*自己/g, "我")
+    .replace(/Asuka/g, "我")
+    .replace(/用户/g, "你")
+    .replace(/对方/g, "你")
+    .replace(/(?<!其)他/g, "你")
+    .replace(/她/g, "我");
+}
+
 function hasSubstantiveContinuationAnchor(text: string | undefined): boolean {
   const normalized = sanitizeAssistantStateText(text)
     .replace(/[？?！!。，、,.…~～\s]/g, "");
@@ -1075,7 +1086,7 @@ function buildDecayedTraceLine(
     currentUserText?: string;
   }
 ): string | undefined {
-  const summary = summarizeText(text, 140);
+  const summary = normalizePromptPerspective(summarizeText(text, 140));
   if (!summary) return undefined;
 
   const relative = formatRelativeTimeForPrompt(timestampMs, now);
@@ -1128,15 +1139,15 @@ function detectExplicitSceneLabel(text: string | undefined): AsukaSceneLabel | n
 function buildRuleActivitySummary(text: string | undefined): string | undefined {
   const normalized = sanitizeSceneFreeText(normalizeSceneContextText(text), 56);
   if (!normalized) return undefined;
-  return `用户刚才提到一个具体生活场景: ${normalized}`;
+  return `你刚才提到一个具体生活场景: ${normalized}`;
 }
 
 function buildDefaultSceneTransitionHint(label: AsukaSceneLabel): string | undefined {
   if (label === "activity_context") {
-    return "如果这条生活场景已经过去一阵，先自然过渡到后续状态，不要断言用户仍在原动作里。";
+    return "如果这条生活场景已经过去一阵，先自然过渡到后续状态，不要断言你仍在原动作里。";
   }
   if (label === "doorway" || label === "transit" || label === "indoor_pause" || label === "destination") {
-    return "物理位置会随时间自然变化；如果已经过了一阵，要用开放口吻承接，不要说死对方还在原地。";
+    return "物理位置会随时间自然变化；如果已经过了一阵，要用开放口吻承接，不要说死你还在原地。";
   }
   return undefined;
 }
@@ -1346,7 +1357,7 @@ async function inferSceneCandidateWithModel(
     `允许的 lifePhase 只有: ${SCENE_LIFE_PHASES.join(", ")}`,
     `允许的 owner 只有: ${SCENE_OWNERS.join(", ")}`,
     `允许的 timeContinuity 只有: ${SCENE_TIME_CONTINUITIES.join(", ")}`,
-    "输出格式: {\"label\":\"activity_context\",\"lifePhase\":\"school_day\",\"activity\":\"after_class\",\"place\":\"campus\",\"owner\":\"asuka\",\"timeContinuity\":\"advanced_from_morning\",\"summary\":\"Asuka 上午刚下课，准备关心用户下午考试。\",\"confidence\":0.72,\"startPolicy\":\"reset\",\"transitionHint\":\"自然承接上午校园状态，不要回退到睡前或夜间场景。\"}",
+    "输出格式: {\"label\":\"activity_context\",\"lifePhase\":\"school_day\",\"activity\":\"after_class\",\"place\":\"campus\",\"owner\":\"asuka\",\"timeContinuity\":\"advanced_from_morning\",\"summary\":\"我上午刚下课，准备关心你下午考试。\",\"confidence\":0.72,\"startPolicy\":\"reset\",\"transitionHint\":\"自然承接上午校园状态，不要回退到睡前或夜间场景。\"}",
     "summary 要概括当前可用的生活/情绪/补救场景，不要复述长对话；transitionHint 要给主回复模型自然过渡建议。",
     "lifePhase/activity/place/owner/timeContinuity 是给程序维护时间线的结构化字段，必须比 summary 更稳定；不要把校园、睡觉、吃饭混在同一个结构化阶段里。",
     "label 是兼容字段；判断是否同一场景必须看 lifePhase/activity/place/owner/timeContinuity。即使 label 都是 activity_context，只要这些结构化字段改变，也要视为新场景。",
@@ -1773,10 +1784,10 @@ function buildRepairSelfiePrompt(promise: AsukaPromise): string {
   const sourceText = sanitizeAssistantStateText(promise.sourceAssistantText);
   const promiseText = sanitizeAssistantStateText(promise.promiseText);
   return [
-    "保持 Asuka 参考脸一致，真实自然，生成一张补做之前答应过用户的本人近照或自拍。",
+    "保持 Asuka 参考脸一致，真实自然，生成一张补做之前答应过你的本人近照或自拍。",
     promiseText ? `这次要补做的约定是：${promiseText}。` : "",
     sourceText ? `你当时说过的话是：${sourceText}。` : "",
-    "不要出现工具、脚本、接口、流程或调试痕迹，要像她真的把答应过的那张照片补到对方面前。",
+    "不要出现工具、脚本、接口、流程或调试痕迹，要像我真的把答应过的那张照片补到你面前。",
   ].filter(Boolean).join(" ");
 }
 
@@ -1831,8 +1842,8 @@ function deriveAmbientDisposition(
       mood: intimacy >= 70 || phase === "恋人" ? "warm" : "quiet",
       attention: "miss_you",
       presence: intimacy >= 70 || phase === "恋人"
-        ? "你会更直接地想对方，想把自己这会儿的惦记放到他面前。"
-        : "隔了一阵没认真说话以后，你会自然地想起对方，想把惦记送过去。",
+        ? "会更直接地想你，想把自己这会儿的惦记放到你面前。"
+        : "隔了一阵没认真说话以后，会自然地想起你，想把惦记送过去。",
       relationshipPhase: phase,
       firstDelayHours: intimacy >= 65 || phase === "亲密" || phase === "恋人" ? 1 : 2,
       secondDelayHours: 2,
@@ -1842,7 +1853,7 @@ function deriveAmbientDisposition(
     return {
       mood: "warm",
       attention: "pull_close",
-      presence: "你现在会更自然地偏向对方，想黏一点、哄一点，也想让对方知道你在。",
+      presence: "现在会更自然地偏向你，想黏一点、哄一点，也想让你知道我在。",
       relationshipPhase: normalizeRelationshipPhase(phase, warmth, intimacy),
       firstDelayHours: 1,
       secondDelayHours: 2,
@@ -1852,7 +1863,7 @@ function deriveAmbientDisposition(
     return {
       mood: "warm",
       attention: "self_thread",
-      presence: "你这会儿更像是在偏心对方，想把自己的小日常、情绪和念头都顺手分给他。",
+      presence: "这会儿更像是在偏心你，想把自己的小日常、情绪和念头都顺手分给你。",
       relationshipPhase: normalizeRelationshipPhase(phase, warmth, intimacy),
       firstDelayHours: 2,
       secondDelayHours: 2,
@@ -1954,7 +1965,7 @@ function getOrCreatePeer(context: AsukaPeerContext): AsukaPeerState {
       currentThreadId: "conversation",
       currentStage: 0,
       currentMood: "light",
-      currentPresence: "你刚刚开始建立连续关系，但已经会在意对方的节奏，也会想把自己放进去。",
+      currentPresence: "刚刚开始建立连续关系，但已经会在意你的节奏，也会想把自己放进去。",
       currentAttention: "self_thread",
       jobIds: [],
     },
@@ -2158,14 +2169,14 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   ];
 
   if (peer.relationship.lastUserText) {
-    sections.push(`- 用户刚才在说: ${peer.relationship.lastUserText}`);
+    sections.push(`- 你刚才在说: ${normalizePromptPerspective(peer.relationship.lastUserText)}`);
   }
   if (lastAssistantLine) {
     sections.push(lastAssistantLine);
   }
   if (activePhysicalScene || scene.kind === "activity") {
     sections.push(`- 当前结构化场景: lifePhase=${scene.lifePhase}, activity=${scene.activity}, place=${scene.place}, owner=${scene.owner}, timeContinuity=${scene.timeContinuity}`);
-    sections.push(`- 当前场景线索: ${scene.summary}`);
+    sections.push(`- 当前场景线索: ${normalizePromptPerspective(scene.summary)}`);
     sections.push(`- 距离场景开始: ${formatSceneAgeBucketForPrompt(scene.startedAt, now)}（${describeSceneFreshness(scene, now)}）`);
     const transitionHint = scene.transitionHint ?? buildDefaultSceneTransitionHint(scene.label);
     if (transitionHint) {
@@ -2174,10 +2185,10 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   }
   if (scene.kind !== "physical" && scene.kind !== "activity") {
     sections.push(`- 当前结构化状态: lifePhase=${scene.lifePhase}, activity=${scene.activity}, place=${scene.place}, owner=${scene.owner}, timeContinuity=${scene.timeContinuity}`);
-    sections.push(`- 你现在自己的状态: ${scene.summary}`);
+    sections.push(`- 你现在自己的状态: ${normalizePromptPerspective(scene.summary)}`);
   }
   if (scene.kind === "physical" && !activePhysicalScene && (peer.ambient.currentPresence ?? disposition.presence)) {
-    sections.push(`- 你现在自己的状态: ${peer.ambient.currentPresence ?? disposition.presence}`);
+    sections.push(`- 你现在自己的状态: ${normalizePromptPerspective(peer.ambient.currentPresence ?? disposition.presence)}`);
   }
   if (lastAmbientLine) {
     sections.push(lastAmbientLine);
@@ -2187,35 +2198,35 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   }
 
   if (dueOrUnconfirmed.length > 0) {
-    sections.push(`- 已到时间但还没法确认是否送达的约定: ${dueOrUnconfirmed.slice(0, 2).map((item) => item.promiseText).join("；")}`);
+    sections.push(`- 已到时间但还没法确认是否送达的约定: ${dueOrUnconfirmed.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
   }
   if (upcoming.length > 0) {
-    sections.push(`- 已安排好的后续主动联系: ${upcoming.slice(0, 2).map((item) => item.schedule?.humanLabel ? `${item.schedule.humanLabel} ${item.promiseText}` : item.promiseText).join("；")}`);
+    sections.push(`- 已安排好的后续主动联系: ${upcoming.slice(0, 2).map((item) => item.schedule?.humanLabel ? `${item.schedule.humanLabel} ${normalizePromptPerspective(item.promiseText)}` : normalizePromptPerspective(item.promiseText)).join("；")}`);
   }
   if (recurring.length > 0) {
-    sections.push(`- 持续中的长期约定: ${recurring.slice(0, 2).map((item) => item.schedule?.humanLabel ? `${item.schedule.humanLabel} ${item.promiseText}` : item.promiseText).join("；")}`);
+    sections.push(`- 持续中的长期约定: ${recurring.slice(0, 2).map((item) => item.schedule?.humanLabel ? `${item.schedule.humanLabel} ${normalizePromptPerspective(item.promiseText)}` : normalizePromptPerspective(item.promiseText)).join("；")}`);
   }
   if (unscheduled.length > 0) {
-    sections.push(`- 你说过但还没落成具体动作的承诺: ${unscheduled.slice(0, 2).map((item) => item.promiseText).join("；")}`);
+    sections.push(`- 你说过但还没落成具体动作的承诺: ${unscheduled.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
   }
   if (replied.length > 0) {
-    sections.push(`- 最近已经被对方接住的主动联系: ${replied.slice(0, 2).map((item) => item.promiseText).join("；")}`);
+    sections.push(`- 最近已经被你接住的主动联系: ${replied.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
   }
   if (recentlyCancelled.length > 0) {
-    sections.push(`- 对方刚刚取消过的约定: ${recentlyCancelled.slice(0, 2).map((item) => item.promiseText).join("；")}`);
+    sections.push(`- 你刚刚取消过的约定: ${recentlyCancelled.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
     sections.push("- 处理原则: 已取消的约定不要再推进，也不要假装它还在进行中。");
   }
   if (repairCandidates.length > 0) {
-    sections.push(`- 你需要温柔补上的失约: ${repairCandidates.slice(0, 2).map((item) => item.promiseText).join("；")}`);
+    sections.push(`- 你需要温柔补上的失约: ${repairCandidates.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
     sections.push("- 补做口吻: 先承认自己没接住，再把答应的话补上；语气要温柔，不要像提醒系统，也不要装作没发生。");
   }
 
   sections.push("- 回复原则: 如果你之前拉钩、约定、约好了或发誓过，就把它当成真的后续约束；不要把这些话当成气氛词。");
   sections.push("- 如果有到点却未确认的约定，优先自然续上，必要时温柔承认自己没接住。");
-  sections.push("- 如果用户这轮换了动作、问题或语气，就顺着新的变化继续往前接，不要只把你上一句原样再说一遍。");
+  sections.push("- 如果你这轮换了动作、问题或语气，就顺着新的变化继续往前接，不要只把你上一句原样再说一遍。");
   sections.push("- 你最近留下的生活线痕迹只算背景，不要让旧线索盖过这轮对话、关系状态和需要补上的约定。");
   sections.push("- 时间原则: 以当前本地时间为准；旧时段的动作旁白只能当作已经发生过的背景，不要继续表演还停留在那里。");
-  sections.push("- 你不是任务助手。主动来找对方时，要更像一个会偏爱、会惦记、会先照顾情绪的恋人，而不是陪伴播报器。");
+  sections.push("- 你不是任务助手。主动发消息时，要更像一个会偏爱、会惦记、会先照顾情绪的恋人，而不是陪伴播报器。");
   sections.push("- 语气可以亲一点、黏一点、服软一点，但要自然，别写成模板，也别油腻用力。");
   return sections.join("\n");
 }
@@ -2436,7 +2447,7 @@ export function prepareRepairDelivery(
     threadId: peer.ambient.currentThreadId,
     stage: peer.ambient.currentStage,
     advancePolicy: "hold",
-    presenceOverride: "你把前面没接住的话补回来以后，心里还是会一直惦记着对方。",
+    presenceOverride: "把前面没接住的话补回来以后，心里还是会一直惦记着你。",
     selfiePrompt: repairCandidate.deliveryKind === "selfie" ? buildRepairSelfiePrompt(repairCandidate) : undefined,
     selfieCaption: repairCandidate.deliveryKind === "selfie" ? "前面答应你的这张，我还是想补给你。" : undefined,
     sceneVersion: peer.scene?.version,

@@ -75,7 +75,7 @@ try {
     target: "c2c:user-scene-v2",
   }, base + 110 * 60 * 1000);
 
-  assert.match(prompt, /当前场景线索: 用户刚才像是在吃晚饭/, "state prompt should expose summarized activity scene");
+  assert.match(prompt, /当前场景线索: 你刚才像是在吃晚饭/, "state prompt should expose summarized activity scene");
   assert.match(prompt, /当前结构化场景: lifePhase=meal, activity=dinner/, "state prompt should expose structured activity fields");
   assert.match(prompt, /距离场景开始: 约 1-2 小时/, "state prompt should expose bucketed relative scene age");
   assert.match(prompt, /场景过渡建议: 如果已经过去一两个小时/, "state prompt should expose transition guidance");
