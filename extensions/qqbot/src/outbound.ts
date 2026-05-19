@@ -50,7 +50,8 @@ interface MessageReplyRecord {
 }
 
 const messageReplyTracker = new Map<string, MessageReplyRecord>();
-const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
+const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|Q{1,2}BOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
 const DEBUG_PROBE_TEXT_RE = /^(?:test(?:\s+again|\d*)?|\.)$/i;
 let openClawConfigCache: any | undefined;
@@ -867,7 +868,7 @@ function recoverBareCronPayloadMessage(text: string): string | null {
 
 function sanitizeSelfieContextText(text: string | undefined): string {
   return text
-    ?.replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    ?.replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(INTERNAL_DELIVERY_LEAK_RE, "")
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
     .replace(/\s+/g, " ")

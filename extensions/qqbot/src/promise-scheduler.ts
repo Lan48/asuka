@@ -22,7 +22,7 @@ function buildJobName(promise: AsukaPromise, suffix = "promise"): string {
 
 function sanitizePromptText(text: string | undefined): string {
   return (text ?? "")
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(/Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
     .replace(/\s+/g, " ")
     .trim();
 }

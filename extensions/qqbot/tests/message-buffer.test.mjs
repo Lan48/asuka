@@ -9,6 +9,7 @@ process.env.USERPROFILE = tmpHome;
 
 const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseProactiveNudge, parseVoiceReplySuffix, stripWrappingDialogueQuotes } = await import("../dist/src/gateway.js");
 const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
+const { parseQQBotPayload } = await import("../dist/src/utils/payload.js");
 
 const first = {
   type: "c2c",
@@ -124,6 +125,33 @@ assert.equal(
   "valid payloads should not hide actual internal-process wording in visible text",
 );
 
+const singleQSelfiePayload = 'QBOT_PAYLOAD: {"type":"selfie","caption":"昨晚被你笑醒的时候偷拍的。"}';
+const parsedSingleQSelfiePayload = parseQQBotPayload(singleQSelfiePayload);
+
+assert.equal(
+  parsedSingleQSelfiePayload.isPayload,
+  true,
+  "single-Q payload typo should still be parsed as a structured payload",
+);
+
+assert.equal(
+  parsedSingleQSelfiePayload.payload?.type,
+  "selfie",
+  "single-Q selfie payload typo should route through the selfie handler",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak(singleQSelfiePayload),
+  false,
+  "valid single-Q structured payload typo should not be treated as visible process text",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak('QBOT_PAYLOAD: {"internal":true}'),
+  true,
+  "invalid single-Q payload typo should still be suppressed as an internal leak",
+);
+
 assert.equal(
   looksLikeInternalProcessLeak(`# 2026-05-15 周五
 
@@ -155,6 +183,18 @@ assert.equal(
   looksLikeInternalDeliveryLeak('QQBOT_PAYLOAD: {"internal":true}'),
   true,
   "invalid structured payload artifacts should still be suppressed in outbound delivery",
+);
+
+assert.equal(
+  looksLikeInternalDeliveryLeak('QBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。","tts":{"emotion":"soft"}}'),
+  false,
+  "valid single-Q audio payload typo should be routed as media instead of sent as text",
+);
+
+assert.equal(
+  looksLikeInternalDeliveryLeak('QBOT_PAYLOAD: {"internal":true}'),
+  true,
+  "invalid single-Q payload typo should still be suppressed in outbound delivery",
 );
 
 for (const leakedOutboundText of [

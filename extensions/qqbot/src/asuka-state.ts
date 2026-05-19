@@ -245,8 +245,8 @@ const STATE_FILE = path.join(STATE_DIR, "state.json");
 const LEGACY_STATE_FILE = path.join(LEGACY_STATE_DIR, "state.json");
 let cache: AsukaStateFile | null = null;
 
-const STRUCTURED_ARTIFACT_RE = /QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
-const INTERNAL_SUMMARY_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+const INTERNAL_SUMMARY_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|Q{1,2}BOT_(?:PAYLOAD|CRON)|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
 const USER_REPLY_SKIP_GRACE_MS = 10 * 60 * 1000;
 const PROMISE_TEXT_DEDUP_WINDOW_MS = 12 * 60 * 60 * 1000;
 const PROMISE_SEMANTIC_DEDUP_WINDOW_MS = 48 * 60 * 60 * 1000;

@@ -219,7 +219,7 @@ function truncate(value: string, maxChars: number): string {
 function sanitizeDigestText(text: string | undefined, maxChars = MAX_FIELD_CHARS): string {
   if (!text) return "";
   const sanitized = text
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*?(?=\n\n|$)/gi, " ")
+    .replace(/Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*?(?=\n\n|$)/gi, " ")
     .replace(/<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, " ")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|sk-cp-[A-Za-z0-9_-]{16,})\b/g, "[redacted]")
     .replace(/\b(?:api[_-]?key|token|secret|password|passwd|clientSecret|Authorization|Bearer)\s*[:=]\s*\S+/gi, "[redacted]")

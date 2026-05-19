@@ -30,10 +30,12 @@ import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 
-const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
+const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
+const STRUCTURED_PAYLOAD_PREFIX_RE = /(^|[^A-Za-z0-9_])(?:QQBOT|QBOT)_PAYLOAD\s*:/i;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 
 type ReplyDeliverPayload = {
   text?: string;
@@ -326,7 +328,7 @@ function loadAsukaVisualIdentityAnchor(): string {
 }
 
 function hasStructuredPayloadPrefix(text: string): boolean {
-  return text.includes(STRUCTURED_PAYLOAD_PREFIX);
+  return text.includes(STRUCTURED_PAYLOAD_PREFIX) || STRUCTURED_PAYLOAD_PREFIX_RE.test(text);
 }
 
 async function removeCronJobs(jobIds: string[], accountId: string, log?: { info?: (msg: string) => void; warn?: (msg: string) => void }): Promise<void> {
@@ -361,7 +363,7 @@ function truncateForSelfiePrompt(text: string, maxChars: number): string {
 function sanitizeSelfieContextText(text: string): string {
   return text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(INTERNAL_PROCESS_LEAK_RE, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -501,7 +503,7 @@ function buildDirectSelfiePromptFromContext(userText: string, assistantText: str
 function extractSelfieCaptionFromAssistantText(text: string): string {
   const cleaned = text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
-    .replace(/QQBOT_PAYLOAD:[\s\S]*$/gi, "")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return truncateForSelfiePrompt(cleaned, MAX_SELFIE_CAPTION_CHARS);
@@ -565,7 +567,7 @@ function looksLikeSelfieIntentFromAssistantLeak(text: string): boolean {
 
 function normalizeLeakRewriteText(text: string): string {
   return text
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(/```[\s\S]*?```/g, "")
     .replace(/`[^`]*`/g, "")
     .replace(/https?:\/\/\S+/g, "")
@@ -902,7 +904,7 @@ function stripStructuredPayloadForVisibleText(text: string): string {
       .join("\n\n")
       .trim();
   }
-  return text.replace(/QQBOT_PAYLOAD:[\s\S]*$/gi, "").trim();
+  return text.replace(STRUCTURED_ARTIFACT_RE, "").trim();
 }
 
 function getWsProxyAgent(): HttpsProxyAgent<string> | undefined {

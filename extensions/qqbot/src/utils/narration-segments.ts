@@ -1,4 +1,4 @@
-const STRUCTURED_PAYLOAD_RE = /QQBOT_(?:PAYLOAD|CRON):/;
+const STRUCTURED_PAYLOAD_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):/;
 const MEDIA_TAG_RE = /<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/i;
 const MARKDOWN_IMAGE_RE = /!\[[^\]]*]\([^)]+\)/;
 const FULL_WIDTH_PAREN_ONLY_RE = /^（[\s\S]*）?$/;

@@ -76,9 +76,9 @@ const RECENT_SELF_THREAD_PROMPT_MS = 2 * DAY_MS;
 const SELF_THREAD_FRESHNESS_MS = RECENT_SELF_THREAD_PROMPT_MS;
 const cache: { state: AsukaMemoryStateFile | null } = { state: null };
 
-const STRUCTURED_ARTIFACT_RE = /QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 const MEDIA_TAG_RE = /<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
-const INTERNAL_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|提醒已发送|根据任务描述|工具调用|调试信息|API 调用|脚本|进程状态|通道规则)/i;
+const INTERNAL_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|提醒已发送|根据任务描述|工具调用|调试信息|API 调用|脚本|进程状态|通道规则)/i;
 const SECRET_RE = /(密码|口令|验证码|token|api[_-]?key|secret|密钥|身份证|银行卡|信用卡|私钥|助记词|cookie|authorization)/i;
 const EXPLICIT_MEMORY_RE = /(记住|记得|别忘|帮我记|你要记|以后你要记得|以后记得|这点很重要|这个很重要)/;
 const USER_PROFILE_RE = /(我叫|叫我|我的名字|我是|生日|纪念日|时区|城市|住在|在.*工作|在.*上学)/;

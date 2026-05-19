@@ -146,6 +146,7 @@ export interface RecoveredSelfiePayloadResult {
 
 /** AI 输出的结构化载荷前缀 */
 const PAYLOAD_PREFIX = 'QQBOT_PAYLOAD:';
+const PAYLOAD_PREFIX_RE = /(^|[^A-Za-z0-9_])((?:QQBOT|QBOT)_PAYLOAD\s*:)/i;
 
 /** Cron 消息存储的前缀 */
 const CRON_PREFIX = 'QQBOT_CRON:';
@@ -164,6 +165,22 @@ export function wrapExactMessageForAgentTurn(rawMessage: string): string {
 // ============================================
 // 解析函数
 // ============================================
+
+function findPayloadPrefix(text: string): { index: number; length: number } | null {
+  const exactIndex = text.indexOf(PAYLOAD_PREFIX);
+  if (exactIndex >= 0) {
+    return { index: exactIndex, length: PAYLOAD_PREFIX.length };
+  }
+
+  const match = PAYLOAD_PREFIX_RE.exec(text);
+  if (!match) return null;
+  const leadingDelimiter = match[1] ?? "";
+  const prefix = match[2] ?? "";
+  return {
+    index: match.index + leadingDelimiter.length,
+    length: prefix.length,
+  };
+}
 
 function extractJsonObject(raw: string): { json: string; rest: string } | null {
   const start = raw.indexOf('{');
@@ -255,11 +272,11 @@ function extractJsonStringField(
 }
 
 export function recoverIncompleteSelfiePayload(text: string): RecoveredSelfiePayloadResult | null {
-  const prefixIndex = text.indexOf(PAYLOAD_PREFIX);
-  if (prefixIndex < 0) return null;
+  const prefix = findPayloadPrefix(text);
+  if (!prefix) return null;
 
-  const leadingText = text.slice(0, prefixIndex).trim();
-  const payloadSection = text.slice(prefixIndex + PAYLOAD_PREFIX.length).trim();
+  const leadingText = text.slice(0, prefix.index).trim();
+  const payloadSection = text.slice(prefix.index + prefix.length).trim();
   if (!/"type"\s*:\s*"selfie"/i.test(payloadSection)) {
     return null;
   }
@@ -307,17 +324,17 @@ export function recoverIncompleteSelfiePayload(text: string): RecoveredSelfiePay
  * }
  */
 export function parseQQBotPayload(text: string): ParseResult {
-  const prefixIndex = text.indexOf(PAYLOAD_PREFIX);
+  const prefix = findPayloadPrefix(text);
 
-  if (prefixIndex < 0) {
+  if (!prefix) {
     return {
       isPayload: false,
       text: text
     };
   }
 
-  const leadingText = text.slice(0, prefixIndex).trim();
-  const payloadSection = text.slice(prefixIndex + PAYLOAD_PREFIX.length).trim();
+  const leadingText = text.slice(0, prefix.index).trim();
+  const payloadSection = text.slice(prefix.index + prefix.length).trim();
   const extracted = extractJsonObject(payloadSection);
 
   if (!extracted) {
