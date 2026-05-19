@@ -7,7 +7,7 @@ const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-message-buffer-test
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
-const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseVoiceReplySuffix, stripWrappingDialogueQuotes } = await import("../dist/src/gateway.js");
+const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseProactiveNudge, parseVoiceReplySuffix, stripWrappingDialogueQuotes } = await import("../dist/src/gateway.js");
 const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
 
 const first = {
@@ -64,6 +64,24 @@ assert.deepEqual(
   parseVoiceReplySuffix("普通～波浪号"),
   { text: "普通～波浪号", forceVoiceReply: false },
   "fullwidth wave inside normal text should remain normal text",
+);
+
+assert.deepEqual(
+  parseProactiveNudge("。"),
+  { isNudge: true, forceVoiceReply: false },
+  "standalone ideographic period should nudge a normal proactive turn",
+);
+
+assert.deepEqual(
+  parseProactiveNudge("～"),
+  { isNudge: true, forceVoiceReply: true },
+  "standalone fullwidth wave should nudge a voice proactive turn",
+);
+
+assert.deepEqual(
+  parseProactiveNudge("等你～"),
+  { isNudge: false, forceVoiceReply: false },
+  "non-standalone wave suffix should remain a normal voice-reply suffix, not a proactive nudge",
 );
 
 assert.equal(stripWrappingDialogueQuotes('"昨晚那酒喝得太急了。"'), "昨晚那酒喝得太急了。");

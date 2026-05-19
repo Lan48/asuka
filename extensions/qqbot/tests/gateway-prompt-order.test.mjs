@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const source = fs.readFileSync(path.join(process.cwd(), "src", "gateway.ts"), "utf-8");
+const outboundSource = fs.readFileSync(path.join(process.cwd(), "src", "outbound.ts"), "utf-8");
 
 const stableIndex = source.indexOf("const stablePromptSections");
 const dynamicIndex = source.indexOf("const dynamicContextSections");
@@ -76,6 +77,21 @@ assert.match(
   source,
   /"audioAsVoice" in payload[\s\S]{0,160}hasResponse = true/,
   "internal media final deliver should count as a response by payload shape and avoid transcript fallback"
+);
+assert.match(
+  source,
+  /parseProactiveNudge[\s\S]*用户只发送了一个主动续聊触发符/,
+  "standalone punctuation nudges should be interpreted as proactive turns, not literal message content"
+);
+assert.match(
+  outboundSource,
+  /主动消息可以像普通回复一样自行判断文字或语音/,
+  "proactive cron rendering should allow Asuka to choose text or voice"
+);
+assert.match(
+  outboundSource,
+  /sendCronMessage[\s\S]{0,4500}sendText\(\{[\s\S]{0,600}replyToId: null/,
+  "cron proactive delivery should route through sendText so structured audio payloads use the same sender as replies"
 );
 assert.match(
   source,

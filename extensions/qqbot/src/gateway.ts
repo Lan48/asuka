@@ -1150,6 +1150,17 @@ export function parseVoiceReplySuffix(text: string): { text: string; forceVoiceR
   };
 }
 
+export function parseProactiveNudge(text: string): { isNudge: boolean; forceVoiceReply: boolean } {
+  const trimmed = text.trim();
+  if (trimmed === "。" || trimmed === ".") {
+    return { isNudge: true, forceVoiceReply: false };
+  }
+  if (trimmed === "～" || trimmed === "~") {
+    return { isNudge: true, forceVoiceReply: true };
+  }
+  return { isNudge: false, forceVoiceReply: false };
+}
+
 // ============ 媒体发送友好错误提示 ============
 
 /**
@@ -2086,12 +2097,19 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
 
         // 解析 QQ 表情标签，将 <faceType=...,ext="base64"> 替换为 【表情: 中文名】
-        const parsedUserText = parseVoiceReplySuffix(parseFaceTags(event.content));
+        const faceParsedContent = parseFaceTags(event.content);
+        const proactiveNudge = !event.attachments?.length
+          ? parseProactiveNudge(faceParsedContent)
+          : { isNudge: false, forceVoiceReply: false };
+        const parsedUserText = parseVoiceReplySuffix(faceParsedContent);
         const parsedContent = parsedUserText.text;
-        const userContent = voiceText
+        let userContent = voiceText
           ? (parsedContent.trim() ? `${parsedContent}\n${voiceText}` : voiceText) + attachmentInfo
           : parsedContent + attachmentInfo;
-        const userRequestedVoiceReply = parsedUserText.forceVoiceReply && !parsedContent.trim().startsWith("/");
+        if (proactiveNudge.isNudge) {
+          userContent = "";
+        }
+        const userRequestedVoiceReply = (parsedUserText.forceVoiceReply || proactiveNudge.forceVoiceReply) && !parsedContent.trim().startsWith("/");
 
         const imageUnderstandingResults = await summarizeImagesForPrompt(
           imageUrls.map((p, i) => ({
@@ -2127,12 +2145,16 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           messageId: event.messageId,
         };
 
-        recordInboundInteraction(asukaPeerContext, userContent);
-        const memoryControl = handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
-        if (!memoryControl.handled) {
+        recordInboundInteraction(asukaPeerContext, proactiveNudge.isNudge ? "用户轻轻催你主动续聊" : userContent);
+        const memoryControl: ReturnType<typeof handleAsukaMemoryControlMessage> = proactiveNudge.isNudge
+          ? { handled: false }
+          : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
+        if (!proactiveNudge.isNudge && !memoryControl.handled) {
           recordAsukaLongTermMemoryFromUserMessage(asukaPeerContext, userContent);
         }
-        const cancelledPromises = cancelPromisesFromUserMessage(asukaPeerContext, userContent);
+        const cancelledPromises = proactiveNudge.isNudge
+          ? { cancelledPromises: [], cronJobIds: [] }
+          : cancelPromisesFromUserMessage(asukaPeerContext, userContent);
         if (cancelledPromises.cancelledPromises.length > 0) {
           log?.info(
             `[qqbot:${account.accountId}] Cancelled ${cancelledPromises.cancelledPromises.length} promise(s) from user message: ${cancelledPromises.cancelledPromises.map((item) => item.id).join(",")}`
@@ -2385,6 +2407,16 @@ ${ttsHint}${sttHint}`;
           imageUnderstandingPrompt.trim() ? imageUnderstandingPrompt.trim() : "",
           searchPrompt.trim() ? searchPrompt.trim() : "",
           voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
+          proactiveNudge.isNudge
+            ? [
+                "- 本轮触发: 用户只发送了一个主动续聊触发符，这不是正文，等同于用户轻轻催你自己主动发一条消息。",
+                "- 处理方式: 按主动消息来生成，而不是解释标点；你需要结合当前本地时间、最近上下文、场景连续性和关系状态，自己判断要不要轻轻推进场景、推进到哪里、用什么语气推进。",
+                "- 推进原则: 不是必须强行发生新事件；如果旧场景已经过时，就自然过渡；如果时间、上下文和情绪都适合，可以主动把生活线往前带一点。",
+                proactiveNudge.forceVoiceReply
+                  ? "- 回复方式: 这次触发符要求语音，必须优先输出 QQBOT_PAYLOAD audio 载荷。"
+                  : "- 回复方式: 由你根据上下文自己决定文字或语音；如果语音更贴合此刻，可以输出 QQBOT_PAYLOAD audio 载荷。",
+              ].join("\n")
+            : "",
           userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 或 `～` 结尾，表示本轮希望听语音回答；如果用户只发送了 `~` 或 `～`，表示希望你沿用当前上下文继续用语音回应。不要把触发符当作正文，也不要向用户解释这个触发规则。" : "",
         ].filter(Boolean).join("\n");
         dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);

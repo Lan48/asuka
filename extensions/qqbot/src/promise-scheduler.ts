@@ -1,7 +1,7 @@
 import type { AsukaPromise } from "./asuka-state.js";
 import { getSceneSnapshotByPeerKey } from "./asuka-state.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
-import { execOpenClaw } from "./utils/openclaw-command.js";
+import { addCronJobDirectFromArgs, execOpenClaw } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, type CronReminderPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 
 interface LoggerLike {
@@ -158,9 +158,10 @@ function nextDayLateMorning(source: Date): Date {
 }
 
 async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: string } | { error: string }> {
+  const env = getQQBotLocalOpenClawEnv();
   try {
     const { stdout, stderr } = await execOpenClaw(args, {
-      env: getQQBotLocalOpenClawEnv(),
+      env,
       maxBuffer: 1024 * 1024,
     });
     if (stderr?.trim()) {
@@ -170,7 +171,13 @@ async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: st
     if (!parsed.id) return { error: "cron add succeeded but returned no job id" };
     return { jobId: parsed.id };
   } catch (error) {
-    return { error: error instanceof Error ? error.message : String(error) };
+    const message = error instanceof Error ? error.message : String(error);
+    log?.warn?.(`[asuka-scheduler] cron add through CLI failed: ${message}`);
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) {
+      return { jobId: direct.jobId };
+    }
+    return { error: `${message}; direct cron store fallback failed: ${direct.error}` };
   }
 }
 

@@ -36,6 +36,17 @@ function resolveLocalOpenClawConfigPath(): string {
   return path.resolve(MODULE_DIR, "../../../../openclaw.json");
 }
 
+function resolveLocalOpenClawScript(stateDir: string): string | undefined {
+  const explicit = process.env.OPENCLAW_SCRIPT?.trim();
+  if (explicit) return explicit;
+  const candidates = [
+    path.resolve(stateDir, "lib", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
 function loadLocalOpenClawConfig(): any {
   if (localOpenClawConfigCache !== undefined) {
     return localOpenClawConfigCache;
@@ -67,11 +78,13 @@ function loadLocalOpenClawConfig(): any {
 export function getQQBotLocalOpenClawEnv(extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const configPath = resolveLocalOpenClawConfigPath();
   const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || path.dirname(configPath);
+  const openClawScript = resolveLocalOpenClawScript(stateDir);
   return {
     ...process.env,
     ...extraEnv,
     OPENCLAW_CONFIG_PATH: configPath,
     OPENCLAW_STATE_DIR: stateDir,
+    ...(openClawScript ? { OPENCLAW_SCRIPT: openClawScript } : {}),
   };
 }
 

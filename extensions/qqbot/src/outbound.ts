@@ -983,6 +983,37 @@ function trimDeliveryText(text: string, limit = MAX_DYNAMIC_PROMISE_TEXT_CHARS):
   return `${cleaned.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
+function isAllowedProactiveAudioPayload(text: string): boolean {
+  const parsed = parseQQBotPayload(text);
+  return Boolean(parsed.isPayload && parsed.payload && isMediaPayload(parsed.payload) && parsed.payload.mediaType === "audio");
+}
+
+function normalizeGeneratedDeliveryText(text: string): string {
+  const normalized = normalizeMediaTags(text).trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
+  if (!normalized) return "";
+  if (isAllowedProactiveAudioPayload(normalized)) return normalized;
+  return trimDeliveryText(normalized);
+}
+
+function isFilteredGeneratedDeliveryText(text: string, promptTimeZone: string): boolean {
+  if (isAllowedProactiveAudioPayload(text)) return false;
+  return looksLikeInternalDeliveryLeak(text) || containsUnsupportedCronMarkup(text) || isTimeContradictoryDeliveryText(text, promptTimeZone);
+}
+
+function buildProactiveVoiceDeliveryRules(): string[] {
+  const ttsConfigured = Boolean(resolveTTSConfig(loadOpenClawConfig() ?? {}));
+  if (!ttsConfigured) {
+    return ["当前未配置 TTS；主动消息只能发自然文字，不要承诺语音。"];
+  }
+  return [
+    "主动消息可以像普通回复一样自行判断文字或语音；如果这一刻更适合让对方听见你的声音，可以输出 QQBOT_PAYLOAD audio 载荷。",
+    "语音载荷格式: QQBOT_PAYLOAD: {\"type\":\"media\",\"mediaType\":\"audio\",\"source\":\"file\",\"path\":\"要朗读的短文本\",\"caption\":\"可选短文字\",\"tts\":{\"emotion\":\"soft\",\"pause\":\"normal\",\"speed\":0.95,\"pitch\":0,\"vol\":1,\"languageBoost\":\"Chinese\"}}",
+    "path 字段同普通回复规则：全角圆括号（...）里的动作/旁白作为文字分段发送，括号外的话语才转语音；不要把旁白裸写进朗读句子。",
+    "语音里需要停顿或语气词时，可以少量使用 <#0.4#> 和日文角括号标记，如 「breath」「sighs」「emm」；不要直接写半角圆括号 TTS 标记。",
+    "如果使用 QQBOT_PAYLOAD audio，只输出这一段结构化载荷和必要的括号旁白/短 caption，不要解释规则。",
+  ];
+}
+
 function loadAsukaVisualIdentityAnchor(): string {
   if (asukaVisualIdentityAnchorCache !== undefined) {
     return asukaVisualIdentityAnchorCache;
@@ -1644,7 +1675,8 @@ function buildPromiseDeliveryPrompt(
     "",
     "【生成任务】",
     "你现在不是在写提醒模板，而是在当前对话上下文里，以 Asuka 的口吻顺着前文自然发出这一句。",
-    "只输出最终可发送的正文，不要解释，不要加引号，不要出现 QQBOT_PAYLOAD、QQBOT_CRON、系统、定时、提醒、任务、状态、脚本、接口这些词。",
+    "只输出最终可发送的正文，不要解释，不要加引号，不要出现 QQBOT_CRON、系统、定时、提醒、任务、状态、脚本、接口这些词。",
+    ...buildProactiveVoiceDeliveryRules(),
     "把这次发送当成一次正常续聊，不要复读固定句型，也不要机械强调“我是按约定来的”。",
     "控制在 1 到 3 句内，简洁一点，但要有温度，像正在真实聊天。",
     "必须让动作、称呼和场景匹配当前本地时间；当前是上午或白天时，不要写睡前、今晚、关灯、洗澡擦头发、明天早上叫你等夜间或未来早晨场景，除非最近对话明确正在夜间。",
@@ -1690,8 +1722,9 @@ function buildSharedSessionDeliveryPrompt(
     `当前本地时间：${currentLocalTime}`,
     "这不是用户刚发来的新消息，而是需要你在当前这条会话里主动自然续上一句。",
     "请把它当成和刚才同一段聊天，延续现有语气、关系和话题，不要另起炉灶。",
-    "只输出最终要发给用户的正文，不要解释，不要加引号，不要出现系统、提醒、任务、脚本、接口、工具、QQBOT_PAYLOAD、QQBOT_CRON 这些词。",
-    "不要调用工具，不要输出 <qqimg>、<qqvoice>、<qqvideo>、<qqfile> 这类媒体标签。",
+    "只输出最终要发给用户的正文，不要解释，不要加引号，不要出现系统、提醒、任务、脚本、接口、工具、QQBOT_CRON 这些词。",
+    "不要调用工具，不要输出 <qqimg>、<qqvoice>、<qqvideo>、<qqfile> 这类媒体标签；如果判断适合语音，只允许使用 QQBOT_PAYLOAD audio 载荷。",
+    ...buildProactiveVoiceDeliveryRules(),
     "控制在 1 到 3 句内，像真实聊天，不要模板化。",
     "必须让场景动作匹配当前本地时间；不要只按旧承诺里的晚安、睡觉、明天早上重演旧夜间场景。",
     "当前是上午或白天时，避免写睡了吗、今晚、关灯、洗完澡、擦头发、明天早上叫你等夜间或未来早晨措辞，除非最近对话明确刚发生在夜间。",
@@ -1839,7 +1872,7 @@ async function renderDeliveryTextFromSharedSession(
         "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
       ],
       prompt,
-      160,
+      520,
     );
     const detail = await response.text();
     if (!response.ok) {
@@ -1849,8 +1882,8 @@ async function renderDeliveryTextFromSharedSession(
 
     const parsed = JSON.parse(detail);
     const latestText = extractAssistantTextFromTextGeneration(generationConfig, parsed);
-    const normalized = trimDeliveryText(normalizeMediaTags(latestText));
-    if (!normalized || looksLikeInternalDeliveryLeak(normalized) || containsUnsupportedCronMarkup(normalized) || isTimeContradictoryDeliveryText(normalized, promptTimeZone)) {
+    const normalized = normalizeGeneratedDeliveryText(latestText);
+    if (!normalized || isFilteredGeneratedDeliveryText(normalized, promptTimeZone)) {
       console.warn(
         `[qqbot] renderDeliveryTextFromSharedSession: filtered generated text latest="${latestText.slice(0, 160)}" normalized="${normalized.slice(0, 160)}"`
       );
@@ -1893,7 +1926,7 @@ async function renderPromiseDeliveryText(
         `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
       ],
       prompt,
-      160,
+      520,
     );
     const detail = await response.text();
     if (!response.ok) {
@@ -1902,8 +1935,8 @@ async function renderPromiseDeliveryText(
     }
 
     const parsed = JSON.parse(detail);
-    const rendered = trimDeliveryText(normalizeMediaTags(extractAssistantTextFromTextGeneration(generationConfig, parsed)));
-    if (!rendered || looksLikeInternalDeliveryLeak(rendered) || containsUnsupportedCronMarkup(rendered) || isTimeContradictoryDeliveryText(rendered, promptTimeZone)) {
+    const rendered = normalizeGeneratedDeliveryText(extractAssistantTextFromTextGeneration(generationConfig, parsed));
+    if (!rendered || isFilteredGeneratedDeliveryText(rendered, promptTimeZone)) {
       return fallbackText;
     }
     return rendered;
@@ -3367,7 +3400,13 @@ export async function sendCronMessage(
       console.log(`[${timestamp}] [qqbot] sendCronMessage: sending proactive message to targetTo=${targetTo}`);
       
       // 发送提醒内容
-      const result = await sendProactiveMessage(account, targetTo, deliveryText || payload.content);
+      const result = await sendText({
+        account,
+        accountId: account.accountId,
+        to: targetTo,
+        text: deliveryText || payload.content,
+        replyToId: null,
+      });
       if (result.skipped) {
         console.log(
           `[${timestamp}] [qqbot] sendCronMessage: proactive message skipped, skipReason=${result.skipReason ?? "duplicate"}`
