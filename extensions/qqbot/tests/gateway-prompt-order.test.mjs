@@ -297,8 +297,13 @@ assert.ok(trailingDashInstructionIndex >= 0, "gateway should add a model-facing 
 const trailingDashInstruction = source.slice(trailingDashInstructionIndex, trailingDashInstructionIndex + 900);
 assert.match(
   trailingDashInstruction,
-  /不要说“我去拍一张，等我一下”[\s\S]{0,900}QQBOT_PAYLOAD selfie[\s\S]{0,120}不能只输出载荷/,
-  "trailing dash selfie trigger should instruct the model to generate visible text plus a selfie payload"
+  /不要说“我去拍一张，等我一下”[\s\S]{0,900}只输出一段自然[\s\S]{0,900}文本发送后[\s\S]{0,900}刚刚生成的可见回复生成图片 prompt/,
+  "trailing dash selfie trigger should make the model generate normal text before the post-reply image prompt stage"
+);
+assert.doesNotMatch(
+  trailingDashInstruction,
+  /QQBOT_PAYLOAD selfie/,
+  "trailing dash selfie trigger should not ask the main reply model to produce the image payload"
 );
 assert.match(
   trailingDashInstruction,
@@ -336,8 +341,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const selfieVisibleText = resolveSelfieVisiblePayloadText\([\s\S]{0,420}parsedPayload\.caption[\s\S]{0,420}await sendVisibleReplyText\(selfieVisibleText\)[\s\S]{0,700}dedupeCaptionAgainstVisibleText\(selfieVisibleText, parsedPayload\.caption\)/,
-  "selfie payload should send visible text separately and avoid duplicating it as the image caption"
+  /const selfieVisibleText = resolveSelfieVisiblePayloadText\([\s\S]{0,420}parsedPayload\.caption[\s\S]{0,420}await sendVisibleReplyText\(selfieVisibleText\)[\s\S]{0,700}buildDirectSelfiePromptFromContext\([\s\S]{0,180}selfieVisibleText[\s\S]{0,420}runDirectSelfieFlow\(selfiePrompt,\s*\{\s*background:\s*true\s*\}\)/,
+  "selfie payload should send visible text first, then build the image prompt from that sent reply"
 );
 const directSelfiePromptBuilderIndex = source.indexOf("function buildDirectSelfiePromptFromContext");
 assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct selfie prompt builder");
@@ -403,8 +408,13 @@ assert.match(
 );
 assert.match(
   source,
-  /Forced trailing-dash image turn produced no selfie payload[\s\S]{0,900}sendVisibleReplyText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
-  "forced trailing-dash image turns should still generate an image when the model replies with plain text only"
+  /Forced trailing-dash image turn produced normal text[\s\S]{0,900}sendVisibleReplyText[\s\S]{0,900}Building post-reply image prompt[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
+  "forced trailing-dash image turns should generate the image prompt after the visible reply is sent"
+);
+assert.match(
+  source,
+  /Sending generated selfie image[\s\S]{0,420}sendC2CImageMessage\(token,\s*event\.senderId,\s*imageUrl,\s*event\.messageId,\s*undefined\)/,
+  "generated selfie images should be sent without repeating the visible reply as image content"
 );
 assert.match(
   source,
