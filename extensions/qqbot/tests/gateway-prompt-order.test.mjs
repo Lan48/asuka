@@ -77,7 +77,7 @@ assert.equal(
 );
 assert.match(
   source,
-  /No response within timeout[\s\S]{0,500}sendErrorMessage/,
+  /No response within timeout[\s\S]{0,2000}sendErrorMessage/,
   "QQBot response timeout should send a user-facing fallback"
 );
 assert.equal(
@@ -326,6 +326,45 @@ assert.match(
   directSelfiePromptBuilder,
   /formatSelfiePromptContextSection\("最近一周对话", context\.recentChatTranscript[\s\S]{0,520}formatSelfiePromptContextSection\("关系与场景状态", context\.asukaStatePrompt[\s\S]{0,520}formatSelfiePromptContextSection\("会话摘要", context\.asukaConversationDigestPrompt[\s\S]{0,760}formatSelfiePromptContextSection\("当前轮次", context\.currentTurnContext/,
   "direct selfie prompt should serialize conversation transcript, state, digest, and current turn sections"
+);
+const visualAnchorIndex = source.indexOf("function loadAsukaVisualIdentityAnchor");
+assert.ok(visualAnchorIndex >= 0, "gateway should define a visual identity anchor loader");
+const visualAnchorSnippet = source.slice(visualAnchorIndex, visualAnchorIndex + 2800);
+assert.ok(
+  visualAnchorSnippet.includes("collectBulletBlocks") && visualAnchorSnippet.includes("/^\\s{2,}\\S/"),
+  "gateway visual identity loader should parse multiline markdown bullets, body descriptors, and prose appearance lines"
+);
+assert.ok(
+  visualAnchorSnippet.includes('path.resolve(process.cwd(), "workspace/IDENTITY.md")') &&
+    visualAnchorSnippet.includes('path.resolve(__dirname, "../../../../workspace/IDENTITY.md")'),
+  "gateway visual identity loader should find workspace files from project cwd and compiled dist/src"
+);
+assert.match(
+  visualAnchorSnippet,
+  /Body[\s\S]{0,900}Her\|Your[\s\S]{0,900}figure\|curves\|bust\|skin/,
+  "gateway visual identity loader should include body descriptors and prose appearance lines"
+);
+const outboundVisualAnchorIndex = outboundSource.indexOf("function loadAsukaVisualIdentityAnchor");
+assert.ok(outboundVisualAnchorIndex >= 0, "outbound should define a visual identity anchor loader");
+const outboundVisualAnchorSnippet = outboundSource.slice(outboundVisualAnchorIndex, outboundVisualAnchorIndex + 2800);
+assert.ok(
+  outboundVisualAnchorSnippet.includes("collectBulletBlocks") && outboundVisualAnchorSnippet.includes("/^\\s{2,}\\S/"),
+  "cron selfie visual identity loader should parse multiline markdown bullets"
+);
+assert.ok(
+  outboundVisualAnchorSnippet.includes('path.resolve(process.cwd(), "workspace/IDENTITY.md")') &&
+    outboundVisualAnchorSnippet.includes('path.resolve(__dirname, "../../../../workspace/IDENTITY.md")'),
+  "cron selfie visual identity loader should find workspace files from project cwd and compiled dist/src"
+);
+assert.match(
+  outboundVisualAnchorSnippet,
+  /Body[\s\S]{0,900}Her\|Your[\s\S]{0,900}figure\|curves\|bust\|skin/,
+  "cron selfie visual identity loader should match direct message behavior"
+);
+assert.match(
+  source,
+  /No response within timeout[\s\S]{0,900}forceSelfieFromTrailingDash[\s\S]{0,900}resolveSelfieVisiblePayloadText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
+  "trailing dash selfie requests should fall back to visible text plus selfie generation when the model turn times out"
 );
 assert.match(
   outboundSource,

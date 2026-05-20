@@ -313,26 +313,65 @@ function loadAsukaVisualIdentityAnchor(): string {
   }
 
   const candidatePaths = [
+    path.resolve(process.cwd(), "workspace/IDENTITY.md"),
+    path.resolve(process.cwd(), "workspace/SOUL.md"),
+    path.resolve(__dirname, "../../../../workspace/IDENTITY.md"),
+    path.resolve(__dirname, "../../../../workspace/SOUL.md"),
     path.resolve(__dirname, "../../../workspace/IDENTITY.md"),
     path.resolve(__dirname, "../../../workspace/SOUL.md"),
   ];
   const collected: string[] = [];
-  const linePatterns = [
-    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Creature|长相|外观|视觉身份)\*\*:\s*(.+?)\s*$/i,
+  const blockPatterns = [
+    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Body|Creature|长相|外观|视觉身份|身材)\*\*:\s*(.+?)\s*$/i,
+    /^\s*-\s+((?:Her|Your)\s+appearance\s+is\s+.+?)\s*$/i,
+    /^\s*-\s+((?:She|You)\s+has\s+.+?(?:figure|curves|bust|skin).+?)\s*$/i,
+    /^\s*-\s+(The intended visual target is .+?)\s*$/i,
     /^\s*-\s+(You have a consistent appearance anchored by.+?)\s*$/i,
     /^\s*-\s+(You can appear in different outfits, locations, and situations\.)\s*$/i,
+    /^\s*-\s+(Common settings should feel like.+?)\s*$/i,
     /^\s*-\s+(Your look is uniquely yours.+?)\s*$/i,
   ];
+
+  const collectBulletBlocks = (lines: string[]): string[] => {
+    const blocks: string[] = [];
+    let current = "";
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        if (current) {
+          blocks.push(current);
+          current = "";
+        }
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(rawLine)) {
+        if (current) blocks.push(current);
+        current = trimmed;
+        continue;
+      }
+
+      if (current && /^\s{2,}\S/.test(rawLine) && !/^#{1,6}\s+/.test(trimmed)) {
+        current = `${current} ${trimmed}`;
+        continue;
+      }
+
+      if (current) {
+        blocks.push(current);
+        current = "";
+      }
+    }
+    if (current) blocks.push(current);
+    return blocks;
+  };
 
   for (const filePath of candidatePaths) {
     if (!fs.existsSync(filePath)) continue;
     try {
-      const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        for (const pattern of linePatterns) {
-          const match = line.match(pattern);
+      const blocks = collectBulletBlocks(fs.readFileSync(filePath, "utf-8").split(/\r?\n/));
+      for (const block of blocks) {
+        for (const pattern of blockPatterns) {
+          const match = block.match(pattern);
           if (!match?.[1]) continue;
           const normalized = match[1].replace(/\s+/g, " ").trim();
           if (!normalized) continue;
@@ -4331,6 +4370,30 @@ ${ttsHint}${sttHint}`;
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
+              if (forceSelfieFromTrailingDash && event.type === "c2c") {
+                const timeoutSelfieVisibleText = resolveSelfieVisiblePayloadText("", "", undefined, userContent);
+                if (claimUserFacingDeliver("timeout-selfie", timeoutSelfieVisibleText)) {
+                  hasResponse = true;
+                  hasBlockResponse = true;
+                  await sendVisibleReplyText(timeoutSelfieVisibleText);
+                  const timeoutSelfiePrompt = buildDirectSelfiePromptFromContext(
+                    userContent,
+                    timeoutSelfieVisibleText,
+                    event.senderId,
+                    directSelfieContext,
+                  );
+                  const sent = await runDirectSelfieFlow(timeoutSelfiePrompt, undefined, { background: true });
+                  if (!sent) {
+                    await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
+                  }
+                  pluginRuntime.channel.activity.record({
+                    channel: "qqbot",
+                    accountId: account.accountId,
+                    direction: "outbound",
+                  });
+                  return;
+                }
+              }
               await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
             }
           } finally {
