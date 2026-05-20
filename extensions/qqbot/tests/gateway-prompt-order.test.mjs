@@ -4,6 +4,8 @@ import path from "node:path";
 
 const source = fs.readFileSync(path.join(process.cwd(), "src", "gateway.ts"), "utf-8");
 const outboundSource = fs.readFileSync(path.join(process.cwd(), "src", "outbound.ts"), "utf-8");
+const configSource = fs.readFileSync(path.join(process.cwd(), "src", "config.ts"), "utf-8");
+const imageGenerationSource = fs.readFileSync(path.join(process.cwd(), "src", "utils", "openclaw-image-generation.ts"), "utf-8");
 
 const stableIndex = source.indexOf("const stablePromptSections");
 const dynamicIndex = source.indexOf("const dynamicContextSections");
@@ -28,6 +30,21 @@ assert.match(
   outboundSource,
   /fileURLToPath\(import\.meta\.url\)/,
   "proactive outbound sends should define an ESM-safe module directory before resolving bundled files"
+);
+assert.match(
+  configSource,
+  /stateDir,\s*"\.\.",\s*"\.\.",\s*"tools",\s*"node_modules",\s*"openclaw",\s*"openclaw\.mjs"/,
+  "runtime config should find the host OpenClaw CLI from a nested .openclaw state dir"
+);
+assert.match(
+  imageGenerationSource,
+  /stateDir,\s*"\.\.",\s*"\.\.",\s*"tools",\s*"node_modules",\s*"openclaw",\s*IMAGE_RUNTIME_MODULE_RELATIVE/,
+  "image generation should prefer the host OpenClaw runtime before bundled plugin dependencies"
+);
+assert.match(
+  imageGenerationSource,
+  /execOpenClaw\(args,[\s\S]{0,120}env: getQQBotLocalOpenClawEnv\(\)/,
+  "image generation CLI fallback should run with the resolved local OpenClaw environment"
 );
 assert.ok(
   source.includes("优先用自然口语里的“我/你/我们”"),

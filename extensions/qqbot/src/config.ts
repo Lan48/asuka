@@ -42,7 +42,9 @@ function resolveLocalOpenClawScript(stateDir: string): string | undefined {
   const candidates = [
     path.resolve(stateDir, "lib", "node_modules", "openclaw", "openclaw.mjs"),
     path.resolve(stateDir, "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
     path.resolve(MODULE_DIR, "../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../../tools/node_modules/openclaw/openclaw.mjs"),
   ];
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
@@ -64,7 +66,7 @@ function loadLocalOpenClawConfig(): any {
   for (const configPath of candidatePaths) {
     if (!fs.existsSync(configPath)) continue;
     try {
-      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8").replace(/^\uFEFF/, ""));
       return localOpenClawConfigCache;
     } catch {
       // ignore malformed optional config path and keep searching

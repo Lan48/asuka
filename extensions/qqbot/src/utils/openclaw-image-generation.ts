@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { getQQBotLocalOpenClawEnv } from "../config.js";
 import { execOpenClaw } from "./openclaw-command.js";
 
 type OpenClawConfigLike = Record<string, any>;
@@ -150,6 +151,8 @@ function candidateRuntimeModulePaths(): string[] {
   for (const stateDir of stateDirs) {
     candidates.push(path.join(stateDir, "tools", "node-v22.22.0", "lib", "node_modules", "openclaw", IMAGE_RUNTIME_MODULE_RELATIVE));
     candidates.push(path.join(stateDir, "lib", "node_modules", "openclaw", IMAGE_RUNTIME_MODULE_RELATIVE));
+    candidates.push(path.join(stateDir, "..", "tools", "node_modules", "openclaw", IMAGE_RUNTIME_MODULE_RELATIVE));
+    candidates.push(path.join(stateDir, "..", "..", "tools", "node_modules", "openclaw", IMAGE_RUNTIME_MODULE_RELATIVE));
   }
 
   return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
@@ -158,13 +161,6 @@ function candidateRuntimeModulePaths(): string[] {
 async function loadRuntimeModule(): Promise<GenerateImageRuntimeModule | null> {
   if (!cachedRuntimeModule) {
     cachedRuntimeModule = (async () => {
-      try {
-        const mod = await dynamicImport("openclaw/dist/plugin-sdk/image-generation-runtime.js");
-        if (typeof mod?.generateImage === "function") return mod as GenerateImageRuntimeModule;
-      } catch {
-        // Fall through to absolute-path discovery for installations where the extension peer is older.
-      }
-
       for (const candidate of candidateRuntimeModulePaths()) {
         if (!fs.existsSync(candidate)) continue;
         try {
@@ -173,6 +169,13 @@ async function loadRuntimeModule(): Promise<GenerateImageRuntimeModule | null> {
         } catch {
           // Keep trying the next known OpenClaw installation.
         }
+      }
+
+      try {
+        const mod = await dynamicImport("openclaw/dist/plugin-sdk/image-generation-runtime.js");
+        if (typeof mod?.generateImage === "function") return mod as GenerateImageRuntimeModule;
+      } catch {
+        // No compatible runtime found through package resolution either.
       }
       return null;
     })();
@@ -228,7 +231,7 @@ async function generateWithCli(options: OfficialOpenClawImageOptions, modelRef: 
       "--json",
     ];
     await execOpenClaw(args, {
-      env: process.env,
+      env: getQQBotLocalOpenClawEnv(),
       maxBuffer: 10 * 1024 * 1024,
       timeout: 240_000,
     });
