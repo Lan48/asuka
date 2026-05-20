@@ -90,6 +90,21 @@ assert.equal(
   false,
   "QQBot fallbacks should not mention suppressed internal errors"
 );
+assert.equal(
+  source.includes("我在。刚才那句没接稳，我重新接你。"),
+  false,
+  "QQBot fallbacks should not train repeated repair catchphrases into conversation context"
+);
+assert.match(
+  source,
+  /const responseTimeout = forceSelfieFromTrailingDash \? 20 \* 60 \* 1000 : 5 \* 60 \* 1000/,
+  "normal replies should wait long enough to avoid premature timeout fallbacks during compaction/model latency"
+);
+assert.match(
+  source,
+  /if \(!meta\.mediaType && looksLikeTransportFallbackText\(String\(meta\.text \|\| ""\)\)\)[\s\S]{0,180}Skipped caching transport fallback refIdx/,
+  "transport fallbacks should not be cached as recent conversation context"
+);
 assert.match(
   source,
   /parsedPayload\.mediaType === "audio"[\s\S]{0,300}const ttsText = parsedPayload\.path/,
@@ -373,8 +388,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const responseTimeout = forceSelfieFromTrailingDash \? 20 \* 60 \* 1000 : 120000/,
-  "trailing dash image requests should wait up to 20 minutes for the model to produce natural visible text plus image payload"
+  /const responseTimeout = forceSelfieFromTrailingDash \? 20 \* 60 \* 1000 : 5 \* 60 \* 1000/,
+  "trailing dash image requests should wait up to 20 minutes and normal replies should avoid premature fallback"
 );
 assert.match(
   source,

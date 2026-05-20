@@ -68,12 +68,12 @@ try {
   assert.ok(repair, "repair payload should exist for a schedule-failed promise");
   assert.equal(repair.promiseId, failedPromise.id, "repair should target the failed promise");
   assert.equal(repair.advancePolicy, "hold", "repair should hold scene advancement");
-  assert.match(repair.content, /没接住|补/, "repair content should acknowledge the miss lightly");
+  assert.match(repair.content, /落空|补|答应/, "repair content should acknowledge the miss lightly");
   const ambientRepair = prepareAmbientLifePayload(repairContext, base + 2_000);
   assert.equal(ambientRepair.mode, "repair", "ambient payload should directly surface repair candidates");
   assert.equal(ambientRepair.promiseId, failedPromise.id, "ambient repair should keep the promise id");
   assert.equal(ambientRepair.advancePolicy, "hold", "ambient repair should hold scene advancement");
-  assert.match(ambientRepair.content, /没接住|补/, "ambient repair content should stay repair-oriented");
+  assert.match(ambientRepair.content, /落空|补|答应/, "ambient repair content should stay repair-oriented");
 
   const followContext = directContext("user-follow-limit", "repair-m-2");
   const followPromise = createPromise(followContext, "拉钩，明天早上九点我来找你说早安。", 10_000);

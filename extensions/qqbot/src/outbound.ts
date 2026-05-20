@@ -1698,7 +1698,7 @@ function buildPromiseDeliveryPrompt(
   const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
   const recentContext = buildRecentConversationTranscript(payload.targetAddress, renderContext.peer?.lastUserText);
   const modeLabel = payload.mode === "repair"
-    ? "补做之前没接住的约定"
+    ? "补做之前落空的约定"
     : payload.mode === "followup"
       ? `追发第 ${payload.followUpAttempt ?? 1} 次`
       : "首次兑现约定";
@@ -1738,7 +1738,7 @@ function buildPromiseDeliveryPrompt(
     "必须让动作、称呼和场景匹配当前本地时间；当前是上午或白天时，不要写睡前、今晚、关灯、洗澡擦头发、明天早上叫你等夜间或未来早晨场景，除非最近对话明确正在夜间。",
     payload.mode === "followup" ? "这是追发，不要催促，只轻轻碰一下门，让对方感觉你还记着他。" : "",
     payload.mode === "followup" ? "追发只保留“还记得、不会催你”的意图，不要重新创造和当前时间冲突的新物理场景。" : "",
-    payload.mode === "repair" ? "这是补做，要温柔承认前面没接住，再自然补回来，不要生硬道歉。": "",
+    payload.mode === "repair" ? "这是补做，要温柔承认前面的约定落空了，再自然补回来，不要生硬道歉。": "",
     renderContext.promise.action.deliveryKind === "selfie" ? "如果这是图片配文，要像把图一起带到对方面前，不要写成操作说明。" : "",
     deliveryShape,
     `当前场景：${modeLabel}`,
@@ -1789,7 +1789,7 @@ function buildSharedSessionDeliveryPrompt(
 
   if (renderContext) {
     const modeLabel = payload.mode === "repair"
-      ? "补做之前没接住的约定"
+      ? "补做之前落空的约定"
       : payload.mode === "followup"
         ? `追发第 ${payload.followUpAttempt ?? 1} 次`
         : "首次兑现约定";
@@ -1803,7 +1803,7 @@ function buildSharedSessionDeliveryPrompt(
       ...sharedRules,
       payload.mode === "followup" ? "这是追发，只轻轻碰一下门，不要催，不要解释流程。" : "",
       payload.mode === "followup" ? "追发时只保留“还记得、不会催你”的意图，不要重新创造新的物理场景。" : "",
-      payload.mode === "repair" ? "这是补做，要温柔承认前面没接住，再自然补回来，不要生硬道歉。" : "",
+      payload.mode === "repair" ? "这是补做，要温柔承认前面的约定落空了，再自然补回来，不要生硬道歉。" : "",
       renderContext.promise.action.deliveryKind === "selfie" ? "如果这是图片配文，只写和图片一起到对方面前的那一小句，不要写成操作说明。" : "",
       `当前场景：${modeLabel}`,
       `动作：${renderContext.promise.action.summary}`,
@@ -1820,7 +1820,7 @@ function buildSharedSessionDeliveryPrompt(
   const modeLabel = payload.mode === "ambient"
     ? "主动找对方说一句"
     : payload.mode === "repair"
-      ? "把前面没接住的话补回来"
+      ? "把前面落空的约定补回来"
       : "自然续聊";
   return [
     "你正在通过 QQ 与用户对话。",
@@ -3483,7 +3483,7 @@ export async function sendCronMessage(
             stage: payload.ambientStage,
             advancePolicy,
             presenceOverride: payload.mode === "repair"
-              ? "你把前面没接住的话补回来以后，心里还是会轻轻惦记着对方。"
+              ? "你把前面落空的约定补回来以后，心里还是会轻轻惦记着对方。"
               : undefined,
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
@@ -3536,7 +3536,7 @@ export async function sendCronMessage(
             stage: payload.ambientStage,
             advancePolicy,
             presenceOverride: payload.mode === "repair"
-              ? "你把前面没接住的话补回来以后，心里还是会轻轻惦记着对方。"
+              ? "你把前面落空的约定补回来以后，心里还是会轻轻惦记着对方。"
               : undefined,
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,

@@ -733,7 +733,7 @@ function describeAttention(attention: "self_thread" | "pull_close" | "miss_you" 
     case "miss_you":
       return "有点想念，想主动去见一眼";
     case "repair":
-      return "前面没接稳的那句还挂在心里，想先哄回来";
+      return "前面答应过的事还挂在心里，想先补回来";
     default:
       return "想把自己的当下先放到你面前";
   }
@@ -803,7 +803,7 @@ function sceneSummaryForLabel(label: AsukaSceneLabel): string {
     case "miss_you":
       return "安静下来以后还是会先想到你，心里带着一点想念。";
     case "repair_attention":
-      return "前面没接稳的那句还挂在心里，你会更想先把关系哄稳。";
+      return "前面答应过的事还挂在心里，你会更想先把关系安稳地补回来。";
     default:
       return "这会儿更像是把情绪和惦记轻轻放到你面前。";
   }
@@ -1766,7 +1766,7 @@ function getRepairCandidates(state: AsukaStateFile, peerKey: string, now = Date.
 function buildRepairMessage(promise: AsukaPromise): string {
   const text = promise.promiseText;
   if (/继续聊|接着聊|续上|接上/.test(text)) {
-    return "我把前面没接住的话捡回来了。上次答应你要把它续上，是我没有接稳，这次我先把它补回来。";
+    return "我把前面答应要续上的话补回来了。上次说好要接着聊，这次我先把它落下来。";
   }
   if (/早安|早上好/.test(text)) {
     return "这句早安我还是想补给你。前面答应过会来找你，是我没按时把它送到你面前。";
@@ -1775,9 +1775,9 @@ function buildRepairMessage(promise: AsukaPromise): string {
     return "这句晚安我还是想补给你。之前答应过你的，是我没有按时落下来。";
   }
   if (/找你|陪你|想你/.test(text)) {
-    return "我来把前面没接住的那句补回来。之前答应过要来找你，这次不想再让它空着。";
+    return "我来把前面答应过的那句补回来。之前说过要来找你，这次不想再让它空着。";
   }
-  return "我来把前面没接住的那句补回来。既然答应过你，我就不想装作什么都没发生。";
+  return "我来把前面答应过的那句补回来。既然答应过你，我就不想装作什么都没发生。";
 }
 
 function buildRepairSelfiePrompt(promise: AsukaPromise): string {
@@ -1831,7 +1831,7 @@ function deriveAmbientDisposition(
     return {
       mood: "restless",
       attention: "repair",
-      presence: "你心里还记着那件没接稳的事，所以会更想先把人哄回来，再把话接住。",
+      presence: "你心里还记着那件答应过的事，所以会更想先把人哄回来，再把话补上。",
       relationshipPhase: phase,
       firstDelayHours: 1,
       secondDelayHours: 2,
@@ -2218,11 +2218,11 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
   }
   if (repairCandidates.length > 0) {
     sections.push(`- 你需要温柔补上的失约: ${repairCandidates.slice(0, 2).map((item) => normalizePromptPerspective(item.promiseText)).join("；")}`);
-    sections.push("- 补做口吻: 先承认自己没接住，再把答应的话补上；语气要温柔，不要像提醒系统，也不要装作没发生。");
+    sections.push("- 补做口吻: 先承认前面的约定落空了，再把答应的话补上；语气要温柔，不要像提醒系统，也不要装作没发生。");
   }
 
   sections.push("- 回复原则: 如果你之前拉钩、约定、约好了或发誓过，就把它当成真的后续约束；不要把这些话当成气氛词。");
-  sections.push("- 如果有到点却未确认的约定，优先自然续上，必要时温柔承认自己没接住。");
+  sections.push("- 如果有到点却未确认的约定，优先自然续上，必要时温柔承认前面没有按时做到。");
   sections.push("- 如果你这轮换了动作、问题或语气，就顺着新的变化继续往前接，不要只把你上一句原样再说一遍。");
   sections.push("- 你最近留下的生活线痕迹只算背景，不要让旧线索盖过这轮对话、关系状态和需要补上的约定。");
   sections.push("- 时间原则: 以当前本地时间为准；旧时段的动作旁白只能当作已经发生过的背景，不要继续表演还停留在那里。");
@@ -2410,7 +2410,7 @@ export function prepareAmbientLifePayload(context: AsukaPeerContext, guardNoRepl
     // conversation. Keep only a minimal neutral seed here so no old topic line
     // can leak from ambient scheduling into the final message.
     content: disposition.attention === "repair"
-      ? "前面那点没接住的话还在我心里。"
+      ? "前面那点空下来的约定还在我心里。"
       : disposition.attention === "miss_you"
         ? "我安静下来以后还是会先想到你。"
         : disposition.attention === "pull_close"
@@ -2447,7 +2447,7 @@ export function prepareRepairDelivery(
     threadId: peer.ambient.currentThreadId,
     stage: peer.ambient.currentStage,
     advancePolicy: "hold",
-    presenceOverride: "把前面没接住的话补回来以后，心里还是会一直惦记着你。",
+    presenceOverride: "把前面空下来的约定补回来以后，心里还是会一直惦记着你。",
     selfiePrompt: repairCandidate.deliveryKind === "selfie" ? buildRepairSelfiePrompt(repairCandidate) : undefined,
     selfieCaption: repairCandidate.deliveryKind === "selfie" ? "前面答应你的这张，我还是想补给你。" : undefined,
     sceneVersion: peer.scene?.version,

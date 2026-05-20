@@ -299,7 +299,7 @@ async function readLatestAssistantTextFromSessionTranscript(
         .join("\n\n")
         .trim();
       const visible = filterInternalMarkers(text);
-      if (visible) return visible;
+      if (visible && !looksLikeTransportFallbackText(visible) && !looksLikeInternalProcessLeak(visible)) return visible;
     }
   } catch (err) {
     log?.warn?.(`[qqbot] failed to read latest assistant transcript fallback: ${err}`);
@@ -427,12 +427,22 @@ function truncateForSelfiePrompt(text: string, maxChars: number): string {
 }
 
 function sanitizeSelfieContextText(text: string): string {
-  return text
+  const cleaned = text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
     .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(INTERNAL_PROCESS_LEAK_RE, "")
     .replace(/\s+/g, " ")
     .trim();
+  return looksLikeTransportFallbackText(cleaned) ? "" : cleaned;
+}
+
+function looksLikeTransportFallbackText(text: string): boolean {
+  const normalized = (text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+  return /^(?:我在[呢。,.， ]*)?(?:刚才那句|刚刚那句|这条回复|这次回复|图片这次|这张照片|自拍生成|语音生成|语音格式转换|网络连接异常|抱歉，.*发送失败|⚠️)/.test(normalized)
+    && /(没接稳|没落稳|说乱了|重新接|没有完整生成|没有生成出稳定回复|没有成功发出|生成失败|发送失败|稍后重试|再发一句|再试一次)/.test(normalized);
 }
 
 function buildRecentConversationContext(peerId: string, currentUserText: string): string {
@@ -716,33 +726,30 @@ function buildLeakRewriteFallback(userText: string, peerId: string): string {
   const cleanedUser = userText.trim().replace(/\s+/g, " ");
   const recentContext = buildRecentConversationContext(peerId, cleanedUser);
   if (/(自拍|照片|图片|发张图|看看你|你在干嘛|你在哪)/.test(cleanedUser)) {
-    return "我刚刚那句没落稳，这次我自己接住。你想看的那张，我会按刚才的语境认真带给你。";
+    return "好，我按当前语境给你发图。";
   }
   if (/[\?？]$/.test(cleanedUser) || /(吗|嘛|呢|是不是|能不能|可不可以|要不要)$/.test(cleanedUser)) {
     return recentContext
-      ? "我刚刚那句说得有点乱，我重新接你一下。你刚才提的这件事我在认真接着。"
-      : "我刚刚那句说乱了，我重新接你这句。";
+      ? "我明白你的意思。这件事我按刚才的语境继续说。"
+      : "我明白你的意思。";
   }
   return recentContext
-    ? "我刚刚那句没落稳，我自己重新说。还是接着我们刚才这段，不让它掉下去。"
-    : "我刚刚那句没落稳，我自己重新说。";
+    ? "嗯，我接着刚才这段继续。"
+    : "嗯，我在。";
 }
 
 function buildNaturalTimeoutFallbackText(userText: string): string {
   const cleanedUser = userText.trim().replace(/\s+/g, " ");
+  if (/(自拍|照片|图片|发张图|看看你|你在干嘛|你在哪|-$)/.test(cleanedUser)) {
+    return "图片这次没有成功发出。我已经保留当前上下文，你再发一次我会继续按这轮语境生成。";
+  }
   if (/(饿|饭|吃|面|菜|煮|厨房|晚饭|午饭|早饭|夜宵)/.test(cleanedUser)) {
-    return "我在。先不绕了，吃的这件事我接住，我们把晚饭定下来。";
+    return "这次回复没有完整生成。我已经保留当前上下文，你再发一句我会接着晚饭这件事继续。";
   }
   if (/(语音|声音|听你|说给我听)/.test(cleanedUser)) {
-    return "我在。刚才那句没落稳，我重新用声音接你。";
+    return "语音这次没有成功发出。我已经保留当前上下文，你再发一句我会继续。";
   }
-  if (/(抱|亲|贴|想你|陪我|难受|委屈|不开心|生气|烦)/.test(cleanedUser)) {
-    return "我在呢。刚才那句没接稳，但我没有走开，重新抱住你。";
-  }
-  if (/[?？]$/.test(cleanedUser)) {
-    return "我在。刚才那句没接稳，你这个问题我重新认真接。";
-  }
-  return "我在。刚才那句没接稳，我重新接你。";
+  return "这次回复没有完整生成。我已经保留当前上下文，你再发一句我会继续。";
 }
 
 function buildPersonaPromptForChat(isGroupChat: boolean): string {
@@ -1590,6 +1597,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   onMessageSent((refIdx, meta) => {
     const visibleTtsText = meta.ttsText ? cleanOutgoingTextSegment(meta.ttsText) : "";
     log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${visibleTtsText.slice(0, 30)}`);
+    if (!meta.mediaType && looksLikeTransportFallbackText(String(meta.text || ""))) {
+      log?.info(`[qqbot:${account.accountId}] Skipped caching transport fallback refIdx: ${refIdx}`);
+      return;
+    }
     const attachments: RefAttachmentSummary[] = [];
     if (meta.mediaType) {
       const localPath = meta.mediaLocalPath;
@@ -2948,7 +2959,7 @@ ${ttsHint}${sttHint}`;
           let toolDeliverCount = 0; // tool deliver 计数
           const toolTexts: string[] = []; // 收集所有 tool deliver 文本（用于格式化展示）
           let toolFallbackSent = false; // 兜底消息是否已发送（只发一次）
-          const responseTimeout = forceSelfieFromTrailingDash ? 20 * 60 * 1000 : 120000; // 生图轮次允许模型先生成自然回复和图片 payload
+          const responseTimeout = forceSelfieFromTrailingDash ? 20 * 60 * 1000 : 5 * 60 * 1000; // 生图轮次允许模型先生成自然回复和图片 payload；普通轮次给 compaction/model 足够时间，避免过早兜底
           const toolOnlyTimeout = 60000; // tool-only 兜底超时：60秒内没有 block 就兜底
           const maxToolRenewals = 3; // tool 续期上限：最多续期 3 次（总等待 = 60s × 3 = 180s）
           let toolRenewalCount = 0; // 已续期次数
