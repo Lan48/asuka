@@ -30,6 +30,7 @@ import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
+import { buildTimeAwareDeliveryFallback, isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
 import {
   generateOfficialOpenClawImageDataUrl,
@@ -2771,8 +2772,21 @@ ${ttsHint}${sttHint}`;
           }
         };
 
+        const resolveTimeSafeVisibleReplyText = (text: string, options?: { forceImage?: boolean }): string => {
+          const cleanedText = cleanOutgoingTextSegment(text);
+          const visibleText = isTimeContradictoryDeliveryText(cleanedText, getPromptTimeZone(account), Date.now())
+            ? buildTimeAwareDeliveryFallback(userContent, { forceImage: options?.forceImage ?? forceSelfieFromTrailingDash })
+            : cleanedText;
+          if (visibleText !== cleanedText) {
+            log?.info(
+              `[qqbot:${account.accountId}] Replaced time-contradictory visible reply: "${cleanedText.slice(0, 120)}" -> "${visibleText.slice(0, 120)}"`
+            );
+          }
+          return visibleText;
+        };
+
         const sendVisibleReplyText = async (text: string): Promise<boolean> => {
-          const visibleText = cleanOutgoingTextSegment(text);
+          const visibleText = resolveTimeSafeVisibleReplyText(text);
           if (!visibleText) {
             return false;
           }
@@ -4060,6 +4074,40 @@ ${ttsHint}${sttHint}`;
                       return;
                     }
                   }
+                }
+
+                if (forceSelfieFromTrailingDash && event.type === "c2c") {
+                  const selfieVisibleText = resolveSelfieVisiblePayloadText(
+                    replyText,
+                    stripStructuredPayloadForVisibleText(replyText),
+                    undefined,
+                    userContent,
+                  );
+                  const timeSafeSelfieVisibleText = resolveTimeSafeVisibleReplyText(selfieVisibleText, { forceImage: true });
+                  log?.info(
+                    `[qqbot:${account.accountId}] Forced trailing-dash image turn produced no selfie payload; running direct selfie fallback from normal reply`
+                  );
+                  await sendVisibleReplyText(timeSafeSelfieVisibleText);
+                  const selfiePrompt = buildDirectSelfiePromptFromContext(
+                    userContent,
+                    timeSafeSelfieVisibleText,
+                    event.senderId,
+                    directSelfieContext,
+                  );
+                  const selfieCaption = dedupeCaptionAgainstVisibleText(
+                    timeSafeSelfieVisibleText,
+                    extractSelfieCaptionFromAssistantText(timeSafeSelfieVisibleText),
+                  );
+                  const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
+                  if (!sent) {
+                    await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
+                  }
+                  pluginRuntime.channel.activity.record({
+                    channel: "qqbot",
+                    accountId: account.accountId,
+                    direction: "outbound",
+                  });
+                  return;
                 }
 
                 // ============ 非结构化消息：简化处理 ============

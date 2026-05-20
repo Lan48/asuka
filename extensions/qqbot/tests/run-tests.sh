@@ -20,6 +20,7 @@ node --check dist/src/utils/minimax-vision.js
 node --check dist/src/utils/minimax-search.js
 node --check dist/src/utils/narration-segments.js
 node --check dist/src/runtime-diagnostics.js
+node --check dist/src/utils/time-contradiction.js
 
 echo "[qqbot:test] behavior fixtures"
 node tests/asuka-media-caption.test.mjs
@@ -35,6 +36,7 @@ node tests/asuka-tts.test.mjs
 node tests/asuka-vision.test.mjs
 node tests/asuka-search.test.mjs
 node tests/asuka-time-context.test.mjs
+node tests/asuka-time-contradiction.test.mjs
 node tests/gateway-prompt-order.test.mjs
 node tests/message-buffer.test.mjs
 node tests/ref-index-store.test.mjs

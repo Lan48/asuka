@@ -194,7 +194,7 @@ assert.ok(
 );
 assert.match(
   source,
-  /const sendVisibleReplyText = async[\s\S]{0,160}cleanOutgoingTextSegment\(text\)/,
+  /const resolveTimeSafeVisibleReplyText = \(text: string[\s\S]{0,220}cleanOutgoingTextSegment\(text\)/,
   "visible text sends should strip internal markers at the final send boundary"
 );
 assert.match(
@@ -395,6 +395,21 @@ assert.match(
   source,
   /No response within timeout[\s\S]{0,900}forceSelfieFromTrailingDash[\s\S]{0,900}resolveSelfieVisiblePayloadText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
   "trailing dash selfie requests should fall back to visible text plus selfie generation when the model turn times out"
+);
+assert.match(
+  source,
+  /resolveTimeSafeVisibleReplyText[\s\S]{0,800}isTimeContradictoryDeliveryText[\s\S]{0,800}buildTimeAwareDeliveryFallback/,
+  "ordinary visible reply sends should pass through time-contradiction filtering at the final send boundary"
+);
+assert.match(
+  source,
+  /Forced trailing-dash image turn produced no selfie payload[\s\S]{0,900}sendVisibleReplyText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
+  "forced trailing-dash image turns should still generate an image when the model replies with plain text only"
+);
+assert.match(
+  source,
+  /resolveTimeSafeVisibleReplyText\(selfieVisibleText,\s*\{\s*forceImage:\s*true\s*\}\)/,
+  "forced image plain-text fallback should use image-oriented time-safe visible text"
 );
 assert.match(
   outboundSource,

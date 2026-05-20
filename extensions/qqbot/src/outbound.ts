@@ -38,6 +38,7 @@ import type { QQBotProactiveQuietHours } from "./types.js";
 import { isAsukaNarrationSegment, splitAsukaNarrationSegments } from "./utils/narration-segments.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
+import { isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
 import {
@@ -1172,18 +1173,6 @@ function formatConversationClock(date: Date): string {
 
 function getPromptTimeZone(account: ResolvedQQBotAccount): string {
   return getNormalizedProactiveQuietHours(account)?.timezone ?? "Asia/Shanghai";
-}
-
-const DAYTIME_NIGHT_SCENE_RE = /(睡了吗|睡了没|睡前|睡觉|睡吧|晚安|今晚|晚上见|关灯|做个好梦|洗完澡|擦头发|准备睡|明天早上叫你|明早叫你)/;
-const LATE_MORNING_WAKE_SCENE_RE = /(刚醒|刚睡醒|刚醒没多久|被窝|窝在被子|床上|枕头|早上好|醒了[？?]|……早[。！!，,]?)/;
-
-function isTimeContradictoryDeliveryText(text: string, timeZone = "Asia/Shanghai", timestampMs = Date.now()): boolean {
-  const hour = normalizePromptHour(getZonedDateParts(new Date(timestampMs), timeZone).hour);
-  if (hour >= 8 && hour < 18) {
-    if (DAYTIME_NIGHT_SCENE_RE.test(text)) return true;
-    if (hour >= 10 && LATE_MORNING_WAKE_SCENE_RE.test(text)) return true;
-  }
-  return false;
 }
 
 function isSameLocalDay(a: Date, b: Date): boolean {
