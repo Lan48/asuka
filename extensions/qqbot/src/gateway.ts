@@ -590,12 +590,19 @@ function buildDirectSelfiePromptFromContext(
   );
 }
 
+const SELFIE_TRAILING_DASH_RE = /[\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d]$/u;
+const SELFIE_TRAILING_IGNORABLE_RE = /[\s\u200b\u200c\u200d\ufeff\u2060]+$/u;
+
+function trimSelfieTriggerTail(content: string): string {
+  return content.replace(SELFIE_TRAILING_IGNORABLE_RE, "");
+}
+
 function shouldForceSelfieFromTrailingDash(content: string): boolean {
-  return content.trimEnd().endsWith("-");
+  return SELFIE_TRAILING_DASH_RE.test(trimSelfieTriggerTail(content));
 }
 
 function stripTrailingSelfieTrigger(content: string): string {
-  return content.trimEnd().replace(/-$/, "").trim();
+  return trimSelfieTriggerTail(content).replace(SELFIE_TRAILING_DASH_RE, "").trim();
 }
 
 function buildForcedSelfieUserText(content: string): string {
@@ -2940,7 +2947,7 @@ ${ttsHint}${sttHint}`;
           let toolDeliverCount = 0; // tool deliver 计数
           const toolTexts: string[] = []; // 收集所有 tool deliver 文本（用于格式化展示）
           let toolFallbackSent = false; // 兜底消息是否已发送（只发一次）
-          const responseTimeout = 120000; // 120秒超时（2分钟，与 TTS/文件生成超时对齐）
+          const responseTimeout = forceSelfieFromTrailingDash ? 210000 : 120000; // 强制自拍允许模型先生成自然回复和自拍 payload
           const toolOnlyTimeout = 60000; // tool-only 兜底超时：60秒内没有 block 就兜底
           const maxToolRenewals = 3; // tool 续期上限：最多续期 3 次（总等待 = 60s × 3 = 180s）
           let toolRenewalCount = 0; // 已续期次数

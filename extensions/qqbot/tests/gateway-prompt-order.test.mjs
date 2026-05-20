@@ -261,13 +261,13 @@ assert.match(
 );
 assert.match(
   source,
-  /function shouldForceSelfieFromTrailingDash\(content: string\)[\s\S]{0,120}trimEnd\(\)\.endsWith\("-"\)/,
-  "gateway should recognize a trailing dash as an explicit selfie trigger"
+  /SELFIE_TRAILING_DASH_RE[\s\S]{0,260}\\u2014[\s\S]{0,260}\\uff0d[\s\S]{0,520}function shouldForceSelfieFromTrailingDash\(content: string\)[\s\S]{0,180}SELFIE_TRAILING_DASH_RE\.test\(trimSelfieTriggerTail\(content\)\)/,
+  "gateway should recognize half-width, full-width, and unicode dash suffixes as explicit selfie triggers"
 );
 assert.match(
   source,
-  /function stripTrailingSelfieTrigger\(content: string\)[\s\S]{0,140}replace\(\/-\$\/, ""\)/,
-  "gateway should strip the trailing dash before building the selfie prompt"
+  /SELFIE_TRAILING_IGNORABLE_RE[\s\S]{0,260}\\u200b[\s\S]{0,520}function stripTrailingSelfieTrigger\(content: string\)[\s\S]{0,180}replace\(SELFIE_TRAILING_DASH_RE, ""\)/,
+  "gateway should strip trailing dash triggers without preserving invisible tail characters"
 );
 const trailingDashTriggerIndex = source.indexOf("Trailing dash selfie trigger detected");
 const modelRequestIndex = source.indexOf("const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig");
@@ -360,6 +360,11 @@ assert.match(
   outboundVisualAnchorSnippet,
   /Body[\s\S]{0,900}Her\|Your[\s\S]{0,900}figure\|curves\|bust\|skin/,
   "cron selfie visual identity loader should match direct message behavior"
+);
+assert.match(
+  source,
+  /const responseTimeout = forceSelfieFromTrailingDash \? 210000 : 120000/,
+  "trailing dash selfie requests should wait longer for the model to produce natural visible text plus selfie payload"
 );
 assert.match(
   source,
