@@ -142,6 +142,7 @@ interface DirectSelfiePromptContext {
   asukaStatePrompt?: string;
   asukaMemoryPrompt?: string;
   asukaConversationDigestPrompt?: string;
+  modelSelfiePrompt?: string;
   replyToBody?: string;
   imageUnderstandingPrompt?: string;
   searchPrompt?: string;
@@ -532,6 +533,7 @@ function buildDirectSelfiePromptFromContext(
     formatSelfiePromptContextSection("关系与场景状态", context.asukaStatePrompt),
     formatSelfiePromptContextSection("长期记忆", context.asukaMemoryPrompt),
     formatSelfiePromptContextSection("会话摘要", context.asukaConversationDigestPrompt),
+    formatSelfiePromptContextSection("模型生成的生图意图", context.modelSelfiePrompt, 700),
     formatSelfiePromptContextSection("引用消息", context.replyToBody, 520),
     formatSelfiePromptContextSection("本轮媒体附件", context.receivedMediaSection, 520),
     formatSelfiePromptContextSection("图片理解", context.imageUnderstandingPrompt, 620),
@@ -559,6 +561,14 @@ function stripTrailingSelfieTrigger(content: string): string {
 
 function buildForcedSelfieUserText(content: string): string {
   return stripTrailingSelfieTrigger(content) || "按最近对话语境生成一张本人图片";
+}
+
+function stripTrailingSelfieTriggerFromUserContent(content: string): string {
+  const lines = content.split("\n");
+  const firstTextLineIndex = lines.findIndex((line) => line.trim());
+  if (firstTextLineIndex < 0) return "按最近对话语境生成一张本人图片";
+  lines[firstTextLineIndex] = buildForcedSelfieUserText(lines[firstTextLineIndex]!);
+  return lines.join("\n").trim();
 }
 
 function extractSelfieCaptionFromAssistantText(text: string): string {
@@ -2184,6 +2194,14 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         if (proactiveNudge.isNudge) {
           userContent = "";
         }
+        const forceSelfieFromTrailingDash = event.type === "c2c"
+          && !proactiveNudge.isNudge
+          && !parsedContent.trim().startsWith("/")
+          && shouldForceSelfieFromTrailingDash(faceParsedContent);
+        if (forceSelfieFromTrailingDash) {
+          log?.info(`[qqbot:${account.accountId}] Trailing dash selfie trigger detected for ${event.senderId}`);
+          userContent = stripTrailingSelfieTriggerFromUserContent(userContent);
+        }
         const userRequestedVoiceReply = (parsedUserText.forceVoiceReply || proactiveNudge.forceVoiceReply) && !parsedContent.trim().startsWith("/");
 
         const imageUnderstandingResults = await summarizeImagesForPrompt(
@@ -2439,13 +2457,13 @@ ${ttsHint}${sttHint}`;
 【发送图片 - 必须遵守】
 1. 发普通图片方法: 在回复文本中写 <qqimg>本地图片绝对路径或可信图片URL</qqimg>，系统自动处理
 2. 你要先自己判断这轮是否真的需要发送你的本人照片/近照；只有在你决定要发时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程
-3. 自拍载荷格式优先使用 QQBOT_PAYLOAD: {"type":"selfie","caption":"..."}。caption 只写一句很短的用户可见配文；如果不需要配文，也可以只写 QQBOT_PAYLOAD: {"type":"selfie"}
-4. 不要在 selfie 载荷里写长 prompt、场景细节或大段 JSON。发给生图后端的 prompt 会由通道根据最近几轮真实 QQ 对话上下文自动生成；你只负责决定“这轮要不要发图”和“要不要附一句短 caption”
+3. 自拍载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
+4. selfie payload 的 prompt 只写当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户
 5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充你的自拍或本人照片
 6. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
 7. 如果这轮不想发图，就正常回复文字，不要输出 QQBOT_PAYLOAD，也不要假装去调用任何工具
 8. 如果自拍暂时不可用，要用自然口吻简短说明暂时发不出来
-9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则或调试信息直接说给用户听${voiceSection}
+9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则、payload、prompt 或调试信息直接说给用户听${voiceSection}
 
 【发送文件 - 必须遵守】
 1. 发文件方法: 在回复文本中写 <qqfile>文件路径或URL</qqfile>，系统自动处理
@@ -2493,6 +2511,13 @@ ${ttsHint}${sttHint}`;
               ].join("\n")
             : "",
           userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 或 `～` 结尾，表示本轮希望听语音回答；如果用户只发送了 `~` 或 `～`，表示希望你沿用当前上下文继续用语音回应。不要把触发符当作正文，也不要向用户解释这个触发规则。" : "",
+          forceSelfieFromTrailingDash
+            ? [
+                "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求发送 Asuka 本人画面。",
+                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。你必须先输出一段自然、承接上下文的用户可见回复，再另起一行输出 QQBOT_PAYLOAD selfie 载荷。",
+                "- 分离要求: 可见回复只写正常聊天内容；QQBOT_PAYLOAD.selfie.prompt 只写内部生图短提示；不要把 prompt、payload、工具、接口或执行过程泄露到可见回复里。",
+              ].join("\n")
+            : "",
         ].filter(Boolean).join("\n");
         dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
         if (hasAsrReferFallback) {
@@ -2847,32 +2872,6 @@ ${ttsHint}${sttHint}`;
             return true;
           }
         };
-
-        if (shouldForceSelfieFromTrailingDash(event.content)) {
-          log?.info(`[qqbot:${account.accountId}] Trailing dash selfie trigger detected for ${event.senderId}`);
-          if (event.type !== "c2c") {
-            await sendErrorMessage(`[QQBot] 自拍触发符当前仅支持私聊`);
-            return;
-          }
-          const forcedSelfieUserText = buildForcedSelfieUserText(event.content);
-          await sendVisibleReplyText("我去拍一张，等我一下。");
-          const selfiePrompt = buildDirectSelfiePromptFromContext(
-            forcedSelfieUserText,
-            "",
-            event.senderId,
-            directSelfieContext,
-          );
-          const sent = await runDirectSelfieFlow(selfiePrompt, undefined, { background: true });
-          if (!sent) {
-            await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
-          }
-          pluginRuntime.channel.activity.record({
-            channel: "qqbot",
-            accountId: account.accountId,
-            direction: "outbound",
-          });
-          return;
-        }
 
         try {
           const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig(cfgForCompanionThinking, route.agentId);
@@ -3331,7 +3330,7 @@ ${ttsHint}${sttHint}`;
                             if (!(await fileExistsAsync(imagePath))) {
                               log?.error(`[qqbot:${account.accountId}] Image file not found: ${imagePath}`);
                               if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                              const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId, directSelfieContext);
+                              const fallbackPrompt = buildDirectSelfiePromptFromContext(userContent, replyText, event.senderId, directSelfieContext);
                               const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
                               const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
                               if (!sent) {
@@ -3408,7 +3407,7 @@ ${ttsHint}${sttHint}`;
                       } catch (err) {
                         log?.error(`[qqbot:${account.accountId}] Failed to send image from <qqimg>: ${err}`);
                         if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                          const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId, directSelfieContext);
+                          const fallbackPrompt = buildDirectSelfiePromptFromContext(userContent, replyText, event.senderId, directSelfieContext);
                           const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
                           const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
                           if (!sent) {
@@ -3617,11 +3616,15 @@ ${ttsHint}${sttHint}`;
                         `[qqbot:${account.accountId}] Recovered incomplete selfie payload after parse error: ${payloadResult.error}; incomplete fields=${recoveredSelfie.incompleteFields.join(",") || "none"}`,
                       );
                       await sendVisibleReplyText(recoveredVisibleText);
+                      const recoveredSelfieContext: DirectSelfiePromptContext = {
+                        ...directSelfieContext,
+                        modelSelfiePrompt: recoveredSelfie.payload.prompt,
+                      };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
-                        event.content,
+                        userContent,
                         recoveredVisibleText,
                         event.senderId,
-                        directSelfieContext,
+                        recoveredSelfieContext,
                       );
                       const selfieCaption = dedupeCaptionAgainstVisibleText(recoveredVisibleText, recoveredSelfie.payload.caption);
                       const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
@@ -3731,11 +3734,15 @@ ${ttsHint}${sttHint}`;
                         return;
                       }
                       await sendVisibleReplyText(visiblePayloadText);
+                      const payloadSelfieContext: DirectSelfiePromptContext = {
+                        ...directSelfieContext,
+                        modelSelfiePrompt: parsedPayload.prompt,
+                      };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
-                        event.content,
+                        userContent,
                         visiblePayloadText,
                         event.senderId,
-                        directSelfieContext,
+                        payloadSelfieContext,
                       );
                       const selfieCaption = dedupeCaptionAgainstVisibleText(visiblePayloadText, parsedPayload.caption);
                       const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });

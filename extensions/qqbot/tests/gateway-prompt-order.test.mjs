@@ -275,17 +275,29 @@ assert.ok(trailingDashTriggerIndex >= 0, "gateway should log explicit trailing d
 assert.ok(modelRequestIndex >= 0, "gateway should resolve message config before agent dispatch");
 assert.ok(
   trailingDashTriggerIndex < modelRequestIndex,
-  "trailing dash selfie trigger should short-circuit before the agent/model turn"
+  "trailing dash selfie trigger should be detected before the agent/model turn"
+);
+const trailingDashInstructionIndex = source.indexOf("- 本轮回复方式: 用户输入以 `-` 结尾");
+assert.ok(trailingDashInstructionIndex >= 0, "gateway should add a model-facing trailing dash instruction");
+const trailingDashInstruction = source.slice(trailingDashInstructionIndex, trailingDashInstructionIndex + 900);
+assert.match(
+  trailingDashInstruction,
+  /不要说“我去拍一张，等我一下”[\s\S]{0,900}QQBOT_PAYLOAD selfie/,
+  "trailing dash selfie trigger should instruct the model to generate visible text plus a selfie payload"
+);
+assert.doesNotMatch(
+  source,
+  /sendVisibleReplyText\("我去拍一张，等我一下。"\)/,
+  "trailing dash selfie trigger should not send a fixed waiting message"
+);
+assert.ok(
+  !/if \(shouldForceSelfieFromTrailingDash\(event\.content\)\)[\s\S]{0,1400}return;/.test(source),
+  "trailing dash selfie trigger should not short-circuit before the agent/model turn"
 );
 assert.match(
   source,
-  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,760}sendVisibleReplyText\("我去拍一张，等我一下。"\)[\s\S]{0,260}runDirectSelfieFlow\(selfiePrompt, undefined, \{ background: true \}\)/,
-  "trailing dash selfie trigger should call the direct image generation flow in the background"
-);
-assert.match(
-  source,
-  /interface DirectSelfiePromptContext[\s\S]{0,520}recentChatTranscript[\s\S]{0,520}asukaStatePrompt[\s\S]{0,520}asukaConversationDigestPrompt/,
-  "direct selfie prompt should accept the same dynamic context used for normal replies"
+  /interface DirectSelfiePromptContext[\s\S]{0,520}recentChatTranscript[\s\S]{0,520}asukaStatePrompt[\s\S]{0,520}asukaConversationDigestPrompt[\s\S]{0,260}modelSelfiePrompt/,
+  "direct selfie prompt should accept the same dynamic context plus the model-generated image intent"
 );
 assert.match(
   source,
@@ -294,8 +306,8 @@ assert.match(
 );
 assert.match(
   source,
-  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,900}buildDirectSelfiePromptFromContext\([\s\S]{0,180}directSelfieContext/,
-  "trailing dash selfie trigger should pass the full direct selfie context into prompt generation"
+  /const payloadSelfieContext: DirectSelfiePromptContext = \{[\s\S]{0,180}\.\.\.directSelfieContext[\s\S]{0,180}modelSelfiePrompt: parsedPayload\.prompt[\s\S]{0,420}buildDirectSelfiePromptFromContext\([\s\S]{0,240}payloadSelfieContext/,
+  "selfie payload handling should keep model-generated image prompts separate from visible reply text"
 );
 const directSelfiePromptBuilderIndex = source.indexOf("function buildDirectSelfiePromptFromContext");
 assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct selfie prompt builder");
