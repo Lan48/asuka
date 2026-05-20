@@ -24,7 +24,7 @@ import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxS
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
-import { buildConversationDigestPrompt, scheduleConversationDigestUpdate } from "./asuka-conversation-digest.js";
+import { buildConversationDigestPrompt, scheduleConversationDigestUpdate, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
@@ -1543,6 +1543,13 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     });
     log?.info(`[qqbot:${account.accountId}] Cached outbound refIdx: ${refIdx}, attachments=${JSON.stringify(attachments)}`);
   });
+
+  const stopDailyDigestScheduler = startDailyConversationDigestScheduler({
+    accountId: account.accountId,
+    rootConfig: cfg as Record<string, unknown>,
+    log,
+  });
+  abortSignal?.addEventListener("abort", stopDailyDigestScheduler, { once: true });
 
   let reconnectAttempts = 0;
   let isAborted = false;

@@ -10,7 +10,9 @@ process.env.USERPROFILE = tmpHome;
 const {
   buildConversationDigestPrompt,
   formatConversationDigestForPrompt,
+  resolveDailyConversationDigestConfig,
   resolveMiniMaxDigestConfig,
+  runDailyConversationDigestUpdate,
   updateConversationDigest,
 } = await import("../dist/src/asuka-conversation-digest.js");
 const { setRefIndex } = await import("../dist/src/ref-index-store.js");
@@ -49,6 +51,10 @@ const digestConfig = resolveMiniMaxDigestConfig(rootConfig);
 assert.ok(digestConfig, "MiniMax digest config should resolve from qqbot.minimax config");
 assert.equal(digestConfig.model, "MiniMax-M2.7");
 assert.equal(digestConfig.apiKey, "search-secret", "digest should prefer channel MiniMax key over provider fallback");
+const dailyDigestConfig = resolveDailyConversationDigestConfig(rootConfig);
+assert.ok(dailyDigestConfig, "daily digest scheduler should resolve when MiniMax digest is configured");
+assert.equal(dailyDigestConfig.enabled, true, "daily digest scheduler should default to enabled");
+assert.equal(dailyDigestConfig.hour, 4, "daily digest scheduler should default to early local maintenance hour");
 
 const context = {
   accountId: "default",
@@ -208,6 +214,7 @@ try {
   assert.equal(capturedBody.system.includes("完整摘要"), true, "digest curator should rewrite the whole digest, not append only");
   assert.equal(capturedBody.system.includes("旧摘要只是草稿"), true, "digest curator should treat previous digest as editable context");
   assert.equal(String(capturedBody.messages[0].content).includes("### 2026-05-15"), true, "digest prompt should group history by local day");
+  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), true, "digest prompt should include long-term memory context for maintenance");
   assert.equal(String(capturedBody.messages[0].content).includes("QQBOT_PAYLOAD"), false, "digest prompt should remove structured payload artifacts");
   assert.equal(String(capturedBody.messages[0].content).includes("用户:"), false, "digest prompt should avoid third-person user labels");
   assert.equal(String(capturedBody.messages[0].content).includes("Asuka:"), false, "digest prompt should avoid third-person bot labels");
@@ -238,6 +245,45 @@ try {
   assert.match(prompt, /【每日摘要】/);
   assert.match(prompt, /2026-05-15（detailed）/);
   assert.doesNotMatch(prompt, /2026-05-10（brief）/);
+
+  setRefIndex("REFIDX_DIGEST_DAILY_MAINT", {
+    content: "今晚继续把上下文整理成精简摘要，后续回复要自然承接。",
+    senderId: "daily-peer",
+    peerId: "daily-peer",
+    senderName: "用户",
+    timestamp: Date.parse("2026-05-16T04:30:00+08:00"),
+    isBot: false,
+  });
+  capturedBody = {};
+  const dailyResult = await runDailyConversationDigestUpdate({
+    accountId: "default",
+    rootConfig: {
+      ...rootConfig,
+      channels: {
+        qqbot: {
+          minimax: {
+            ...rootConfig.channels.qqbot.minimax,
+            digest: {
+              ...rootConfig.channels.qqbot.minimax.digest,
+              dailyUpdate: { hour: 4, maxPeers: 10 },
+            },
+          },
+        },
+      },
+    },
+    now: Date.parse("2026-05-16T05:00:00+08:00"),
+  });
+  assert.ok(dailyResult.checked >= 1, "daily digest maintenance should scan active peers");
+  assert.ok(dailyResult.updated >= 1, "daily digest maintenance should update peers not refreshed today");
+  assert.equal(String(capturedBody.messages[0].content).includes("每日 digest 维护"), true, "daily maintenance should mark the synthetic update turn");
+  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), true, "daily maintenance should include memory context");
+
+  const beforeHourResult = await runDailyConversationDigestUpdate({
+    accountId: "default",
+    rootConfig,
+    now: Date.parse("2026-05-17T03:30:00+08:00"),
+  });
+  assert.deepEqual(beforeHourResult, { checked: 0, updated: 0, skipped: 0 }, "daily digest maintenance should wait for the configured local hour");
 
   const fixedPrompt = formatConversationDigestForPrompt({
     version: 2,

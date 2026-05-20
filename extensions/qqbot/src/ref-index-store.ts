@@ -388,6 +388,27 @@ export function getEntriesForPeerSince(peerId: string, sinceMs: number, maxEntri
 }
 
 /**
+ * 列出指定时间之后有对话活动的 peerId，按最新活动时间倒序。
+ * 用于每日 digest 维护任务批量刷新近期活跃会话摘要。
+ */
+export function getActivePeerIdsSince(sinceMs: number, maxPeers: number = 100): string[] {
+  const store = loadFromFile();
+  const now = Date.now();
+  const normalizedSince = Number.isFinite(sinceMs) ? sinceMs : 0;
+  const latestByPeer = new Map<string, number>();
+
+  for (const entry of store.values()) {
+    if (!entry.peerId || !isLiveEntry(entry, now) || entry.timestamp < normalizedSince) continue;
+    latestByPeer.set(entry.peerId, Math.max(latestByPeer.get(entry.peerId) ?? 0, entry.timestamp));
+  }
+
+  return [...latestByPeer.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, Math.max(1, Math.floor(maxPeers)))
+    .map(([peerId]) => peerId);
+}
+
+/**
  * 进程退出前强制 compact（确保数据一致性）
  */
 export function flushRefIndex(): void {

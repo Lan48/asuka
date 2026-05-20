@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
-import { formatRefEntryForAgent, getEntriesForPeerSince } from "./ref-index-store.js";
+import { buildAsukaLongTermMemoryPrompt } from "./asuka-memory.js";
+import { formatRefEntryForAgent, getActivePeerIdsSince, getEntriesForPeerSince } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 
 const DIGEST_DIR = getQQBotDataDir("data", "asuka-conversation-digest");
@@ -16,10 +17,15 @@ const DEFAULT_MAX_HISTORY_CHARS = 30_000;
 const DEFAULT_MAX_DIGEST_CHARS = 5_200;
 const DEFAULT_MIN_UPDATE_INTERVAL_MS = 20_000;
 const DEFAULT_MAX_HISTORY_ENTRIES = 512;
+const DEFAULT_DAILY_DIGEST_HOUR = 4;
+const DEFAULT_DAILY_DIGEST_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_DAILY_DIGEST_STARTUP_DELAY_MS = 90_000;
+const DEFAULT_DAILY_DIGEST_MAX_PEERS = 60;
 const MAX_FIELD_CHARS = 420;
 const MAX_ARRAY_ITEMS = 10;
 const runningUpdates = new Set<string>();
 const cache: { state: ConversationDigestStateFile | null } = { state: null };
+const dailySchedulers = new Map<string, { timer: ReturnType<typeof setInterval>; startupTimer: ReturnType<typeof setTimeout> }>();
 
 export interface ConversationWeeklyDigest {
   relationshipContinuity: string;
@@ -95,6 +101,23 @@ interface ConversationDigestUpdateInput {
   log?: { info?: (message: string) => void; error?: (message: string) => void };
 }
 
+interface DailyConversationDigestConfig {
+  enabled: boolean;
+  hour: number;
+  timeZone: string;
+  checkIntervalMs: number;
+  startupDelayMs: number;
+  maxPeers: number;
+}
+
+interface DailyConversationDigestInput {
+  accountId: string;
+  rootConfig: Record<string, unknown>;
+  now?: number;
+  force?: boolean;
+  log?: { info?: (message: string) => void; error?: (message: string) => void };
+}
+
 function emptyState(): ConversationDigestStateFile {
   return { version: 2, digests: {} };
 }
@@ -156,6 +179,25 @@ function isEnabledBlock(block: Record<string, any> | undefined): boolean {
   return block.enabled !== false;
 }
 
+function getBooleanValue(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (/^(?:true|1|yes|on)$/i.test(value.trim())) return true;
+    if (/^(?:false|0|no|off)$/i.test(value.trim())) return false;
+  }
+  return fallback;
+}
+
+function clampHour(value: unknown, fallback: number): number {
+  const numeric = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim()
+      ? Number(value)
+      : fallback;
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(23, Math.max(0, Math.floor(numeric)));
+}
+
 function normalizeMiniMaxApiRoot(baseUrl: string): string {
   let normalized = baseUrl.replace(/\/+$/, "");
   if (normalized.endsWith("/anthropic/v1")) normalized = normalized.slice(0, -13);
@@ -207,6 +249,32 @@ export function resolveMiniMaxDigestConfig(rootConfig: Record<string, unknown>):
     maxDigestChars: Math.max(800, Math.floor(getNumberValue(block?.maxDigestChars, DEFAULT_MAX_DIGEST_CHARS))),
     minUpdateIntervalMs: Math.max(0, Math.floor(getNumberValue(block?.minUpdateIntervalMs, DEFAULT_MIN_UPDATE_INTERVAL_MS))),
     maxHistoryEntries: Math.max(20, Math.floor(getNumberValue(block?.maxHistoryEntries, DEFAULT_MAX_HISTORY_ENTRIES))),
+  };
+}
+
+export function resolveDailyConversationDigestConfig(rootConfig: Record<string, unknown>): DailyConversationDigestConfig | undefined {
+  if (!resolveMiniMaxDigestConfig(rootConfig)) return undefined;
+  const root = rootConfig as Record<string, any>;
+  const qqbot = getObject(getObject(root.channels)?.qqbot);
+  const minimax = getObject(qqbot?.minimax);
+  const digest = getObject(minimax?.digest);
+  const daily = getObject(digest?.dailyUpdate ?? digest?.daily);
+  const timeZone = getStringValue(
+    daily?.timeZone,
+    daily?.timezone,
+    digest?.timeZone,
+    digest?.timezone,
+    qqbot?.proactiveQuietHours?.timezone,
+    DEFAULT_DIGEST_TIME_ZONE,
+  );
+
+  return {
+    enabled: getBooleanValue(daily?.enabled, true),
+    hour: clampHour(daily?.hour ?? daily?.localHour, DEFAULT_DAILY_DIGEST_HOUR),
+    timeZone,
+    checkIntervalMs: Math.max(60_000, Math.floor(getNumberValue(daily?.checkIntervalMs, DEFAULT_DAILY_DIGEST_CHECK_INTERVAL_MS))),
+    startupDelayMs: Math.max(0, Math.floor(getNumberValue(daily?.startupDelayMs, DEFAULT_DAILY_DIGEST_STARTUP_DELAY_MS))),
+    maxPeers: Math.max(1, Math.floor(getNumberValue(daily?.maxPeers, DEFAULT_DAILY_DIGEST_MAX_PEERS))),
   };
 }
 
@@ -537,6 +605,17 @@ function formatLocalDate(timestamp: number, timeZone = DEFAULT_DIGEST_TIME_ZONE)
   return `${year}-${month}-${day}`;
 }
 
+function formatLocalHour(timestamp: number, timeZone = DEFAULT_DIGEST_TIME_ZONE): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(timestamp));
+  const raw = parts.find((part) => part.type === "hour")?.value ?? "0";
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed % 24 : 0;
+}
+
 function formatDailyHistory(entries: ReturnType<typeof getEntriesForPeerSince>, maxChars: number, timeZone = DEFAULT_DIGEST_TIME_ZONE): string {
   const groups = new Map<string, string[]>();
   for (const entry of entries) {
@@ -574,6 +653,7 @@ function buildHistoryForDigest(peerId: string, now: number, config: MiniMaxDiges
 function buildDigestPrompt(input: {
   previous?: ConversationDigest | LegacyConversationDigest;
   history: string;
+  memoryPrompt?: string;
   userText: string;
   assistantText: string;
   now: number;
@@ -585,6 +665,9 @@ function buildDigestPrompt(input: {
     `当前本地日期: ${currentLocalDate}（${DEFAULT_DIGEST_TIME_ZONE}）`,
     "上一版 digest JSON（只是可修改草稿，不是事实来源；不要机械继承）:",
     previousJson,
+    "",
+    "长期记忆/关系记忆节选（只作为摘要维护参考；如果与近一周历史冲突，以近一周历史和本轮新增为准）:",
+    sanitizeDigestPerspectiveText(input.memoryPrompt, 1_600) || "（无长期记忆节选）",
     "",
     "近一周对话节选（越靠后越新）:",
     input.history || "（无历史）",
@@ -780,6 +863,119 @@ export function buildConversationDigestPrompt(context: AsukaPeerContext): string
   return digest ? formatConversationDigestForPrompt(digest) : "";
 }
 
+function parseDigestPeerKey(peerKey: string): Pick<AsukaPeerContext, "accountId" | "peerKind" | "peerId" | "senderId" | "target"> | null {
+  const parts = peerKey.split(":");
+  if (parts.length < 3) return null;
+  const accountId = parts.shift() || "";
+  const peerKind = parts.shift() === "group" ? "group" : "direct";
+  const peerId = parts.join(":");
+  if (!accountId || !peerId) return null;
+  return {
+    accountId,
+    peerKind,
+    peerId,
+    senderId: peerId,
+    target: peerKind === "group" ? `qqbot:group:${peerId}` : `qqbot:c2c:${peerId}`,
+  };
+}
+
+function buildDigestContext(accountId: string, peerKind: "direct" | "group", peerId: string): AsukaPeerContext {
+  return {
+    accountId,
+    peerKind,
+    peerId,
+    senderId: peerId,
+    target: peerKind === "group" ? `qqbot:group:${peerId}` : `qqbot:c2c:${peerId}`,
+  };
+}
+
+function collectDailyDigestContexts(accountId: string, now: number, config: DailyConversationDigestConfig): AsukaPeerContext[] {
+  const state = loadState();
+  const byKey = new Map<string, AsukaPeerContext>();
+
+  for (const peerKey of Object.keys(state.digests)) {
+    const parsed = parseDigestPeerKey(peerKey);
+    if (!parsed || parsed.accountId !== accountId) continue;
+    byKey.set(peerKey, buildDigestContext(parsed.accountId, parsed.peerKind, parsed.peerId));
+  }
+
+  const since = now - DIGEST_WINDOW_MS;
+  for (const peerId of getActivePeerIdsSince(since, config.maxPeers)) {
+    const context = buildDigestContext(accountId, "direct", peerId);
+    byKey.set(makePeerKey(context), context);
+  }
+
+  return [...byKey.values()].slice(0, config.maxPeers);
+}
+
+function shouldSkipDailyDigest(context: AsukaPeerContext, now: number, timeZone: string, force: boolean | undefined): boolean {
+  if (force) return false;
+  const digest = getConversationDigest(context);
+  if (!digest) return false;
+  return formatLocalDate(digest.updatedAt, timeZone) === formatLocalDate(now, timeZone);
+}
+
+export async function runDailyConversationDigestUpdate(input: DailyConversationDigestInput): Promise<{ checked: number; updated: number; skipped: number }> {
+  const config = resolveDailyConversationDigestConfig(input.rootConfig);
+  if (!config?.enabled) return { checked: 0, updated: 0, skipped: 0 };
+  const now = input.now ?? Date.now();
+  if (!input.force && formatLocalHour(now, config.timeZone) < config.hour) {
+    return { checked: 0, updated: 0, skipped: 0 };
+  }
+
+  const contexts = collectDailyDigestContexts(input.accountId, now, config);
+  let updated = 0;
+  let skipped = 0;
+  for (const context of contexts) {
+    if (shouldSkipDailyDigest(context, now, config.timeZone, input.force)) {
+      skipped++;
+      continue;
+    }
+    const before = getConversationDigest(context)?.updatedAt ?? 0;
+    const digest = await updateConversationDigest(context, {
+      rootConfig: input.rootConfig,
+      userText: "【每日 digest 维护】根据最新近一周对话、长期记忆和旧 digest 更新精简长期上下文。",
+      assistantText: "",
+      now,
+      log: input.log,
+    });
+    if (digest && digest.updatedAt !== before) updated++;
+  }
+  input.log?.info?.(`[asuka-digest] daily maintenance account=${input.accountId}, checked=${contexts.length}, updated=${updated}, skipped=${skipped}`);
+  return { checked: contexts.length, updated, skipped };
+}
+
+export function startDailyConversationDigestScheduler(input: Omit<DailyConversationDigestInput, "now" | "force">): () => void {
+  const config = resolveDailyConversationDigestConfig(input.rootConfig);
+  const key = input.accountId;
+  const existing = dailySchedulers.get(key);
+  if (existing) {
+    clearInterval(existing.timer);
+    clearTimeout(existing.startupTimer);
+    dailySchedulers.delete(key);
+  }
+  if (!config?.enabled) {
+    input.log?.info?.(`[asuka-digest] daily scheduler disabled for account=${input.accountId}`);
+    return () => {};
+  }
+
+  const run = () => {
+    void runDailyConversationDigestUpdate(input).catch((error) => {
+      input.log?.error?.(`[asuka-digest] daily maintenance failed for ${input.accountId}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
+  const startupTimer = setTimeout(run, config.startupDelayMs);
+  const timer = setInterval(run, config.checkIntervalMs);
+  dailySchedulers.set(key, { timer, startupTimer });
+  input.log?.info?.(`[asuka-digest] daily scheduler started account=${input.accountId}, hour=${config.hour}, timeZone=${config.timeZone}, checkIntervalMs=${config.checkIntervalMs}`);
+
+  return () => {
+    clearInterval(timer);
+    clearTimeout(startupTimer);
+    if (dailySchedulers.get(key)?.timer === timer) dailySchedulers.delete(key);
+  };
+}
+
 export async function updateConversationDigest(context: AsukaPeerContext, input: ConversationDigestUpdateInput): Promise<ConversationDigest | null> {
   const config = resolveMiniMaxDigestConfig(input.rootConfig);
   if (!config) return null;
@@ -791,9 +987,11 @@ export async function updateConversationDigest(context: AsukaPeerContext, input:
     return upgradeLegacyDigest(previous);
   }
   const history = buildHistoryForDigest(context.peerId, now, config);
+  const memoryPrompt = buildAsukaLongTermMemoryPrompt(context, input.userText, now);
   const prompt = buildDigestPrompt({
     previous,
     history: history.text,
+    memoryPrompt,
     userText: input.userText,
     assistantText: input.assistantText,
     now,
