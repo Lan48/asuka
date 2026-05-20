@@ -2948,7 +2948,7 @@ ${ttsHint}${sttHint}`;
           let toolDeliverCount = 0; // tool deliver 计数
           const toolTexts: string[] = []; // 收集所有 tool deliver 文本（用于格式化展示）
           let toolFallbackSent = false; // 兜底消息是否已发送（只发一次）
-          const responseTimeout = forceSelfieFromTrailingDash ? 210000 : 120000; // 强制自拍允许模型先生成自然回复和自拍 payload
+          const responseTimeout = forceSelfieFromTrailingDash ? 20 * 60 * 1000 : 120000; // 生图轮次允许模型先生成自然回复和图片 payload
           const toolOnlyTimeout = 60000; // tool-only 兜底超时：60秒内没有 block 就兜底
           const maxToolRenewals = 3; // tool 续期上限：最多续期 3 次（总等待 = 60s × 3 = 180s）
           let toolRenewalCount = 0; // 已续期次数

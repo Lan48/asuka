@@ -373,8 +373,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const responseTimeout = forceSelfieFromTrailingDash \? 210000 : 120000/,
-  "trailing dash selfie requests should wait longer for the model to produce natural visible text plus selfie payload"
+  /const responseTimeout = forceSelfieFromTrailingDash \? 20 \* 60 \* 1000 : 120000/,
+  "trailing dash image requests should wait up to 20 minutes for the model to produce natural visible text plus image payload"
 );
 assert.match(
   source,
