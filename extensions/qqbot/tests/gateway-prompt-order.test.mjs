@@ -282,7 +282,7 @@ assert.ok(trailingDashInstructionIndex >= 0, "gateway should add a model-facing 
 const trailingDashInstruction = source.slice(trailingDashInstructionIndex, trailingDashInstructionIndex + 900);
 assert.match(
   trailingDashInstruction,
-  /不要说“我去拍一张，等我一下”[\s\S]{0,900}QQBOT_PAYLOAD selfie/,
+  /不要说“我去拍一张，等我一下”[\s\S]{0,900}QQBOT_PAYLOAD selfie[\s\S]{0,120}不能只输出载荷/,
   "trailing dash selfie trigger should instruct the model to generate visible text plus a selfie payload"
 );
 assert.doesNotMatch(
@@ -308,6 +308,16 @@ assert.match(
   source,
   /const payloadSelfieContext: DirectSelfiePromptContext = \{[\s\S]{0,180}\.\.\.directSelfieContext[\s\S]{0,180}modelSelfiePrompt: parsedPayload\.prompt[\s\S]{0,420}buildDirectSelfiePromptFromContext\([\s\S]{0,240}payloadSelfieContext/,
   "selfie payload handling should keep model-generated image prompts separate from visible reply text"
+);
+assert.match(
+  source,
+  /function resolveSelfieVisiblePayloadText\([\s\S]{0,900}const visibleText = cleanOutgoingTextSegment\(resolveVisiblePayloadText[\s\S]{0,900}const captionText = cleanOutgoingTextSegment\(caption \|\| ""\)[\s\S]{0,900}return "好，我按刚刚的语境给你发一张。"/,
+  "selfie payload handling should recover a safe visible reply when the model emits only a payload"
+);
+assert.match(
+  source,
+  /const selfieVisibleText = resolveSelfieVisiblePayloadText\([\s\S]{0,420}parsedPayload\.caption[\s\S]{0,420}await sendVisibleReplyText\(selfieVisibleText\)[\s\S]{0,700}dedupeCaptionAgainstVisibleText\(selfieVisibleText, parsedPayload\.caption\)/,
+  "selfie payload should send visible text separately and avoid duplicating it as the image caption"
 );
 const directSelfiePromptBuilderIndex = source.indexOf("function buildDirectSelfiePromptFromContext");
 assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct selfie prompt builder");

@@ -971,6 +971,25 @@ function resolveVisiblePayloadText(replyText: string, rawVisibleText: string): s
   return preferred || rawVisibleText;
 }
 
+function resolveSelfieVisiblePayloadText(
+  replyText: string,
+  rawVisibleText: string,
+  caption: string | undefined,
+  userText: string,
+): string {
+  const visibleText = cleanOutgoingTextSegment(resolveVisiblePayloadText(replyText, rawVisibleText));
+  if (visibleText) return visibleText;
+
+  const captionText = cleanOutgoingTextSegment(caption || "");
+  if (captionText) return captionText;
+
+  const requestText = cleanOutgoingTextSegment(stripTrailingSelfieTrigger(userText)).replace(/\s+/g, " ").trim();
+  if (requestText && requestText !== "按最近对话语境生成一张本人图片") {
+    return "好，我按你刚刚说的来。";
+  }
+  return "好，我按刚刚的语境给你发一张。";
+}
+
 function stripStructuredPayloadForVisibleText(text: string): string {
   if (!hasStructuredPayloadPrefix(text)) return text;
   const payloadResult = parseQQBotPayload(text);
@@ -2457,7 +2476,7 @@ ${ttsHint}${sttHint}`;
 【发送图片 - 必须遵守】
 1. 发普通图片方法: 在回复文本中写 <qqimg>本地图片绝对路径或可信图片URL</qqimg>，系统自动处理
 2. 你要先自己判断这轮是否真的需要发送你的本人照片/近照；只有在你决定要发时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程
-3. 自拍载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
+3. 自拍载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容，必须能单独作为本轮聊天回复成立；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
 4. selfie payload 的 prompt 只写当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户
 5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充你的自拍或本人照片
 6. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
@@ -2514,7 +2533,7 @@ ${ttsHint}${sttHint}`;
           forceSelfieFromTrailingDash
             ? [
                 "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求发送 Asuka 本人画面。",
-                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。你必须先输出一段自然、承接上下文的用户可见回复，再另起一行输出 QQBOT_PAYLOAD selfie 载荷。",
+                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。你必须先输出一段自然、承接上下文的用户可见回复，再另起一行输出 QQBOT_PAYLOAD selfie 载荷；不能只输出载荷。",
                 "- 分离要求: 可见回复只写正常聊天内容；QQBOT_PAYLOAD.selfie.prompt 只写内部生图短提示；不要把 prompt、payload、工具、接口或执行过程泄露到可见回复里。",
               ].join("\n")
             : "",
@@ -3611,7 +3630,12 @@ ${ttsHint}${sttHint}`;
                         .filter((part): part is string => Boolean(part && part.trim()))
                         .join("\n\n")
                         .trim();
-                      const recoveredVisibleText = resolveVisiblePayloadText(replyText, rawRecoveredVisibleText);
+                      const recoveredVisibleText = resolveSelfieVisiblePayloadText(
+                        replyText,
+                        rawRecoveredVisibleText,
+                        recoveredSelfie.payload.caption,
+                        userContent,
+                      );
                       log?.info(
                         `[qqbot:${account.accountId}] Recovered incomplete selfie payload after parse error: ${payloadResult.error}; incomplete fields=${recoveredSelfie.incompleteFields.join(",") || "none"}`,
                       );
@@ -3733,18 +3757,24 @@ ${ttsHint}${sttHint}`;
                         await sendErrorMessage(`[QQBot] 自拍载荷当前仅支持私聊`);
                         return;
                       }
-                      await sendVisibleReplyText(visiblePayloadText);
+                      const selfieVisibleText = resolveSelfieVisiblePayloadText(
+                        replyText,
+                        rawVisiblePayloadText,
+                        parsedPayload.caption,
+                        userContent,
+                      );
+                      await sendVisibleReplyText(selfieVisibleText);
                       const payloadSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
                         modelSelfiePrompt: parsedPayload.prompt,
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
-                        visiblePayloadText,
+                        selfieVisibleText,
                         event.senderId,
                         payloadSelfieContext,
                       );
-                      const selfieCaption = dedupeCaptionAgainstVisibleText(visiblePayloadText, parsedPayload.caption);
+                      const selfieCaption = dedupeCaptionAgainstVisibleText(selfieVisibleText, parsedPayload.caption);
                       const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
                       if (!sent) {
                         await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
