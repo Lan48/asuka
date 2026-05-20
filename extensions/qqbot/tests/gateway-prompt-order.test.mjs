@@ -19,6 +19,16 @@ assert.ok(
   source.includes("当前场景是两个人正在私聊，不是在写第三人称故事或摘要"),
   "private chat persona should softly anchor replies as direct two-person conversation"
 );
+assert.match(
+  source,
+  /fileURLToPath\(import\.meta\.url\)/,
+  "gateway should define an ESM-safe module directory before resolving bundled files"
+);
+assert.match(
+  outboundSource,
+  /fileURLToPath\(import\.meta\.url\)/,
+  "proactive outbound sends should define an ESM-safe module directory before resolving bundled files"
+);
 assert.ok(
   source.includes("优先用自然口语里的“我/你/我们”"),
   "chat persona should prefer first/second-person wording without hard rejection rules"
@@ -252,7 +262,7 @@ assert.ok(
 );
 assert.match(
   source,
-  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,650}runDirectSelfieFlow\(selfiePrompt, undefined, \{ background: true \}\)/,
+  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,760}sendVisibleReplyText\("我去拍一张，等我一下。"\)[\s\S]{0,260}runDirectSelfieFlow\(selfiePrompt, undefined, \{ background: true \}\)/,
   "trailing dash selfie trigger should call the direct image generation flow in the background"
 );
 assert.ok(

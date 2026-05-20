@@ -3,6 +3,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount, WSPayload, C2CMessageEvent, GuildMessageEvent, GroupMessageEvent } from "./types.js";
 import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify, onMessageSent } from "./api.js";
 import { loadSession, saveSession, clearSession, type SessionState } from "./session-store.js";
@@ -34,6 +35,8 @@ import {
   generateOfficialOpenClawImageDataUrl,
   hasOfficialOpenClawImageGenerationConfig,
 } from "./utils/openclaw-image-generation.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
@@ -2793,6 +2796,7 @@ ${ttsHint}${sttHint}`;
             return;
           }
           const forcedSelfieUserText = buildForcedSelfieUserText(event.content);
+          await sendVisibleReplyText("我去拍一张，等我一下。");
           const selfiePrompt = buildDirectSelfiePromptFromContext(
             forcedSelfieUserText,
             "",

@@ -4,6 +4,7 @@
 
 import * as fs from "node:fs";
 import * as path from "path";
+import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount } from "./types.js";
 import { decodeCronPayload, parseQQBotPayload, isMediaPayload, isSelfiePayload, wrapExactMessageForAgentTurn, type MediaPayload } from "./utils/payload.js";
 import {
@@ -43,6 +44,8 @@ import {
   generateOfficialOpenClawImageDataUrl,
   hasOfficialOpenClawImageGenerationConfig,
 } from "./utils/openclaw-image-generation.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
