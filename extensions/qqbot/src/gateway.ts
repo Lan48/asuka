@@ -508,6 +508,18 @@ function buildDirectSelfiePromptFromContext(userText: string, assistantText: str
   );
 }
 
+function shouldForceSelfieFromTrailingDash(content: string): boolean {
+  return content.trimEnd().endsWith("-");
+}
+
+function stripTrailingSelfieTrigger(content: string): string {
+  return content.trimEnd().replace(/-$/, "").trim();
+}
+
+function buildForcedSelfieUserText(content: string): string {
+  return stripTrailingSelfieTrigger(content) || "按最近对话语境生成一张本人图片";
+}
+
 function extractSelfieCaptionFromAssistantText(text: string): string {
   const cleaned = text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
@@ -2773,6 +2785,30 @@ ${ttsHint}${sttHint}`;
             return true;
           }
         };
+
+        if (shouldForceSelfieFromTrailingDash(event.content)) {
+          log?.info(`[qqbot:${account.accountId}] Trailing dash selfie trigger detected for ${event.senderId}`);
+          if (event.type !== "c2c") {
+            await sendErrorMessage(`[QQBot] 自拍触发符当前仅支持私聊`);
+            return;
+          }
+          const forcedSelfieUserText = buildForcedSelfieUserText(event.content);
+          const selfiePrompt = buildDirectSelfiePromptFromContext(
+            forcedSelfieUserText,
+            "",
+            event.senderId,
+          );
+          const sent = await runDirectSelfieFlow(selfiePrompt, undefined, { background: true });
+          if (!sent) {
+            await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
+          }
+          pluginRuntime.channel.activity.record({
+            channel: "qqbot",
+            accountId: account.accountId,
+            direction: "outbound",
+          });
+          return;
+        }
 
         try {
           const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig(cfgForCompanionThinking, route.agentId);

@@ -78,7 +78,8 @@ function loadLocalOpenClawConfig(): any {
 export function getQQBotLocalOpenClawEnv(extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const configPath = resolveLocalOpenClawConfigPath();
   const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || path.dirname(configPath);
-  const openClawScript = resolveLocalOpenClawScript(stateDir);
+  const explicitWrapper = process.env.OPENCLAW_WRAPPER?.trim();
+  const openClawScript = explicitWrapper ? undefined : resolveLocalOpenClawScript(stateDir);
   return {
     ...process.env,
     ...extraEnv,

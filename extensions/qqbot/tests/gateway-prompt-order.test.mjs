@@ -232,6 +232,29 @@ assert.match(
   /shouldUseMiniMaxDefaults[\s\S]{0,260}DEFAULT_MINIMAX_IMAGE_MODEL/,
   "direct selfie flow should default MiniMax provider-backed images to image-01"
 );
+assert.match(
+  source,
+  /function shouldForceSelfieFromTrailingDash\(content: string\)[\s\S]{0,120}trimEnd\(\)\.endsWith\("-"\)/,
+  "gateway should recognize a trailing dash as an explicit selfie trigger"
+);
+assert.match(
+  source,
+  /function stripTrailingSelfieTrigger\(content: string\)[\s\S]{0,140}replace\(\/-\$\/, ""\)/,
+  "gateway should strip the trailing dash before building the selfie prompt"
+);
+const trailingDashTriggerIndex = source.indexOf("Trailing dash selfie trigger detected");
+const modelRequestIndex = source.indexOf("const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig");
+assert.ok(trailingDashTriggerIndex >= 0, "gateway should log explicit trailing dash selfie triggers");
+assert.ok(modelRequestIndex >= 0, "gateway should resolve message config before agent dispatch");
+assert.ok(
+  trailingDashTriggerIndex < modelRequestIndex,
+  "trailing dash selfie trigger should short-circuit before the agent/model turn"
+);
+assert.match(
+  source,
+  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,650}runDirectSelfieFlow\(selfiePrompt, undefined, \{ background: true \}\)/,
+  "trailing dash selfie trigger should call the direct image generation flow in the background"
+);
 assert.ok(
   !source.includes("shouldForceFreshSession"),
   "reply loop correction should not strip conversation context or force /new sessions"
