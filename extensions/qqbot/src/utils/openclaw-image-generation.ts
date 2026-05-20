@@ -29,7 +29,7 @@ export type OfficialOpenClawImageOptions = {
   identityPrompt?: string;
 };
 
-const DEFAULT_OPENCLAW_IMAGE_MODEL = "openai-codex/gpt-image-1";
+const DEFAULT_OPENCLAW_IMAGE_MODEL = "openai-codex/chatgpt-image-latest";
 const DEFAULT_OPENCLAW_IMAGE_SIZE = "1024x1024";
 const DEFAULT_OPENCLAW_OUTPUT_FORMAT = "png";
 const IMAGE_RUNTIME_MODULE_RELATIVE = path.join("dist", "plugin-sdk", "image-generation-runtime.js");
@@ -69,7 +69,7 @@ export function resolveOpenClawImageGenerationModelRef(cfg: OpenClawConfigLike):
     skillEnv.OPENCLAW_IMAGE_GENERATION_MODEL,
     skillEnv.STUDIO_IMAGE_EDIT_MODEL,
     skillEnv.STUDIO_IMAGE_MODEL,
-    "gpt-image-1",
+    "chatgpt-image-latest",
   );
 
   if (/^openai-codex:/i.test(authProfile) || /^https:\/\/api\.openai\.com\/v1\/?$/i.test(baseUrl)) {

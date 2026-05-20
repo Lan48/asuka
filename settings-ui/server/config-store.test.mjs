@@ -139,18 +139,18 @@ test("功能矩阵优先显示自拍 OAuth profile 来源", () => {
   delete config.skills.entries["asuka-selfie"].env.STUDIO_API_KEY;
   config.skills.entries["asuka-selfie"].env.STUDIO_AUTH_PROFILE = "openai-codex:zhueshun@gmail.com";
   config.skills.entries["asuka-selfie"].env.STUDIO_API_BASE_URL = "https://api.openai.com/v1";
-  config.skills.entries["asuka-selfie"].env.STUDIO_IMAGE_MODEL = "gpt-image-1";
+  config.skills.entries["asuka-selfie"].env.STUDIO_IMAGE_MODEL = "chatgpt-image-latest";
 
   const selfie = buildFeatureMap(config).find((item) => item.name === "Asuka 自拍");
   assert.equal(selfie.provider, "openai-codex");
-  assert.equal(selfie.model, "gpt-image-1");
+  assert.equal(selfie.model, "chatgpt-image-latest");
   assert.equal(selfie.keySource, "skills.entries.asuka-selfie.env.STUDIO_AUTH_PROFILE");
   assert.equal(selfie.keyConfigured, true);
 });
 
 test("功能矩阵优先显示 OpenClaw 官方图片模型", () => {
   const config = fixtureConfig();
-  config.agents.defaults.imageGenerationModel = { primary: "openai-codex/gpt-image-1", timeoutMs: 240000 };
+  config.agents.defaults.imageGenerationModel = { primary: "openai-codex/chatgpt-image-latest", timeoutMs: 240000 };
   config.models.providers["openai-codex"] = {
     baseUrl: "https://chatgpt.com/backend-api/codex",
     api: "openai-codex-responses",
@@ -159,7 +159,7 @@ test("功能矩阵优先显示 OpenClaw 官方图片模型", () => {
 
   const selfie = buildFeatureMap(config).find((item) => item.name === "Asuka 自拍");
   assert.equal(selfie.provider, "openai-codex");
-  assert.equal(selfie.model, "gpt-image-1");
+  assert.equal(selfie.model, "chatgpt-image-latest");
   assert.equal(selfie.keySource, "OpenClaw OAuth profile store");
   assert.equal(selfie.keyConfigured, true);
 });

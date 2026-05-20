@@ -370,7 +370,7 @@ export function buildTemplate(existing = {}) {
         },
       },
     },
-    agents: { defaults: { model: { primary: "minimax/MiniMax-M2.7" }, imageGenerationModel: { primary: "openai-codex/gpt-image-1", timeoutMs: 240000 }, thinkingDefault: "off", workspace: "workspace" } },
+    agents: { defaults: { model: { primary: "minimax/MiniMax-M2.7" }, imageGenerationModel: { primary: "openai-codex/chatgpt-image-latest", timeoutMs: 240000 }, thinkingDefault: "off", workspace: "workspace" } },
     channels: {
       qqbot: {
         enabled: true,
