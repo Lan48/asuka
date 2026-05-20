@@ -73,10 +73,10 @@ interface StudioSelfieConfig {
   quality: string;
 }
 const SELFIE_IDENTITY_LOCK_PROMPT = [
-  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "每次生成图片都必须让 Asuka 作为画面主角，并严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
   "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
   "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
-  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+  "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
 ].join(" ");
 const PROACTIVE_SEND_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_SEND_LOCK_TIMEOUT_MS = 45 * 1000;
@@ -2024,7 +2024,7 @@ function buildCronSelfiePrompt(
   };
 
   return [
-    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前约定的本人近照或自拍。`,
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前约定的 Asuka 主角图片；不要固定成手持自拍，除非原始约定明确要自拍。`,
     loadAsukaVisualIdentityAnchor(),
     formatContextSection("当前本地时间", currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}。` : "",

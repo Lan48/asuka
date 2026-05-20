@@ -285,6 +285,11 @@ assert.match(
   /不要说“我去拍一张，等我一下”[\s\S]{0,900}QQBOT_PAYLOAD selfie[\s\S]{0,120}不能只输出载荷/,
   "trailing dash selfie trigger should instruct the model to generate visible text plus a selfie payload"
 );
+assert.match(
+  trailingDashInstruction,
+  /Asuka 主角图片[\s\S]{0,900}不一定是手持自拍[\s\S]{0,900}不要把所有请求都写成固定自拍/,
+  "trailing dash image generation should keep Asuka as the subject without forcing a fixed selfie composition"
+);
 assert.doesNotMatch(
   source,
   /sendVisibleReplyText\("我去拍一张，等我一下。"\)/,
@@ -326,6 +331,11 @@ assert.match(
   directSelfiePromptBuilder,
   /formatSelfiePromptContextSection\("最近一周对话", context\.recentChatTranscript[\s\S]{0,520}formatSelfiePromptContextSection\("关系与场景状态", context\.asukaStatePrompt[\s\S]{0,520}formatSelfiePromptContextSection\("会话摘要", context\.asukaConversationDigestPrompt[\s\S]{0,760}formatSelfiePromptContextSection\("当前轮次", context\.currentTurnContext/,
   "direct selfie prompt should serialize conversation transcript, state, digest, and current turn sections"
+);
+assert.match(
+  directSelfiePromptBuilder,
+  /SELFIE_IDENTITY_LOCK_PROMPT[\s\S]{0,260}Asuka 主角图片[\s\S]{0,120}不要固定成手持自拍/,
+  "direct image prompts should always retain Asuka identity while allowing non-selfie compositions"
 );
 const visualAnchorIndex = source.indexOf("function loadAsukaVisualIdentityAnchor");
 assert.ok(visualAnchorIndex >= 0, "gateway should define a visual identity anchor loader");

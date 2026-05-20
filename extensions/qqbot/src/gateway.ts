@@ -116,10 +116,10 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
 }
 
 const SELFIE_IDENTITY_LOCK_PROMPT = [
-  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "每次生成图片都必须让 Asuka 作为画面主角，并严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
   "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
   "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
-  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+  "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
 ].join(" ");
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
@@ -582,10 +582,10 @@ function buildDirectSelfiePromptFromContext(
     cleanedAssistant ? `当前回复语境：${cleanedAssistant}` : "",
   ].filter(Boolean);
   const contextClause = contextParts.length > 0
-    ? `\n\n【自拍上下文】\n${contextParts.join("\n")}\n\n请优先延续这个语境里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。`
+    ? `\n\n【生图上下文】\n${contextParts.join("\n")}\n\n请优先延续这个语境里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。`
     : "";
   return truncateForSelfiePrompt(
-    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境的本人画面。${contextClause}\n\n【用户当前要求】${cleanedUser}\n\n不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。`,
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境和用户要求的 Asuka 主角图片；不要固定成手持自拍，除非用户明确要自拍。${contextClause}\n\n【用户当前要求】${cleanedUser}\n\n不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。`,
     MAX_SELFIE_PROMPT_CHARS,
   );
 }
@@ -606,13 +606,13 @@ function stripTrailingSelfieTrigger(content: string): string {
 }
 
 function buildForcedSelfieUserText(content: string): string {
-  return stripTrailingSelfieTrigger(content) || "按最近对话语境生成一张本人图片";
+  return stripTrailingSelfieTrigger(content) || "按最近对话语境生成一张 Asuka 为主角的图片";
 }
 
 function stripTrailingSelfieTriggerFromUserContent(content: string): string {
   const lines = content.split("\n");
   const firstTextLineIndex = lines.findIndex((line) => line.trim());
-  if (firstTextLineIndex < 0) return "按最近对话语境生成一张本人图片";
+  if (firstTextLineIndex < 0) return "按最近对话语境生成一张 Asuka 为主角的图片";
   lines[firstTextLineIndex] = buildForcedSelfieUserText(lines[firstTextLineIndex]!);
   return lines.join("\n").trim();
 }
@@ -1030,7 +1030,7 @@ function resolveSelfieVisiblePayloadText(
   if (captionText) return captionText;
 
   const requestText = cleanOutgoingTextSegment(stripTrailingSelfieTrigger(userText)).replace(/\s+/g, " ").trim();
-  if (requestText && requestText !== "按最近对话语境生成一张本人图片") {
+  if (requestText && !/^按最近对话语境生成一张(?:本人|Asuka 为主角的)?图片$/.test(requestText)) {
     return "好，我按你刚刚说的来。";
   }
   return "好，我按刚刚的语境给你发一张。";
@@ -2521,13 +2521,13 @@ ${ttsHint}${sttHint}`;
 
 【发送图片 - 必须遵守】
 1. 发普通图片方法: 在回复文本中写 <qqimg>本地图片绝对路径或可信图片URL</qqimg>，系统自动处理
-2. 你要先自己判断这轮是否真的需要发送你的本人照片/近照；只有在你决定要发时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程
-3. 自拍载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容，必须能单独作为本轮聊天回复成立；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
-4. selfie payload 的 prompt 只写当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户
-5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充你的自拍或本人照片
+2. 你要先自己判断这轮是否真的需要生成并发送图片；只有在你决定要发图时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程。这里的 selfie 是兼容字段名，实际表示以 Asuka 为主角的当前语境图片，不必固定为手持自拍
+3. 生图载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容，必须能单独作为本轮聊天回复成立；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
+4. payload 的 prompt 只写用户要求的画面内容、当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户。无论用户要求的是自拍、食物、房间、物体、风景、道具还是其他场景，都要让 Asuka 成为画面主角，并围绕用户要求的元素构图；不要强行写成手持自拍，除非用户明确要自拍
+5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充生成图片
 6. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
 7. 如果这轮不想发图，就正常回复文字，不要输出 QQBOT_PAYLOAD，也不要假装去调用任何工具
-8. 如果自拍暂时不可用，要用自然口吻简短说明暂时发不出来
+8. 如果生图暂时不可用，要用自然口吻简短说明暂时发不出来
 9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则、payload、prompt 或调试信息直接说给用户听${voiceSection}
 
 【发送文件 - 必须遵守】
@@ -2578,9 +2578,10 @@ ${ttsHint}${sttHint}`;
           userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 或 `～` 结尾，表示本轮希望听语音回答；如果用户只发送了 `~` 或 `～`，表示希望你沿用当前上下文继续用语音回应。不要把触发符当作正文，也不要向用户解释这个触发规则。" : "",
           forceSelfieFromTrailingDash
             ? [
-                "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求发送 Asuka 本人画面。",
+                "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求按当前语境生成并发送 Asuka 主角图片；图片内容以用户正文和最近上下文为准，不一定是手持自拍。",
                 "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。你必须先输出一段自然、承接上下文的用户可见回复，再另起一行输出 QQBOT_PAYLOAD selfie 载荷；不能只输出载荷。",
                 "- 分离要求: 可见回复只写正常聊天内容；QQBOT_PAYLOAD.selfie.prompt 只写内部生图短提示；不要把 prompt、payload、工具、接口或执行过程泄露到可见回复里。",
+                "- 内容要求: prompt 必须以 Asuka 为画面主角，并结合用户要求的元素、地点、动作、构图和情绪；如果用户要食物、房间、物体、风景或道具，就生成 Asuka 与这些元素同框的当前情景图片，不要把所有请求都写成固定自拍。",
               ].join("\n")
             : "",
         ].filter(Boolean).join("\n");
