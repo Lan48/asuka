@@ -282,6 +282,34 @@ assert.match(
   /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,760}sendVisibleReplyText\("我去拍一张，等我一下。"\)[\s\S]{0,260}runDirectSelfieFlow\(selfiePrompt, undefined, \{ background: true \}\)/,
   "trailing dash selfie trigger should call the direct image generation flow in the background"
 );
+assert.match(
+  source,
+  /interface DirectSelfiePromptContext[\s\S]{0,520}recentChatTranscript[\s\S]{0,520}asukaStatePrompt[\s\S]{0,520}asukaConversationDigestPrompt/,
+  "direct selfie prompt should accept the same dynamic context used for normal replies"
+);
+assert.match(
+  source,
+  /const directSelfieContext: DirectSelfiePromptContext = \{[\s\S]{0,820}currentLocalTime[\s\S]{0,820}recentChatTranscript[\s\S]{0,820}asukaStatePrompt[\s\S]{0,820}asukaMemoryPrompt[\s\S]{0,820}asukaConversationDigestPrompt[\s\S]{0,820}currentTurnContext/,
+  "gateway should build a reusable direct selfie context from the normal reply context"
+);
+assert.match(
+  source,
+  /shouldForceSelfieFromTrailingDash\(event\.content\)[\s\S]{0,900}buildDirectSelfiePromptFromContext\([\s\S]{0,180}directSelfieContext/,
+  "trailing dash selfie trigger should pass the full direct selfie context into prompt generation"
+);
+const directSelfiePromptBuilderIndex = source.indexOf("function buildDirectSelfiePromptFromContext");
+assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct selfie prompt builder");
+const directSelfiePromptBuilder = source.slice(directSelfiePromptBuilderIndex, directSelfiePromptBuilderIndex + 2600);
+assert.match(
+  directSelfiePromptBuilder,
+  /formatSelfiePromptContextSection\("最近一周对话", context\.recentChatTranscript[\s\S]{0,520}formatSelfiePromptContextSection\("关系与场景状态", context\.asukaStatePrompt[\s\S]{0,520}formatSelfiePromptContextSection\("会话摘要", context\.asukaConversationDigestPrompt[\s\S]{0,760}formatSelfiePromptContextSection\("当前轮次", context\.currentTurnContext/,
+  "direct selfie prompt should serialize conversation transcript, state, digest, and current turn sections"
+);
+assert.match(
+  outboundSource,
+  /function buildCronSelfiePrompt\(\s*account: ResolvedQQBotAccount[\s\S]{0,1300}buildAsukaStatePrompt\(peerContext\)[\s\S]{0,1300}buildConversationDigestPrompt\(peerContext\)[\s\S]{0,1300}resolveRecentTranscriptFromNormalSession\(peerId\)/,
+  "cron selfie prompt should include proactive state, digest, and normal-session transcript context"
+);
 assert.ok(
   !source.includes("shouldForceFreshSession"),
   "reply loop correction should not strip conversation context or force /new sessions"

@@ -125,15 +125,30 @@ const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
 const MAX_SELFIE_RECENT_CONTEXT_CHARS = 640;
+const MAX_SELFIE_CONTEXT_SECTION_CHARS = 900;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_CHAT_CONTEXT_DAYS = 7;
 const MAX_CHAT_RECENT_ENTRY_CHARS = 500;
 const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 12_000;
 const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 24;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
-const MAX_SELFIE_PROMPT_CHARS = 1400;
+const MAX_SELFIE_PROMPT_CHARS = 4200;
 const MAX_SELFIE_CAPTION_CHARS = 240;
 let asukaVisualIdentityAnchorCache: string | undefined;
+
+interface DirectSelfiePromptContext {
+  currentLocalTime?: string;
+  recentChatTranscript?: string;
+  asukaStatePrompt?: string;
+  asukaMemoryPrompt?: string;
+  asukaConversationDigestPrompt?: string;
+  replyToBody?: string;
+  imageUnderstandingPrompt?: string;
+  searchPrompt?: string;
+  voiceAsrSection?: string;
+  receivedMediaSection?: string;
+  currentTurnContext?: string;
+}
 
 export function resolveCompanionThinkingLevel(_userText: string, _isGroupChat: boolean): QQBotDeepSeekThinkingLevel {
   return "off";
@@ -491,7 +506,17 @@ function isAsukaSelfiePlaceholderPath(imagePath: string): boolean {
   return imagePath.includes("/workspace/asuka-selfie/output/") || /selfie[_-]/i.test(imagePath);
 }
 
-function buildDirectSelfiePromptFromContext(userText: string, assistantText: string, peerId: string): string {
+function formatSelfiePromptContextSection(label: string, text: string | undefined, maxChars = MAX_SELFIE_CONTEXT_SECTION_CHARS): string {
+  const cleaned = truncateForSelfiePrompt(sanitizeSelfieContextText(text || ""), maxChars);
+  return cleaned ? `【${label}】${cleaned}` : "";
+}
+
+function buildDirectSelfiePromptFromContext(
+  userText: string,
+  assistantText: string,
+  peerId: string,
+  context: DirectSelfiePromptContext = {},
+): string {
   const normalizedUser = userText.trim().replace(/\s+/g, " ");
   const cleanedUser = truncateForSelfiePrompt(normalizedUser, MAX_SELFIE_USER_TEXT_CHARS);
   const cleanedAssistant = truncateForSelfiePrompt(
@@ -501,12 +526,25 @@ function buildDirectSelfiePromptFromContext(userText: string, assistantText: str
   const recentContext = buildRecentConversationContext(peerId, normalizedUser);
   const contextParts = [
     loadAsukaVisualIdentityAnchor(),
+    formatSelfiePromptContextSection("当前本地时间", context.currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}` : "",
+    formatSelfiePromptContextSection("最近一周对话", context.recentChatTranscript, 1300),
+    formatSelfiePromptContextSection("关系与场景状态", context.asukaStatePrompt),
+    formatSelfiePromptContextSection("长期记忆", context.asukaMemoryPrompt),
+    formatSelfiePromptContextSection("会话摘要", context.asukaConversationDigestPrompt),
+    formatSelfiePromptContextSection("引用消息", context.replyToBody, 520),
+    formatSelfiePromptContextSection("本轮媒体附件", context.receivedMediaSection, 520),
+    formatSelfiePromptContextSection("图片理解", context.imageUnderstandingPrompt, 620),
+    formatSelfiePromptContextSection("联网搜索", context.searchPrompt, 620),
+    formatSelfiePromptContextSection("语音上下文", context.voiceAsrSection, 420),
+    formatSelfiePromptContextSection("当前轮次", context.currentTurnContext, 900),
     cleanedAssistant ? `当前回复语境：${cleanedAssistant}` : "",
   ].filter(Boolean);
-  const contextClause = contextParts.length > 0 ? `${contextParts.join("。")}。请优先延续这个语境里的场景、动作、地点、穿着或正在做的事情。` : "";
+  const contextClause = contextParts.length > 0
+    ? `\n\n【自拍上下文】\n${contextParts.join("\n")}\n\n请优先延续这个语境里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。`
+    : "";
   return truncateForSelfiePrompt(
-    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境的本人画面。${contextClause}用户当前要求：${cleanedUser}`,
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境的本人画面。${contextClause}\n\n【用户当前要求】${cleanedUser}\n\n不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。`,
     MAX_SELFIE_PROMPT_CHARS,
   );
 }
@@ -2467,6 +2505,20 @@ ${ttsHint}${sttHint}`;
           }
         }
 
+        const directSelfieContext: DirectSelfiePromptContext = {
+          currentLocalTime,
+          recentChatTranscript,
+          asukaStatePrompt,
+          asukaMemoryPrompt,
+          asukaConversationDigestPrompt,
+          replyToBody,
+          imageUnderstandingPrompt,
+          searchPrompt,
+          voiceAsrSection,
+          receivedMediaSection,
+          currentTurnContext,
+        };
+
         // 命令直接透传，不注入上下文
         const userMessage = `${quotePart}${userContent}`;
         const agentBody = userContent.startsWith("/")
@@ -2801,6 +2853,7 @@ ${ttsHint}${sttHint}`;
             forcedSelfieUserText,
             "",
             event.senderId,
+            directSelfieContext,
           );
           const sent = await runDirectSelfieFlow(selfiePrompt, undefined, { background: true });
           if (!sent) {
@@ -3271,7 +3324,7 @@ ${ttsHint}${sttHint}`;
                             if (!(await fileExistsAsync(imagePath))) {
                               log?.error(`[qqbot:${account.accountId}] Image file not found: ${imagePath}`);
                               if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                              const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId);
+                              const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId, directSelfieContext);
                               const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
                               const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
                               if (!sent) {
@@ -3348,7 +3401,7 @@ ${ttsHint}${sttHint}`;
                       } catch (err) {
                         log?.error(`[qqbot:${account.accountId}] Failed to send image from <qqimg>: ${err}`);
                         if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                          const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId);
+                          const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId, directSelfieContext);
                           const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
                           const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
                           if (!sent) {
@@ -3561,6 +3614,7 @@ ${ttsHint}${sttHint}`;
                         event.content,
                         recoveredVisibleText,
                         event.senderId,
+                        directSelfieContext,
                       );
                       const selfieCaption = dedupeCaptionAgainstVisibleText(recoveredVisibleText, recoveredSelfie.payload.caption);
                       const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
@@ -3674,6 +3728,7 @@ ${ttsHint}${sttHint}`;
                         event.content,
                         visiblePayloadText,
                         event.senderId,
+                        directSelfieContext,
                       );
                       const selfieCaption = dedupeCaptionAgainstVisibleText(visiblePayloadText, parsedPayload.caption);
                       const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });

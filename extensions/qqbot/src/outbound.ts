@@ -1964,19 +1964,44 @@ async function renderPromiseDeliveryText(
 }
 
 function buildCronSelfiePrompt(
+  account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   visibleTextOverride?: string,
 ): string {
   const peerId = payload.targetAddress;
   const visibleContent = sanitizeSelfieContextText(visibleTextOverride || payload.selfieCaption || payload.content);
   const recentContext = buildRecentConversationContext(peerId, visibleContent);
+  const peerContext = buildPeerContextFromCronPayload(account, payload);
+  const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
+  const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
+  const recentTranscript = buildRecentConversationTranscript(peerId, renderContext?.peer?.lastUserText || visibleContent);
+  const sessionTranscript = resolveRecentTranscriptFromNormalSession(peerId);
+  const currentLocalTime = formatZonedDateTimeForPrompt(Date.now(), getPromptTimeZone(account));
+  const formatContextSection = (label: string, text: string | undefined, limit = 900): string => {
+    const cleaned = trimDeliveryText(text || "", limit);
+    return cleaned ? `【${label}】${cleaned}` : "";
+  };
+
   return [
     `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前约定的本人近照或自拍。`,
     loadAsukaVisualIdentityAnchor(),
+    formatContextSection("当前本地时间", currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}。` : "",
+    formatContextSection("最近几轮对话", recentTranscript, 900),
+    formatContextSection("普通会话 transcript", sessionTranscript, 1100),
+    formatContextSection("关系与场景状态", statePrompt),
+    formatContextSection("主动触达记忆", proactiveMemoryPrompt),
+    formatContextSection("会话摘要", conversationDigestPrompt),
     visibleContent ? `这次要兑现给用户的内容是：${visibleContent}。` : "",
+    renderContext?.promise.originalText ? `原始承诺原文：${trimDeliveryText(renderContext.promise.originalText, 420)}。` : "",
+    renderContext?.promise.sourceAssistantText ? `当时我说过的话：${trimDeliveryText(renderContext.promise.sourceAssistantText, 420)}。` : "",
+    renderContext?.peer?.lastUserText ? `用户最近一句：${trimDeliveryText(renderContext.peer.lastUserText, 320)}。` : "",
+    renderContext?.peer?.lastAssistantText ? `我最近一句：${trimDeliveryText(renderContext.peer.lastAssistantText, 320)}。` : "",
     sanitizeSelfieContextText(payload.selfiePrompt) || "",
-    "不要出现工具、脚本、接口、调试或任务流程痕迹。",
+    "请优先延续上述上下文里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。",
+    "不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。",
   ].filter(Boolean).join(" ");
 }
 
@@ -1998,7 +2023,7 @@ async function runDirectSelfieFlowForCron(
   }
 
   const target = `qqbot:c2c:${payload.targetAddress}`;
-  const prompt = buildCronSelfiePrompt(payload, captionOverride);
+  const prompt = buildCronSelfiePrompt(account, payload, captionOverride);
   const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content);
 
   try {
