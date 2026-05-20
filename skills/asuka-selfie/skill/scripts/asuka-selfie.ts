@@ -6,7 +6,8 @@
  */
 
 import { execFile } from "child_process";
-import { existsSync, readFileSync } from "fs";
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import os from "os";
 import path from "path";
 import { promisify } from "util";
 
@@ -27,6 +28,7 @@ const SELFIE_IDENTITY_LOCK_PROMPT = [
 
 interface StudioMediaItem {
   url?: string;
+  b64_json?: string;
 }
 
 interface StudioImageResponse {
@@ -227,6 +229,89 @@ function getStudioApiKey(): string {
   return process.env.STUDIO_API_KEY || process.env.DASHSCOPE_API_KEY || "";
 }
 
+function getStudioAuthProfile(): string {
+  return process.env.STUDIO_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || "";
+}
+
+function resolveAuthProfilesPath(): string {
+  if (process.env.OPENCLAW_AUTH_PROFILES_PATH) return path.resolve(process.env.OPENCLAW_AUTH_PROFILES_PATH);
+  if (process.env.OPENCLAW_AGENT_DIR) return path.resolve(process.env.OPENCLAW_AGENT_DIR, "auth-profiles.json");
+  const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), ".openclaw");
+  const agentId = process.env.OPENCLAW_AGENT_ID || "main";
+  return path.join(stateDir, "agents", agentId, "agent", "auth-profiles.json");
+}
+
+function getAccountId(accessToken: string): string | undefined {
+  try {
+    const payload = accessToken.split(".")[1];
+    if (!payload) return undefined;
+    const decoded = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const auth = JSON.parse(decoded)?.["https://api.openai.com/auth"];
+    return typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function refreshOpenAICodexProfile(credential: Record<string, any>): Promise<Record<string, any>> {
+  if (!credential.refresh) throw new Error("OAuth profile is missing refresh token");
+  const response = await fetch("https://auth.openai.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: String(credential.refresh),
+      client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+    }),
+  });
+  if (!response.ok) throw new Error(`OpenAI Codex OAuth refresh failed: HTTP ${response.status}`);
+  const json = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!json.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
+    throw new Error("OpenAI Codex OAuth refresh response missing token fields");
+  }
+  return {
+    ...credential,
+    type: "oauth",
+    provider: "openai-codex",
+    access: json.access_token,
+    refresh: json.refresh_token,
+    expires: Date.now() + json.expires_in * 1000,
+    accountId: getAccountId(json.access_token) || credential.accountId,
+  };
+}
+
+async function resolveStudioBearerToken(): Promise<string> {
+  const authProfile = getStudioAuthProfile().trim();
+  if (!authProfile) return getStudioApiKey();
+
+  const authProfilesPath = resolveAuthProfilesPath();
+  if (!existsSync(authProfilesPath)) throw new Error(`OAuth profile store not found: ${authProfilesPath}`);
+  const store = JSON.parse(readFileSync(authProfilesPath, "utf8"));
+  const credential = store?.profiles?.[authProfile];
+  if (!credential) throw new Error(`OAuth profile not found: ${authProfile}`);
+  if (credential.type !== "oauth") throw new Error(`Auth profile ${authProfile} is not OAuth`);
+  if (!credential.access) throw new Error(`OAuth profile ${authProfile} is missing access token`);
+
+  if (typeof credential.expires === "number" && credential.expires > Date.now() + 60_000) {
+    return credential.access;
+  }
+  if (credential.provider !== "openai-codex") {
+    throw new Error(`OAuth refresh is not supported for provider ${credential.provider || "(missing)"}`);
+  }
+
+  const refreshed = await refreshOpenAICodexProfile(credential);
+  store.profiles[authProfile] = refreshed;
+  const tmpPath = `${authProfilesPath}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmpPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  renameSync(tmpPath, authProfilesPath);
+  try {
+    chmodSync(authProfilesPath, 0o600);
+  } catch {
+    // Best effort on Windows filesystems.
+  }
+  return refreshed.access;
+}
+
 function getModelId(): string {
   return process.env.STUDIO_IMAGE_EDIT_MODEL
     || process.env.STUDIO_IMAGE_MODEL
@@ -308,6 +393,7 @@ async function resolveImagePart(input: string): Promise<{ blob: Blob; filename: 
 function extractImageUrl(response: StudioImageResponse): string {
   for (const item of response.data || []) {
     if (item?.url) return item.url;
+    if (item?.b64_json) return `data:image/png;base64,${item.b64_json}`;
   }
 
   for (const url of response.result_urls || []) {
@@ -346,11 +432,11 @@ async function generateImageEdit(input: {
   extraReferenceImageUrls?: string[];
   extraReferenceImagePaths?: string[];
 }): Promise<StudioImageResponse> {
-  const apiKey = getStudioApiKey();
+  const apiKey = await resolveStudioBearerToken();
 
   if (!apiKey) {
     throw new Error(
-      "STUDIO_API_KEY environment variable not set. Configure your Studio media API key first."
+      "STUDIO_API_KEY or STUDIO_AUTH_PROFILE environment variable not set. Configure your Studio media API key or OpenClaw OAuth profile first."
     );
   }
 
@@ -507,6 +593,7 @@ Arguments:
 
 Environment:
   STUDIO_API_KEY       - Studio media API key
+  STUDIO_AUTH_PROFILE  - Optional OpenClaw OAuth profile id, for example openai-codex:zhueshun@gmail.com
   STUDIO_API_BASE_URL  - Optional base URL, default ${DEFAULT_STUDIO_BASE_URL}
   STUDIO_IMAGE_MODEL   - Optional image edit model override, default ${DEFAULT_MODEL}
   STUDIO_IMAGE_QUALITY - Optional quality, default ${DEFAULT_QUALITY}

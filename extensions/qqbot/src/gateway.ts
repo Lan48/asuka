@@ -29,6 +29,7 @@ import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
+import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
 
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
@@ -49,6 +50,7 @@ type ReplyDeliverPayload = {
 
 interface StudioSelfieConfig {
   apiKey: string;
+  authProfile?: string;
   baseUrl: string;
   modelId: string;
   quality: string;
@@ -78,6 +80,7 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
   const providerApiKey = getConfigString(minimaxProvider.apiKey);
   const providerBaseUrl = getConfigString(minimaxProvider.baseUrl);
   const apiKey = getConfigString(skillCfg.apiKey, skillEnv.STUDIO_API_KEY, skillEnv.DASHSCOPE_API_KEY, providerApiKey);
+  const authProfile = getConfigString(skillEnv.STUDIO_AUTH_PROFILE, skillEnv.OPENCLAW_AUTH_PROFILE);
   const baseUrl = getConfigString(
     skillEnv.STUDIO_API_BASE_URL,
     skillEnv.STUDIO_BASE_URL,
@@ -97,6 +100,7 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
 
   return {
     apiKey,
+    authProfile,
     baseUrl,
     modelId,
     quality: getConfigString(skillEnv.STUDIO_IMAGE_QUALITY, "standard"),
@@ -763,6 +767,7 @@ function extractStudioImageUrl(response: any): string {
   const data = Array.isArray(response?.data) ? response.data : [];
   for (const item of data) {
     if (item?.url && typeof item.url === "string") return item.url;
+    if (item?.b64_json && typeof item.b64_json === "string") return `data:image/png;base64,${item.b64_json}`;
   }
   const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
   for (const url of resultUrls) {
@@ -849,6 +854,10 @@ async function generateStudioSelfieImageUrl(
 
   const form = new FormData();
   const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  const bearerToken = await resolveBearerTokenFromApiKeyOrProfile({
+    apiKey: config.apiKey,
+    authProfile: config.authProfile,
+  });
   form.append("model", config.modelId);
   form.append("prompt", buildStudioSelfiePrompt(prompt));
   form.append("size", normalizeStudioImageSize(size));
@@ -860,7 +869,7 @@ async function generateStudioSelfieImageUrl(
   const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${bearerToken}`,
       Accept: "application/json",
     },
     body: form,
@@ -2616,7 +2625,7 @@ ${ttsHint}${sttHint}`;
 
         const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
           const selfieConfig = resolveDirectSelfieRuntimeConfig(cfg as Record<string, any>);
-          const { apiKey, baseUrl, modelId, quality } = selfieConfig;
+          const { apiKey, authProfile, baseUrl, modelId, quality } = selfieConfig;
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
@@ -2682,13 +2691,13 @@ ${ttsHint}${sttHint}`;
             if (!referenceImagePath) {
               throw new Error("no bundled reference image found");
             }
-            const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, baseUrl, modelId, quality }, referenceImagePath);
+            const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
             log?.info(`[qqbot:${account.accountId}] Studio selfie image generated for ${event.senderId}`);
             return await sendGeneratedSelfieImage(imageUrl);
           };
 
-          if (!apiKey) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image API key missing`);
+          if (!apiKey && !authProfile) {
+            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image API key/auth profile missing`);
             return await sendFallbackSelfieImage();
           }
 

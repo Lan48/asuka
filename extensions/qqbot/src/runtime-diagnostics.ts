@@ -268,7 +268,9 @@ function summarizeMediaReadiness(
     imageDataDir: summarizeFile(path.join(qqbotDataDir, "images")),
     studioApiKeyConfigured: hasConfiguredSecret(skillCfg?.apiKey)
       || hasConfiguredSecret(skillEnv.STUDIO_API_KEY)
+      || hasConfiguredSecret(skillEnv.STUDIO_AUTH_PROFILE)
       || hasConfiguredSecret(env.STUDIO_API_KEY)
+      || hasConfiguredSecret(env.STUDIO_AUTH_PROFILE)
       || hasConfiguredSecret(skillEnv.DASHSCOPE_API_KEY)
       || hasConfiguredSecret(env.DASHSCOPE_API_KEY),
     studioModel: model || "third_party_media:gemini-3-pro-image-preview",
@@ -354,7 +356,9 @@ function summarizeMiniMaxReadiness(
     || providerBaseUrlConfigured;
   const imageApiKeyConfigured = hasConfiguredSecret(skillCfg?.apiKey)
     || hasConfiguredSecret(skillEnv.STUDIO_API_KEY)
+    || hasConfiguredSecret(skillEnv.STUDIO_AUTH_PROFILE)
     || hasConfiguredSecret(env.STUDIO_API_KEY)
+    || hasConfiguredSecret(env.STUDIO_AUTH_PROFILE)
     || providerApiKeyConfigured;
   const imageConfigured = imageBaseUrlConfigured && imageApiKeyConfigured && /^image-01(?:$|-)/i.test(imageModel);
 

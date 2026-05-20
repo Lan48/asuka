@@ -38,6 +38,7 @@ import { isAsukaNarrationSegment, splitAsukaNarrationSegments } from "./utils/na
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
+import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -59,6 +60,7 @@ let asukaVisualIdentityAnchorCache: string | undefined;
 type DecodedCronPayload = NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>;
 interface StudioSelfieConfig {
   apiKey: string;
+  authProfile?: string;
   baseUrl: string;
   modelId: string;
   quality: string;
@@ -1261,6 +1263,7 @@ function resolveRecentTranscriptFromNormalSession(targetAddress: string): string
 
 function resolveSelfieSkillRuntimeConfig(): {
   apiKey: string;
+  authProfile: string;
   baseUrl: string;
   modelId: string;
   quality: string;
@@ -1271,6 +1274,7 @@ function resolveSelfieSkillRuntimeConfig(): {
   const env = skillCfg?.env || {};
   return {
     apiKey: String(skillCfg?.apiKey || env.STUDIO_API_KEY || process.env.STUDIO_API_KEY || env.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
+    authProfile: String(env.STUDIO_AUTH_PROFILE || process.env.STUDIO_AUTH_PROFILE || env.OPENCLAW_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || "").trim(),
     baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim(),
     modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "third_party_media:gemini-3-pro-image-preview").trim(),
     quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
@@ -1360,6 +1364,7 @@ function extractStudioImageUrl(response: any): string {
   const data = Array.isArray(response?.data) ? response.data : [];
   for (const item of data) {
     if (item?.url && typeof item.url === "string") return item.url;
+    if (item?.b64_json && typeof item.b64_json === "string") return `data:image/png;base64,${item.b64_json}`;
   }
   const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
   for (const url of resultUrls) {
@@ -1446,6 +1451,10 @@ async function generateStudioSelfieImageUrl(
 
   const form = new FormData();
   const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  const bearerToken = await resolveBearerTokenFromApiKeyOrProfile({
+    apiKey: config.apiKey,
+    authProfile: config.authProfile,
+  });
   form.append("model", config.modelId);
   form.append("prompt", buildStudioSelfiePrompt(prompt));
   form.append("size", normalizeStudioImageSize(size));
@@ -1457,7 +1466,7 @@ async function generateStudioSelfieImageUrl(
   const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${bearerToken}`,
       Accept: "application/json",
     },
     body: form,
@@ -1969,10 +1978,10 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
-  const { apiKey, baseUrl, modelId, quality, referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
+  const { apiKey, authProfile, baseUrl, modelId, quality, referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
 
-  if (!apiKey) {
-    return { channel: "qqbot", error: "selfie skill api key missing" };
+  if (!apiKey && !authProfile) {
+    return { channel: "qqbot", error: "selfie skill api key/auth profile missing" };
   }
   const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
   if (!referenceImagePath) {
@@ -1984,7 +1993,7 @@ async function runDirectSelfieFlowForCron(
   const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content);
 
   try {
-    const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, baseUrl, modelId, quality }, referenceImagePath);
+    const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
     console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image for target=${payload.targetAddress}`);
     const result = await sendMedia({
       to: target,
