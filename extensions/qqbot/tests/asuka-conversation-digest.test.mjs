@@ -101,7 +101,7 @@ setRefIndex("REFIDX_DIGEST_TTS", {
 });
 
 const recentTranscript = buildRecentConversationTranscript("user-digest", "当前消息", now);
-assert.ok(recentTranscript.length <= 12_080, "main reply recent transcript should be capped near 12k chars");
+assert.ok(recentTranscript.length <= 18_080, "main reply recent transcript should be capped near 18k chars");
 assert.ok(!recentTranscript.includes("第 0 条"), "main reply transcript should keep the latest entries instead of full week history");
 
 let capturedUrl = "";
@@ -127,68 +127,6 @@ globalThis.fetch = async (url, init) => {
           lastSalientTurns: ["用户接受用大模型管理近一周摘要"],
           evidenceNotes: ["明确说过: 用户要求不要像命令机器人", "近轮推断: 用户更在意连续性"],
         },
-        daily: [
-          {
-            date: "2026-05-10",
-            detailLevel: "brief",
-            relationshipContinuity: "普通日常，细节未记录。",
-            emotionalArc: "日常",
-            openLoops: [],
-            userPreferences: [],
-            temporaryDirectives: [],
-            asukaSelfContinuity: "日常在家",
-            sceneContinuity: "普通日常，无特殊事件记录。",
-            importantFacts: [],
-            thingsToAvoid: [],
-            salientTurns: [],
-            evidenceNotes: [],
-          },
-          {
-            date: "2026-05-09",
-            detailLevel: "brief",
-            relationshipContinuity: "较早前保持轻陪伴。",
-            emotionalArc: "平稳。",
-            openLoops: ["旧事项只保留摘要"],
-            userPreferences: [],
-            temporaryDirectives: [],
-            asukaSelfContinuity: "",
-            sceneContinuity: "旧场景只作背景。",
-            importantFacts: ["旧事实简略"],
-            thingsToAvoid: [],
-            salientTurns: ["旧关键句"],
-            evidenceNotes: ["旧摘要继承: 置信度较低"],
-          },
-          {
-            date: "2026-05-14",
-            detailLevel: "detailed",
-            relationshipContinuity: "昨天用户强调不要像命令机器人。",
-            emotionalArc: "对连续性更敏感。",
-            openLoops: ["继续优化主回复上下文负担", "迟到愧疚情绪已和解"],
-            userPreferences: ["保持中文自然陪伴"],
-            temporaryDirectives: [],
-            asukaSelfContinuity: "Asuka 延续杭州校园生活线。",
-            sceneContinuity: "昨天场景不能跳回睡前。",
-            importantFacts: ["昨天确定使用近一周摘要"],
-            thingsToAvoid: ["不要暴露内部工具"],
-            salientTurns: ["用户接受用大模型管理近一周摘要"],
-            evidenceNotes: ["明确说过: 用户接受近一周摘要方案"],
-          },
-          {
-            date: "2026-05-15",
-            detailLevel: "detailed",
-            relationshipContinuity: "今天继续确认摘要结构。",
-            emotionalArc: "用户希望保留更多细节。",
-            openLoops: ["实现 daily + weekly 摘要"],
-            userPreferences: ["最近摘要更详细，远的摘要更简略"],
-            temporaryDirectives: ["接下来十轮用语音回答（从今天请求开始，需外部计数）"],
-            asukaSelfContinuity: "Asuka 当前生活线要承接今天。",
-            sceneContinuity: "今天是当前场景优先。",
-            importantFacts: ["摘要同文件保存"],
-            thingsToAvoid: ["不要把远日细节塞满 prompt"],
-            salientTurns: ["这样会不会太省略？"],
-            evidenceNotes: ["明确说过: 用户要求最近详细、远的简略"],
-          },
-        ],
       }),
     }],
   }), {
@@ -207,19 +145,19 @@ try {
   assert.ok(digest, "digest update should write normalized digest");
   assert.equal(capturedUrl, "https://api.minimaxi.com/anthropic/v1/messages");
   assert.equal(capturedBody.model, "MiniMax-M2.7");
-  assert.equal(capturedBody.max_tokens, 6000, "digest curator should leave room for MiniMax text after thinking blocks");
+  assert.equal(capturedBody.max_tokens, 4000, "weekly digest curator should leave room for MiniMax text");
   assert.deepEqual(capturedBody.thinking, { type: "disabled" }, "digest curator should disable provider thinking output");
   assert.equal(capturedBody.system.includes("不能生成用户可见回复"), true, "digest curator must be explicitly non-user-facing");
-  assert.equal(capturedBody.system.includes("daily 日摘要"), true, "digest curator should produce daily summaries");
+  assert.equal(capturedBody.system.includes("不要生成 daily 日摘要"), true, "digest curator should be weekly-only");
   assert.equal(capturedBody.system.includes("完整摘要"), true, "digest curator should rewrite the whole digest, not append only");
   assert.equal(capturedBody.system.includes("旧摘要只是草稿"), true, "digest curator should treat previous digest as editable context");
   assert.equal(String(capturedBody.messages[0].content).includes("### 2026-05-15"), true, "digest prompt should group history by local day");
-  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), true, "digest prompt should include long-term memory context for maintenance");
+  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), false, "digest prompt should only use raw dialogue and previous weekly digest");
   assert.equal(String(capturedBody.messages[0].content).includes("QQBOT_PAYLOAD"), false, "digest prompt should remove structured payload artifacts");
   assert.equal(String(capturedBody.messages[0].content).includes("用户:"), false, "digest prompt should avoid third-person user labels");
   assert.equal(String(capturedBody.messages[0].content).includes("Asuka:"), false, "digest prompt should avoid third-person bot labels");
   assert.equal(String(capturedBody.messages[0].content).includes("完整替换版 digest"), true, "digest prompt should require full replacement updates");
-  assert.equal(String(capturedBody.messages[0].content).includes("如果旧摘要被新上下文纠正、补全、完成或过期"), true, "digest prompt should require revising stale prior summaries");
+  assert.equal(String(capturedBody.messages[0].content).includes("如果旧摘要被新原文纠正、补全、完成或过期"), true, "digest prompt should require revising stale prior summaries");
   assert.equal(String(capturedBody.messages[0].content).includes("已经成功发出的语音回复"), true, "digest prompt should include outbound TTS voice transcripts for counting temporary voice directives");
   assert.equal(digest.version, 2);
   assert.equal(JSON.stringify(digest).includes("用户"), false, "stored digest should normalize user perspective");
@@ -229,12 +167,7 @@ try {
   assert.equal(digest.weekly.userPreferences.some((item) => item.includes("十轮")), false, "temporary directives should not remain stable weekly preferences");
   assert.equal(digest.weekly.temporaryDirectives[0].includes("十轮"), true, "temporary directives should be kept separately from stable preferences");
   assert.equal(digest.weekly.evidenceNotes.length > 0, true, "digest should keep evidence notes");
-  assert.equal(digest.daily.some((day) => day.date === "2026-05-10"), false, "empty no-record daily placeholders should be pruned");
-  assert.equal(digest.daily.at(-1).date, "2026-05-15");
-  assert.equal(digest.daily.at(-1).detailLevel, "detailed");
-  assert.equal(digest.daily.at(-1).userPreferences.some((item) => item.includes("十轮")), false, "temporary directives should not remain stable daily preferences");
-  assert.equal(digest.daily.at(-1).temporaryDirectives.some((item) => item.includes("十轮")), true, "temporary daily directives should be preserved with expiry context");
-  assert.equal(digest.daily[0].detailLevel, "brief");
+  assert.equal(digest.daily.length, 0, "stored digest should be weekly-only");
 
   const prompt = buildConversationDigestPrompt(context);
   assert.match(prompt, /【近一周会话摘要】/);
@@ -242,16 +175,14 @@ try {
   assert.match(prompt, /当前未闭环事项/);
   assert.match(prompt, /临时指令\/待过期偏好/);
   assert.match(prompt, /证据\/置信度/);
-  assert.match(prompt, /【每日摘要】/);
-  assert.match(prompt, /2026-05-15（detailed）/);
-  assert.doesNotMatch(prompt, /2026-05-10（brief）/);
+  assert.doesNotMatch(prompt, /【每日摘要】/, "main digest prompt should not contain daily summaries");
 
   setRefIndex("REFIDX_DIGEST_DAILY_MAINT", {
     content: "今晚继续把上下文整理成精简摘要，后续回复要自然承接。",
     senderId: "daily-peer",
     peerId: "daily-peer",
     senderName: "用户",
-    timestamp: Date.parse("2026-05-16T04:30:00+08:00"),
+    timestamp: Date.parse("2026-05-15T23:30:00+08:00"),
     isBot: false,
   });
   capturedBody = {};
@@ -275,8 +206,9 @@ try {
   });
   assert.ok(dailyResult.checked >= 1, "daily digest maintenance should scan active peers");
   assert.ok(dailyResult.updated >= 1, "daily digest maintenance should update peers not refreshed today");
-  assert.equal(String(capturedBody.messages[0].content).includes("每日 digest 维护"), true, "daily maintenance should mark the synthetic update turn");
-  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), true, "daily maintenance should include memory context");
+  assert.equal(String(capturedBody.messages[0].content).includes("本次维护目标日期: 2026-05-15"), true, "daily maintenance should target the last completed local day");
+  assert.equal(String(capturedBody.messages[0].content).includes("每日 digest 维护"), false, "daily maintenance should not pollute weekly digest with synthetic task text");
+  assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), false, "daily maintenance should only use raw dialogue and previous weekly digest");
 
   const beforeHourResult = await runDailyConversationDigestUpdate({
     accountId: "default",
@@ -343,7 +275,7 @@ try {
     }],
   });
   assert.match(upgradedPrompt, /临时指令\/待过期偏好: 无/, "old v2 digests should format without missing-field crashes");
-  assert.doesNotMatch(upgradedPrompt, /2026-05-12/, "old empty daily placeholders should be pruned during upgrade");
+  assert.doesNotMatch(upgradedPrompt, /2026-05-12/, "old daily summaries should be ignored during weekly-only upgrade");
 } finally {
   globalThis.fetch = originalFetch;
   fs.rmSync(tmpHome, { recursive: true, force: true });

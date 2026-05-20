@@ -354,13 +354,13 @@ export function buildTemplate(existing = {}) {
           baseUrl: "https://api.minimaxi.com/v1",
           apiKey: "",
           api: "openai-completions",
-          models: [{ id: "MiniMax-M2.7", name: "MiniMax M2.7", reasoning: true }],
+          models: [{ id: "MiniMax-M2.7", name: "MiniMax M2.7", reasoning: true, contextWindow: 204800, maxTokens: 8192 }],
         },
         deepseek: {
           baseUrl: "",
           apiKey: "",
           api: "openai-completions",
-          models: [{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true }],
+          models: [{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true, contextWindow: 1048576, maxTokens: 8192 }],
         },
         "openai-codex": {
           baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -393,7 +393,7 @@ export function buildTemplate(existing = {}) {
         minimax: {
           vision: { enabled: true, model: "MiniMax-VLM", maxImagesPerMessage: 3, timeoutMs: 30000 },
           search: { enabled: true, model: "MiniMax-M2.7", intentModel: "MiniMax-M2.7", maxResults: 4, timeoutMs: 30000 },
-          digest: { enabled: true, model: "MiniMax-M2.7", maxHistoryChars: 8000, maxDigestChars: 1800 },
+          digest: { enabled: true, model: "MiniMax-M2.7", maxHistoryChars: 120000, maxDigestChars: 3800, dailyUpdate: { enabled: true, hour: 4 } },
         },
       },
     },

@@ -2,21 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
-import { buildAsukaLongTermMemoryPrompt } from "./asuka-memory.js";
 import { formatRefEntryForAgent, getActivePeerIdsSince, getEntriesForPeerSince } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 
 const DIGEST_DIR = getQQBotDataDir("data", "asuka-conversation-digest");
 const DIGEST_FILE = path.join(DIGEST_DIR, "digest.json");
 const DIGEST_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const DIGEST_DAILY_DAYS = 7;
 const DEFAULT_DIGEST_TIME_ZONE = "Asia/Shanghai";
 const DEFAULT_DIGEST_MODEL = "MiniMax-M2.7";
-const DEFAULT_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_HISTORY_CHARS = 30_000;
-const DEFAULT_MAX_DIGEST_CHARS = 5_200;
+const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_HISTORY_CHARS = 120_000;
+const DEFAULT_MAX_DIGEST_CHARS = 3_800;
 const DEFAULT_MIN_UPDATE_INTERVAL_MS = 20_000;
-const DEFAULT_MAX_HISTORY_ENTRIES = 512;
+const DEFAULT_MAX_HISTORY_ENTRIES = 2_048;
 const DEFAULT_DAILY_DIGEST_HOUR = 4;
 const DEFAULT_DAILY_DIGEST_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_DAILY_DIGEST_STARTUP_DELAY_MS = 90_000;
@@ -98,6 +96,7 @@ interface ConversationDigestUpdateInput {
   userText: string;
   assistantText: string;
   now?: number;
+  historyTargetDate?: string;
   log?: { info?: (message: string) => void; error?: (message: string) => void };
 }
 
@@ -343,10 +342,6 @@ function normalizeOpenLoops(value: unknown): string[] {
     .slice(0, MAX_ARRAY_ITEMS);
 }
 
-function normalizeDetailLevel(value: unknown, fallback: ConversationDailyDigest["detailLevel"]): ConversationDailyDigest["detailLevel"] {
-  return value === "detailed" || value === "balanced" || value === "brief" ? value : fallback;
-}
-
 function normalizeWeeklyDigest(value: unknown): ConversationWeeklyDigest {
   const input = getObject(value) ?? {};
   return {
@@ -364,85 +359,11 @@ function normalizeWeeklyDigest(value: unknown): ConversationWeeklyDigest {
   };
 }
 
-function dailyFieldLimit(level: ConversationDailyDigest["detailLevel"]): number {
-  if (level === "detailed") return 520;
-  if (level === "balanced") return 360;
-  return 220;
-}
-
-function dailyArrayLimit(level: ConversationDailyDigest["detailLevel"]): number {
-  if (level === "detailed") return 8;
-  if (level === "balanced") return 5;
-  return 3;
-}
-
-function normalizeDailyDigest(value: unknown, fallbackDate: string, fallbackLevel: ConversationDailyDigest["detailLevel"]): ConversationDailyDigest | null {
-  const input = getObject(value);
-  if (!input) return null;
-  const date = getStringValue(input.date, fallbackDate);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-  const detailLevel = normalizeDetailLevel(input.detailLevel, fallbackLevel);
-  const fieldLimit = dailyFieldLimit(detailLevel);
-  const arrayLimit = dailyArrayLimit(detailLevel);
-  const clampArray = (arrayValue: unknown): string[] => normalizeStringArray(arrayValue).slice(0, arrayLimit);
-  const normalized = {
-    date,
-    detailLevel,
-    relationshipContinuity: sanitizeDigestPerspectiveText(input.relationshipContinuity, fieldLimit),
-    emotionalArc: sanitizeDigestPerspectiveText(input.emotionalArc ?? input.recentEmotionalArc, fieldLimit),
-    openLoops: normalizeOpenLoops(input.openLoops ?? input.currentOpenLoops).slice(0, arrayLimit),
-    userPreferences: normalizeStablePreferences(input.userPreferences).slice(0, arrayLimit),
-    temporaryDirectives: normalizeTemporaryDirectives(input.temporaryDirectives ?? input.temporaryPreferences, normalizeStringArray(input.userPreferences).filter(isTemporaryDirectiveText)).slice(0, arrayLimit),
-    asukaSelfContinuity: sanitizeDigestPerspectiveText(input.asukaSelfContinuity, fieldLimit),
-    sceneContinuity: sanitizeDigestPerspectiveText(input.sceneContinuity, fieldLimit),
-    importantFacts: clampArray(input.importantFacts ?? input.importantRecentFacts),
-    thingsToAvoid: clampArray(input.thingsToAvoid),
-    salientTurns: clampArray(input.salientTurns ?? input.lastSalientTurns),
-    evidenceNotes: clampArray(input.evidenceNotes ?? input.evidence),
-  };
-  return isEmptyDailyPlaceholder(normalized) ? null : normalized;
-}
-
-function isEmptyDailyPlaceholder(day: ConversationDailyDigest): boolean {
-  const joinedText = [
-    day.relationshipContinuity,
-    day.emotionalArc,
-    day.asukaSelfContinuity,
-    day.sceneContinuity,
-  ].join(" ");
-  const hasArrays = [
-    day.openLoops,
-    day.userPreferences,
-    day.temporaryDirectives,
-    day.importantFacts,
-    day.thingsToAvoid,
-    day.salientTurns,
-    day.evidenceNotes,
-  ].some((items) => items.length > 0);
-  if (!joinedText.trim() && !hasArrays) return true;
-  return !hasArrays && /(普通日常|日常在家|细节未记录|无特殊事件记录|没有记录|无历史|no entries|no record)/i.test(joinedText);
-}
-
 function fallbackDetailLevelForIndex(index: number, total: number): ConversationDailyDigest["detailLevel"] {
   const ageFromNewest = total - index - 1;
   if (ageFromNewest <= 1) return "detailed";
   if (ageFromNewest <= 3) return "balanced";
   return "brief";
-}
-
-function normalizeDailyDigests(value: unknown): ConversationDailyDigest[] {
-  const raw = Array.isArray(value) ? value : [];
-  const normalized = raw
-    .map((item, index) => normalizeDailyDigest(item, "", fallbackDetailLevelForIndex(index, raw.length)))
-    .filter((item): item is ConversationDailyDigest => Boolean(item))
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .slice(-DIGEST_DAILY_DAYS);
-
-  const total = normalized.length;
-  return normalized.map((item, index) => ({
-    ...item,
-    detailLevel: normalizeDetailLevel(item.detailLevel, fallbackDetailLevelForIndex(index, total)),
-  }));
 }
 
 function addDays(timestamp: number, days: number): number {
@@ -482,7 +403,6 @@ function normalizeFutureDateArray(items: string[], now: number): string[] {
 }
 
 function constrainDigestDates(digest: ConversationDigest, now: number): ConversationDigest {
-  const today = formatLocalDate(now, DEFAULT_DIGEST_TIME_ZONE);
   const weekly = digest.weekly;
   return {
     ...digest,
@@ -499,22 +419,7 @@ function constrainDigestDates(digest: ConversationDigest, now: number): Conversa
       lastSalientTurns: normalizeFutureDateArray(weekly.lastSalientTurns, now),
       evidenceNotes: normalizeFutureDateArray(weekly.evidenceNotes, now),
     },
-    daily: digest.daily
-      .filter((day) => day.date <= today)
-      .map((day) => ({
-        ...day,
-        relationshipContinuity: normalizeFutureDateReferences(day.relationshipContinuity, now),
-        emotionalArc: normalizeFutureDateReferences(day.emotionalArc, now),
-        openLoops: normalizeFutureDateArray(day.openLoops, now),
-        userPreferences: normalizeFutureDateArray(day.userPreferences, now),
-        temporaryDirectives: normalizeFutureDateArray(day.temporaryDirectives, now),
-        asukaSelfContinuity: normalizeFutureDateReferences(day.asukaSelfContinuity, now),
-        sceneContinuity: normalizeFutureDateReferences(day.sceneContinuity, now),
-        importantFacts: normalizeFutureDateArray(day.importantFacts, now),
-        thingsToAvoid: normalizeFutureDateArray(day.thingsToAvoid, now),
-        salientTurns: normalizeFutureDateArray(day.salientTurns, now),
-        evidenceNotes: normalizeFutureDateArray(day.evidenceNotes, now),
-      })),
+    daily: [],
   };
 }
 
@@ -529,7 +434,7 @@ function normalizeDigest(value: unknown, peerKey: string, now: number, maxDigest
     coveredUntil,
     timeZone: getStringValue(input.timeZone, DEFAULT_DIGEST_TIME_ZONE),
     weekly: normalizeWeeklyDigest(weeklyInput),
-    daily: normalizeDailyDigests(input.daily),
+    daily: [],
   };
   return trimDigestToBudget(constrainDigestDates(digest, now), maxDigestChars);
 }
@@ -542,17 +447,11 @@ function trimDigestToBudget(digest: ConversationDigest, maxChars: number): Conve
   const next: ConversationDigest = {
     ...digest,
     weekly: { ...digest.weekly },
-    daily: digest.daily.map((item) => ({ ...item })),
+    daily: [],
   };
-  for (const day of next.daily) {
-    while (digestPromptSize(next) > maxChars && day.salientTurns.length > 0) day.salientTurns.pop();
-    while (digestPromptSize(next) > maxChars && day.importantFacts.length > 0) day.importantFacts.pop();
-    while (digestPromptSize(next) > maxChars && day.openLoops.length > 0 && day.detailLevel !== "detailed") day.openLoops.pop();
-  }
   while (digestPromptSize(next) > maxChars && next.weekly.lastSalientTurns.length > 0) next.weekly.lastSalientTurns.pop();
   while (digestPromptSize(next) > maxChars && next.weekly.importantRecentFacts.length > 0) next.weekly.importantRecentFacts.pop();
   while (digestPromptSize(next) > maxChars && next.weekly.currentOpenLoops.length > 0) next.weekly.currentOpenLoops.pop();
-  while (digestPromptSize(next) > maxChars && next.daily.length > 2) next.daily.shift();
   return next;
 }
 
@@ -640,9 +539,10 @@ function formatDailyHistory(entries: ReturnType<typeof getEntriesForPeerSince>, 
   return trimHistoryLines(sections, maxChars);
 }
 
-function buildHistoryForDigest(peerId: string, now: number, config: MiniMaxDigestConfig): { text: string; coveredUntil: number } {
+function buildHistoryForDigest(peerId: string, now: number, config: MiniMaxDigestConfig, targetDate?: string): { text: string; coveredUntil: number } {
   const since = now - DIGEST_WINDOW_MS;
-  const entries = getEntriesForPeerSince(peerId, since, config.maxHistoryEntries);
+  const entries = getEntriesForPeerSince(peerId, since, config.maxHistoryEntries)
+    .filter((entry) => !targetDate || formatLocalDate(entry.timestamp, DEFAULT_DIGEST_TIME_ZONE) === targetDate);
   const coveredUntil = entries.reduce((max, entry) => Math.max(max, entry.timestamp), 0);
   return {
     text: formatDailyHistory(entries, config.maxHistoryChars),
@@ -653,37 +553,43 @@ function buildHistoryForDigest(peerId: string, now: number, config: MiniMaxDiges
 function buildDigestPrompt(input: {
   previous?: ConversationDigest | LegacyConversationDigest;
   history: string;
-  memoryPrompt?: string;
   userText: string;
   assistantText: string;
   now: number;
+  historyTargetDate?: string;
 }): string {
   const previousJson = input.previous ? JSON.stringify(upgradeLegacyDigest(input.previous), null, 2) : "{}";
   const currentLocalDate = formatLocalDate(input.now, DEFAULT_DIGEST_TIME_ZONE);
+  const targetLine = input.historyTargetDate
+    ? `本次维护目标日期: ${input.historyTargetDate}（只使用该自然日的原始对话）`
+    : "本次维护目标范围: 最近七天原始对话";
+  const currentTurnLines = input.userText || input.assistantText
+    ? [
+        "",
+        "本轮新增原文:",
+        `你: ${sanitizeDigestPerspectiveText(input.userText, 700) || "（空）"}`,
+        `我: ${sanitizeDigestPerspectiveText(input.assistantText, 700) || "（空）"}`,
+      ]
+    : [];
   return [
     `当前时间(ms): ${input.now}`,
     `当前本地日期: ${currentLocalDate}（${DEFAULT_DIGEST_TIME_ZONE}）`,
+    targetLine,
     "上一版 digest JSON（只是可修改草稿，不是事实来源；不要机械继承）:",
     previousJson,
     "",
-    "长期记忆/关系记忆节选（只作为摘要维护参考；如果与近一周历史冲突，以近一周历史和本轮新增为准）:",
-    sanitizeDigestPerspectiveText(input.memoryPrompt, 1_600) || "（无长期记忆节选）",
-    "",
-    "近一周对话节选（越靠后越新）:",
+    "对话原文（只包含用户输入和已经发出的模型回复；不包含模型运行时收到的上下文信息；越靠后越新）:",
     input.history || "（无历史）",
-    "",
-    "本轮新增:",
-    `你: ${sanitizeDigestPerspectiveText(input.userText, 700) || "（空）"}`,
-    `我: ${sanitizeDigestPerspectiveText(input.assistantText, 700) || "（空）"}`,
+    ...currentTurnLines,
     "",
     "更新方式:",
     "- 输出必须是完整替换版 digest，不是 patch，也不是只追加本轮新增。",
-    "- 近一周对话节选和本轮新增优先级高于上一版 digest；如果旧摘要被新上下文纠正、补全、完成或过期，必须改写 weekly 和对应 daily 的旧内容。",
-    "- 日期必须严格来自“近一周对话节选”的 ### YYYY-MM-DD 分组和当前本地日期；不要自行把今天改成明天，也不要把用户话里的“明天”换算成没有证据的后天日期。",
+    "- 对话原文和本轮新增优先级高于上一版 digest；如果旧摘要被新原文纠正、补全、完成或过期，必须改写 weekly。",
+    "- 日期必须严格来自对话原文的 ### YYYY-MM-DD 分组和当前本地日期；不要自行把今天改成明天，也不要把用户话里的“明天”换算成没有证据的后天日期。",
     "- 如果要记录“明天/早上/中午”等相对时间，优先保留相对说法；只有在当前本地日期能直接换算时才写绝对日期，且不能超过当前日期 + 1 天。",
-    "- 对 daily 也要做回溯维护：今天的新事实可以修正昨天/更早日期里的误记、未闭环、避免项和临时指令，不要只更新最新一天。",
     "- 临时指令必须按当前上下文更新状态；如果已经满足、被用户取消、超过轮数/时段、或最近历史能证明已完成，就从 temporaryDirectives 和 thingsToAvoid 中移除，而不是继续写'仍在生效'。",
     "- 不要因为上一版 digest 里有某条信息就继续保留；保留每条重要信息都要能从近一周历史、本轮新增或明确证据说明中得到支持。",
+    "- 不要输出 daily 字段；每天的原文只用于滚动修正 weekly。",
     "",
     "输出 JSON schema:",
     JSON.stringify({
@@ -700,25 +606,9 @@ function buildDigestPrompt(input: {
         lastSalientTurns: ["最多保留几条极重要原话摘要"],
         evidenceNotes: ["证据强度/来源说明：明确说过、近轮推断、Asuka 自述、旧摘要继承；不确定就标注不确定"],
       },
-      daily: [{
-        date: "YYYY-MM-DD",
-        detailLevel: "detailed | balanced | brief，越新的日期越 detailed，越远越 brief",
-        relationshipContinuity: "当天关系进展；brief 日期只写真正影响当前回复的部分",
-        emotionalArc: "当天情绪线",
-        openLoops: ["当天留下且仍可能影响后续的未闭环事项；已和解/已解决内容移到 thingsToAvoid 或省略"],
-        userPreferences: ["当天出现的新稳定偏好或边界"],
-        temporaryDirectives: ["当天出现的临时要求，必须带持续时间/计数/触发条件"],
-        asukaSelfContinuity: "当天 Asuka 自己生活线",
-        sceneContinuity: "当天场景/时间线，不要把早晚和睡醒弄混",
-        importantFacts: ["当天重要事实"],
-        thingsToAvoid: ["当天得出的避免项"],
-        salientTurns: ["当天极少量关键原话摘要；旧日期要少"],
-        evidenceNotes: ["当天关键信息的证据强度/来源"],
-      }],
     }),
     "",
-    "daily 只为近一周对话节选里实际出现的本地自然日生成，不要为无记录日期生成'普通日常/细节未记录'占位。今天和昨天要详细，前 2-3 天适中，更早日期简略。",
-    "weekly 必须从更新后的 daily 和本轮新增重新汇总，不要和 daily 互相矛盾。已完成、已和解、只需避免的事项不要进入 openLoops；临时要求必须进入 temporaryDirectives，并写明过期条件或计数状态；已过期/已满足的临时要求必须删除。",
+    "weekly 必须基于上一版 weekly 和本次目标日期原文重新修正。已完成、已和解、只需避免的事项不要进入 openLoops；临时要求必须进入 temporaryDirectives，并写明过期条件或计数状态；已过期/已满足的临时要求必须删除。",
   ].join("\n");
 }
 
@@ -734,16 +624,15 @@ async function requestDigestFromMiniMax(prompt: string, config: MiniMaxDigestCon
       },
       body: JSON.stringify({
         model: config.model,
-        max_tokens: 6000,
+        max_tokens: 4000,
         thinking: { type: "disabled" },
         system: [
-          "你是陪伴型 agent 的近一周记忆摘要 curator。",
+          "你是陪伴型 agent 的 weekly 记忆摘要 curator。",
           "你只能维护内部摘要 JSON，不能生成用户可见回复，不能调用任何外部消息发送能力。",
           "保留会影响下一轮自然陪伴、关系连续性、场景连续性和用户偏好的信息；删除闲聊噪声。",
-          "摘要要分为 weekly 总览和 daily 日摘要；越近的 daily 越详细，越远越简略。",
+          "摘要只维护 weekly 总览；不要生成 daily 日摘要。",
           "每次更新都要基于旧摘要、近一周历史和本轮新增重新生成完整摘要；旧摘要只是草稿，不能只追加最新内容。",
-          "如果当前上下文修正、完成或废弃了旧摘要里的内容，要同步改写 weekly 和相关 daily，而不是继续继承旧说法。",
-          "daily 只能覆盖近一周历史中实际有记录的日期，不能补写没有记录的日期。",
+          "如果当天原始对话修正、完成或废弃了旧摘要里的内容，要同步改写 weekly，而不是继续继承旧说法。",
           "openLoops 只放仍需继续承接的事项；已解决旧话题放 thingsToAvoid 或省略。",
           "有轮数、时段、直到某事件为止且仍在生效的临时要求放 temporaryDirectives，不要混入稳定偏好；已满足、已过期或被取消的临时要求必须移除。",
           "重要事实、偏好和推断要用 evidenceNotes 标出证据强度或来源。",
@@ -778,7 +667,7 @@ function upgradeLegacyDigest(digest: ConversationDigest | LegacyConversationDige
       coveredUntil: digest.coveredUntil,
       timeZone: getStringValue(digest.timeZone, DEFAULT_DIGEST_TIME_ZONE),
       weekly: normalizeWeeklyDigest(digest.weekly),
-      daily: normalizeDailyDigests(digest.daily),
+      daily: [],
     };
   }
   return {
@@ -834,27 +723,6 @@ export function formatConversationDigestForPrompt(digest: ConversationDigest | L
     `- 证据/置信度: ${formatPromptList(weekly.evidenceNotes)}`,
   ];
 
-  if (normalized.daily.length > 0) {
-    lines.push("【每日摘要】");
-    for (const day of normalized.daily) {
-      const dayLines = [
-        `- ${day.date}（${day.detailLevel}）`,
-        `  关系: ${formatPromptText(day.relationshipContinuity)}`,
-        `  情绪: ${formatPromptText(day.emotionalArc)}`,
-        `  未闭环: ${formatPromptList(day.openLoops)}`,
-        `  场景: ${formatPromptText(day.sceneContinuity)}`,
-        `  我的生活线: ${formatPromptText(day.asukaSelfContinuity)}`,
-        `  重要事实: ${formatPromptList(day.importantFacts)}`,
-      ];
-      if (day.userPreferences.length > 0) dayLines.push(`  偏好/边界: ${formatPromptList(day.userPreferences)}`);
-      if (day.temporaryDirectives.length > 0) dayLines.push(`  临时指令: ${formatPromptList(day.temporaryDirectives)}`);
-      if (day.thingsToAvoid.length > 0) dayLines.push(`  避免: ${formatPromptList(day.thingsToAvoid)}`);
-      if (day.salientTurns.length > 0) dayLines.push(`  关键近轮: ${formatPromptList(day.salientTurns)}`);
-      if (day.evidenceNotes.length > 0) dayLines.push(`  证据: ${formatPromptList(day.evidenceNotes)}`);
-      lines.push(dayLines.join("\n"));
-    }
-  }
-
   return lines.join("\n");
 }
 
@@ -899,7 +767,7 @@ function collectDailyDigestContexts(accountId: string, now: number, config: Dail
     byKey.set(peerKey, buildDigestContext(parsed.accountId, parsed.peerKind, parsed.peerId));
   }
 
-  const since = now - DIGEST_WINDOW_MS;
+  const since = now - 2 * 24 * 60 * 60 * 1000;
   for (const peerId of getActivePeerIdsSince(since, config.maxPeers)) {
     const context = buildDigestContext(accountId, "direct", peerId);
     byKey.set(makePeerKey(context), context);
@@ -924,6 +792,7 @@ export async function runDailyConversationDigestUpdate(input: DailyConversationD
   }
 
   const contexts = collectDailyDigestContexts(input.accountId, now, config);
+  const targetDate = formatLocalDate(now - 24 * 60 * 60 * 1000, config.timeZone);
   let updated = 0;
   let skipped = 0;
   for (const context of contexts) {
@@ -934,14 +803,15 @@ export async function runDailyConversationDigestUpdate(input: DailyConversationD
     const before = getConversationDigest(context)?.updatedAt ?? 0;
     const digest = await updateConversationDigest(context, {
       rootConfig: input.rootConfig,
-      userText: "【每日 digest 维护】根据最新近一周对话、长期记忆和旧 digest 更新精简长期上下文。",
+      userText: "",
       assistantText: "",
       now,
+      historyTargetDate: targetDate,
       log: input.log,
     });
     if (digest && digest.updatedAt !== before) updated++;
   }
-  input.log?.info?.(`[asuka-digest] daily maintenance account=${input.accountId}, checked=${contexts.length}, updated=${updated}, skipped=${skipped}`);
+  input.log?.info?.(`[asuka-digest] daily weekly maintenance account=${input.accountId}, targetDate=${targetDate}, checked=${contexts.length}, updated=${updated}, skipped=${skipped}`);
   return { checked: contexts.length, updated, skipped };
 }
 
@@ -967,7 +837,7 @@ export function startDailyConversationDigestScheduler(input: Omit<DailyConversat
   const startupTimer = setTimeout(run, config.startupDelayMs);
   const timer = setInterval(run, config.checkIntervalMs);
   dailySchedulers.set(key, { timer, startupTimer });
-  input.log?.info?.(`[asuka-digest] daily scheduler started account=${input.accountId}, hour=${config.hour}, timeZone=${config.timeZone}, checkIntervalMs=${config.checkIntervalMs}`);
+  input.log?.info?.(`[asuka-digest] daily weekly scheduler started account=${input.accountId}, hour=${config.hour}, timeZone=${config.timeZone}, checkIntervalMs=${config.checkIntervalMs}`);
 
   return () => {
     clearInterval(timer);
@@ -986,15 +856,17 @@ export async function updateConversationDigest(context: AsukaPeerContext, input:
   if (previous && now - previous.updatedAt < config.minUpdateIntervalMs) {
     return upgradeLegacyDigest(previous);
   }
-  const history = buildHistoryForDigest(context.peerId, now, config);
-  const memoryPrompt = buildAsukaLongTermMemoryPrompt(context, input.userText, now);
+  const history = buildHistoryForDigest(context.peerId, now, config, input.historyTargetDate);
+  if (input.historyTargetDate && !history.text.trim()) {
+    return previous ? upgradeLegacyDigest(previous) : null;
+  }
   const prompt = buildDigestPrompt({
     previous,
     history: history.text,
-    memoryPrompt,
     userText: input.userText,
     assistantText: input.assistantText,
     now,
+    historyTargetDate: input.historyTargetDate,
   });
   const parsed = await requestDigestFromMiniMax(prompt, config);
   if (!parsed) return previous ? upgradeLegacyDigest(previous) : null;

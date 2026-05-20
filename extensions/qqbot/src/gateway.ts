@@ -24,7 +24,7 @@ import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxS
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
-import { buildConversationDigestPrompt, scheduleConversationDigestUpdate, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
+import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
@@ -129,9 +129,9 @@ const MAX_SELFIE_RECENT_CONTEXT_CHARS = 640;
 const MAX_SELFIE_CONTEXT_SECTION_CHARS = 900;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_CHAT_CONTEXT_DAYS = 7;
-const MAX_CHAT_RECENT_ENTRY_CHARS = 500;
-const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 12_000;
-const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 24;
+const MAX_CHAT_RECENT_ENTRY_CHARS = 600;
+const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 18_000;
+const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 40;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
 const MAX_SELFIE_PROMPT_CHARS = 4200;
 const MAX_SELFIE_CAPTION_CHARS = 240;
@@ -2478,7 +2478,6 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         if (asukaConversationDigestPrompt) {
           dynamicPromptSections.push(asukaConversationDigestPrompt);
         }
-
         // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
         // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
@@ -3245,12 +3244,6 @@ ${ttsHint}${sttHint}`;
                 });
                 const loggedPromises = recordAssistantReply(asukaPeerContext, replyText, parsedPromises);
                 recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, replyText);
-                scheduleConversationDigestUpdate(asukaPeerContext, {
-                  rootConfig: cfg as Record<string, unknown>,
-                  userText: userContent,
-                  assistantText: replyText,
-                  log,
-                });
                 await refreshSceneState(asukaPeerContext, {
                   trigger: "assistant",
                   text: replyText,
