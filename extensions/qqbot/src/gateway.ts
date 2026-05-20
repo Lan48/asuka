@@ -30,6 +30,10 @@ import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
+import {
+  generateOfficialOpenClawImageDataUrl,
+  hasOfficialOpenClawImageGenerationConfig,
+} from "./utils/openclaw-image-generation.js";
 
 const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
@@ -2626,6 +2630,7 @@ ${ttsHint}${sttHint}`;
         const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
           const selfieConfig = resolveDirectSelfieRuntimeConfig(cfg as Record<string, any>);
           const { apiKey, authProfile, baseUrl, modelId, quality } = selfieConfig;
+          const officialImageConfigured = hasOfficialOpenClawImageGenerationConfig(cfg as Record<string, any>);
           const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
@@ -2691,13 +2696,33 @@ ${ttsHint}${sttHint}`;
             if (!referenceImagePath) {
               throw new Error("no bundled reference image found");
             }
-            const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
-            log?.info(`[qqbot:${account.accountId}] Studio selfie image generated for ${event.senderId}`);
+            let imageUrl: string;
+            if (officialImageConfigured) {
+              try {
+                imageUrl = await generateOfficialOpenClawImageDataUrl({
+                  cfg: cfg as Record<string, any>,
+                  prompt,
+                  referenceImagePath,
+                  size: "1024x1024",
+                  quality,
+                  identityPrompt: SELFIE_IDENTITY_LOCK_PROMPT,
+                });
+                log?.info(`[qqbot:${account.accountId}] OpenClaw official selfie image generated for ${event.senderId}`);
+              } catch (officialError) {
+                if (!apiKey && !authProfile) throw officialError;
+                log?.error(`[qqbot:${account.accountId}] OpenClaw official selfie image generation failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
+                imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+                log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
+              }
+            } else {
+              imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+              log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
+            }
             return await sendGeneratedSelfieImage(imageUrl);
           };
 
-          if (!apiKey && !authProfile) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image API key/auth profile missing`);
+          if (!apiKey && !authProfile && !officialImageConfigured) {
+            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image generation config missing`);
             return await sendFallbackSelfieImage();
           }
 

@@ -288,6 +288,8 @@ export function buildFeatureMap(config) {
   const providers = config.models?.providers || {};
   const primaryRef = config.agents?.defaults?.model?.primary || "";
   const primary = providerForModelRef(config, primaryRef);
+  const imageGenerationRef = config.agents?.defaults?.imageGenerationModel?.primary || "";
+  const imageGeneration = providerForModelRef(config, imageGenerationRef);
   const tts = qqbot.tts || {};
   const stt = qqbot.stt || config.tools?.media?.audio?.models?.[0] || {};
   const vision = qqbot.minimax?.vision || {};
@@ -306,6 +308,11 @@ export function buildFeatureMap(config) {
       : selfieEnv.STUDIO_API_KEY
         ? secretStatus(config, ["skills", "entries", "asuka-selfie", "env", "STUDIO_API_KEY"])
         : providerKeyStatus(config, "minimax");
+  const officialSelfieAuth = imageGenerationRef
+    ? imageGeneration.providerId === "openai-codex"
+      ? { sourcePath: "OpenClaw OAuth profile store", configured: true, last4: "OAuth" }
+      : providerKeyStatus(config, imageGeneration.providerId)
+    : selfieAuth;
 
   const ttsProvider = tts.provider || "openai";
   const sttProvider = stt.provider || "openai";
@@ -328,7 +335,7 @@ export function buildFeatureMap(config) {
     feature("图片理解", "vision", "minimax", vision.model, visionKey, vision.enabled !== false),
     feature("联网搜索", "search", "minimax", search.intentModel || search.model, searchKey, search.enabled !== false),
     feature("对话 Digest", "digest", "minimax", digest.model || search.model, digestKey, digest.enabled !== false),
-    feature("Asuka 自拍", "image", selfieEnv.STUDIO_AUTH_PROFILE ? "openai-codex" : (selfieEnv.STUDIO_API_BASE_URL ? "studio" : "minimax"), selfieEnv.STUDIO_IMAGE_MODEL, selfieAuth, selfie.enabled !== false),
+    feature("Asuka 自拍", "image", imageGeneration.providerId || (selfieEnv.STUDIO_AUTH_PROFILE ? "openai-codex" : (selfieEnv.STUDIO_API_BASE_URL ? "studio" : "minimax")), imageGeneration.model || selfieEnv.STUDIO_IMAGE_MODEL, officialSelfieAuth, selfie.enabled !== false),
     feature("QQBot 发送", "qqbot", "qqbot", qqbot.appId ? `appId ${qqbot.appId}` : "", secretStatus(config, ["channels", "qqbot", "clientSecret"]), qqbot.enabled !== false),
   ];
 }
@@ -355,9 +362,15 @@ export function buildTemplate(existing = {}) {
           api: "openai-completions",
           models: [{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true }],
         },
+        "openai-codex": {
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          api: "openai-codex-responses",
+          models: [{ id: "gpt-5.5", name: "GPT-5.5" }],
+          request: { allowPrivateNetwork: true, proxy: { mode: "env-proxy" } },
+        },
       },
     },
-    agents: { defaults: { model: { primary: "minimax/MiniMax-M2.7" }, thinkingDefault: "off", workspace: "workspace" } },
+    agents: { defaults: { model: { primary: "minimax/MiniMax-M2.7" }, imageGenerationModel: { primary: "openai-codex/gpt-image-1", timeoutMs: 240000 }, thinkingDefault: "off", workspace: "workspace" } },
     channels: {
       qqbot: {
         enabled: true,

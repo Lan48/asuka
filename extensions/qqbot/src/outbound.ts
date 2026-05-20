@@ -39,6 +39,10 @@ import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
+import {
+  generateOfficialOpenClawImageDataUrl,
+  hasOfficialOpenClawImageGenerationConfig,
+} from "./utils/openclaw-image-generation.js";
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -1978,10 +1982,12 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
+  const cfg = loadOpenClawConfig();
   const { apiKey, authProfile, baseUrl, modelId, quality, referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
+  const officialImageConfigured = hasOfficialOpenClawImageGenerationConfig(cfg);
 
-  if (!apiKey && !authProfile) {
-    return { channel: "qqbot", error: "selfie skill api key/auth profile missing" };
+  if (!apiKey && !authProfile && !officialImageConfigured) {
+    return { channel: "qqbot", error: "selfie image generation config missing" };
   }
   const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
   if (!referenceImagePath) {
@@ -1993,7 +1999,26 @@ async function runDirectSelfieFlowForCron(
   const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content);
 
   try {
-    const imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+    let imageUrl: string;
+    if (officialImageConfigured) {
+      try {
+        imageUrl = await generateOfficialOpenClawImageDataUrl({
+          cfg,
+          prompt,
+          referenceImagePath,
+          size: "1024x1024",
+          quality,
+          identityPrompt: SELFIE_IDENTITY_LOCK_PROMPT,
+        });
+        console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image with OpenClaw official image runtime for target=${payload.targetAddress}`);
+      } catch (officialError) {
+        if (!apiKey && !authProfile) throw officialError;
+        console.warn(`[qqbot] runDirectSelfieFlowForCron: OpenClaw official image runtime failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
+        imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+      }
+    } else {
+      imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+    }
     console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image for target=${payload.targetAddress}`);
     const result = await sendMedia({
       to: target,

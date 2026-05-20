@@ -148,6 +148,22 @@ test("功能矩阵优先显示自拍 OAuth profile 来源", () => {
   assert.equal(selfie.keyConfigured, true);
 });
 
+test("功能矩阵优先显示 OpenClaw 官方图片模型", () => {
+  const config = fixtureConfig();
+  config.agents.defaults.imageGenerationModel = { primary: "openai-codex/gpt-image-1", timeoutMs: 240000 };
+  config.models.providers["openai-codex"] = {
+    baseUrl: "https://chatgpt.com/backend-api/codex",
+    api: "openai-codex-responses",
+    request: { allowPrivateNetwork: true, proxy: { mode: "env-proxy" } },
+  };
+
+  const selfie = buildFeatureMap(config).find((item) => item.name === "Asuka 自拍");
+  assert.equal(selfie.provider, "openai-codex");
+  assert.equal(selfie.model, "gpt-image-1");
+  assert.equal(selfie.keySource, "OpenClaw OAuth profile store");
+  assert.equal(selfie.keyConfigured, true);
+});
+
 test("保存会写入新配置并创建备份", () => {
   const original = fixtureConfig();
   const { configPath } = createTempConfigFixture(original);

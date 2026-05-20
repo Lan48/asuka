@@ -359,6 +359,9 @@ export default function App() {
                       <h3>{id}</h3>
                       <TextField label="baseUrl" value={getPath(config, `${base}.baseUrl`)} onChange={(value) => update(`${base}.baseUrl`, value)} />
                       <TextField label="api" value={getPath(config, `${base}.api`)} onChange={(value) => update(`${base}.api`, value)} />
+                      <Toggle label="request.allowPrivateNetwork" checked={getPath(config, `${base}.request.allowPrivateNetwork`, false) === true} onChange={(value) => update(`${base}.request.allowPrivateNetwork`, value)} />
+                      <TextField label="request.proxy.mode" value={getPath(config, `${base}.request.proxy.mode`)} onChange={(value) => update(`${base}.request.proxy.mode`, value)} />
+                      <TextField label="request.proxy.url" value={getPath(config, `${base}.request.proxy.url`)} onChange={(value) => update(`${base}.request.proxy.url`, value)} />
                       <SecretField label="apiKey / oauthKey" value={getPath(config, `${base}.apiKey`)} onChange={(value) => update(`${base}.apiKey`, value)} />
                       <TextField label="默认模型 ID" value={getPath(config, `${base}.models.0.id`)} onChange={(value) => update(`${base}.models.0.id`, value)} />
                       <TextField label="默认模型名称" value={getPath(config, `${base}.models.0.name`)} onChange={(value) => update(`${base}.models.0.name`, value)} />
@@ -474,6 +477,11 @@ export default function App() {
             <Card title="Asuka 自拍">
               <div className="grid two">
                 <Toggle label="启用 asuka-selfie" checked={getPath(config, "skills.entries.asuka-selfie.enabled", true) !== false} onChange={(value) => update("skills.entries.asuka-selfie.enabled", value)} />
+                <TextField label="OpenClaw imageGenerationModel.primary" value={getPath(config, "agents.defaults.imageGenerationModel.primary")} onChange={(value) => update("agents.defaults.imageGenerationModel.primary", value)} />
+                <TextField label="OpenClaw imageGenerationModel.timeoutMs" type="number" value={getPath(config, "agents.defaults.imageGenerationModel.timeoutMs", "")} onChange={(value) => update("agents.defaults.imageGenerationModel.timeoutMs", Number(value))} />
+                <Toggle label="openai-codex allowPrivateNetwork" checked={getPath(config, "models.providers.openai-codex.request.allowPrivateNetwork", false) === true} onChange={(value) => update("models.providers.openai-codex.request.allowPrivateNetwork", value)} />
+                <TextField label="openai-codex proxy mode" value={getPath(config, "models.providers.openai-codex.request.proxy.mode")} onChange={(value) => update("models.providers.openai-codex.request.proxy.mode", value)} />
+                <TextField label="openai-codex proxy url" value={getPath(config, "models.providers.openai-codex.request.proxy.url")} onChange={(value) => update("models.providers.openai-codex.request.proxy.url", value)} />
                 <SecretField label="STUDIO_API_KEY" value={getPath(config, "skills.entries.asuka-selfie.env.STUDIO_API_KEY")} onChange={(value) => update("skills.entries.asuka-selfie.env.STUDIO_API_KEY", value)} />
                 <TextField label="STUDIO_AUTH_PROFILE" value={getPath(config, "skills.entries.asuka-selfie.env.STUDIO_AUTH_PROFILE")} onChange={(value) => update("skills.entries.asuka-selfie.env.STUDIO_AUTH_PROFILE", value)} />
                 <TextField label="STUDIO_API_BASE_URL" value={getPath(config, "skills.entries.asuka-selfie.env.STUDIO_API_BASE_URL")} onChange={(value) => update("skills.entries.asuka-selfie.env.STUDIO_API_BASE_URL", value)} />
