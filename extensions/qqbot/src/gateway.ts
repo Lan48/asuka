@@ -846,6 +846,16 @@ function normalizeStudioImageSize(size?: string): string {
   return raw;
 }
 
+function normalizeStudioMediaImageSize(size?: string): string {
+  const raw = (size || "1K").trim();
+  if (/^[124]K$/i.test(raw)) return raw.toUpperCase();
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  if (normalized === "1024x1024") return "1K";
+  if (normalized === "2048x2048") return "2K";
+  if (normalized === "4096x4096") return "4K";
+  return "1K";
+}
+
 function normalizeMiniMaxAspectRatio(size?: string): string {
   const raw = normalizeStudioImageSize(size);
   const normalized = raw.toLowerCase().replace(/\s+/g, "");
@@ -903,6 +913,18 @@ function isMiniMaxImageConfig(config: StudioSelfieConfig): boolean {
   return /minimax/i.test(config.baseUrl) || /^image-01(?:$|-)/i.test(config.modelId);
 }
 
+function isStudioMediaImageConfig(config: StudioSelfieConfig): boolean {
+  return /(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?:[/:]|$)/i.test(config.baseUrl)
+    || /^(?:apibusiness_media:)?gpt-image-2$/i.test(config.modelId);
+}
+
+function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  const path = resourcePath.replace(/^\/+/, "");
+  if (/\/studio\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
+}
+
 async function generateMiniMaxSelfieImageUrl(
   prompt: string,
   config: StudioSelfieConfig,
@@ -949,6 +971,48 @@ async function generateMiniMaxSelfieImageUrl(
   return extractMiniMaxImageUrl(body);
 }
 
+async function generateStudioMediaSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  form.append("model", config.modelId.replace(/^apibusiness_media:/i, ""));
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
+  form.append("image_size", normalizeStudioMediaImageSize(size));
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/edits"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio Media image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
+}
+
 async function generateStudioSelfieImageUrl(
   prompt: string,
   config: StudioSelfieConfig,
@@ -961,6 +1025,10 @@ async function generateStudioSelfieImageUrl(
 
   if (isMiniMaxImageConfig(config)) {
     return generateMiniMaxSelfieImageUrl(prompt, config, referenceImagePath, size);
+  }
+
+  if (isStudioMediaImageConfig(config)) {
+    return generateStudioMediaSelfieImageUrl(prompt, config, referenceImagePath, size);
   }
 
   const form = new FormData();
