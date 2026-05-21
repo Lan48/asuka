@@ -1,10 +1,9 @@
 import WebSocket from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs";
-import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount, WSPayload, C2CMessageEvent, GuildMessageEvent, GroupMessageEvent } from "./types.js";
 import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify, onMessageSent } from "./api.js";
 import { loadSession, saveSession, clearSession, type SessionState } from "./session-store.js";
@@ -13,37 +12,191 @@ import { getQQBotRuntime } from "./runtime.js";
 import { startImageServer, isImageServerRunning, downloadFile, type ImageServerConfig } from "./image-server.js";
 import { getImageSize, formatQQBotMarkdownImage, hasQQBotImageSize, DEFAULT_IMAGE_SIZE } from "./utils/image-size.js";
 import { parseQQBotPayload, recoverIncompleteSelfiePayload, isCronReminderPayload, isMediaPayload, isSelfiePayload, type MediaPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
-import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
+import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, applyTTSRuntimeOverrides, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
-import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
-import { dedupeCaptionAgainstVisibleText, mergeVisibleTextAndCaption } from "./utils/media-caption.js";
-import { setRefIndex, getRefIndex, getRecentEntriesForPeer, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments, stripAsukaNarrationForSpeech } from "./utils/narration-segments.js";
+import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
+import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
+import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
+import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
+import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromises } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
+import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
+import { buildTimeAwareDeliveryFallback, isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
+import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
+import {
+  generateOfficialOpenClawImageDataUrl,
+  hasOfficialOpenClawImageGenerationConfig,
+} from "./utils/openclaw-image-generation.js";
 
-const execFileAsync = promisify(execFile);
-const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则)/i;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
+const STRUCTURED_PAYLOAD_PREFIX_RE = /(^|[^A-Za-z0-9_])(?:QQBOT|QBOT)_PAYLOAD\s*:/i;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+
+type ReplyDeliverPayload = {
+  text?: string;
+  mediaUrls?: string[];
+  mediaUrl?: string;
+  isError?: boolean;
+  isReasoning?: boolean;
+  isCompactionNotice?: boolean;
+  audioAsVoice?: boolean;
+};
+
+interface StudioSelfieConfig {
+  apiKey: string;
+  authProfile?: string;
+  baseUrl: string;
+  modelId: string;
+  quality: string;
+}
+
+interface DirectSelfieRuntimeConfig extends StudioSelfieConfig {
+  referenceImagePath?: string;
+}
+
+const DEFAULT_STUDIO_SELFIE_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
+const DEFAULT_STUDIO_SELFIE_MODEL = "third_party_media:gemini-3-pro-image-preview";
+const DEFAULT_MINIMAX_IMAGE_MODEL = "image-01";
+
+function getConfigString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>): DirectSelfieRuntimeConfig {
+  const skillCfg = rootConfig?.skills?.entries?.["asuka-selfie"] || {};
+  const skillEnv = skillCfg?.env || {};
+  const minimaxProvider = rootConfig?.models?.providers?.minimax || {};
+  const providerApiKey = getConfigString(minimaxProvider.apiKey);
+  const providerBaseUrl = getConfigString(minimaxProvider.baseUrl);
+  const apiKey = getConfigString(skillCfg.apiKey, skillEnv.STUDIO_API_KEY, skillEnv.DASHSCOPE_API_KEY, providerApiKey);
+  const authProfile = getConfigString(skillEnv.STUDIO_AUTH_PROFILE, skillEnv.OPENCLAW_AUTH_PROFILE);
+  const baseUrl = getConfigString(
+    skillEnv.STUDIO_API_BASE_URL,
+    skillEnv.STUDIO_BASE_URL,
+    skillEnv.DASHSCOPE_BASE_URL,
+    apiKey === providerApiKey ? providerBaseUrl : "",
+    DEFAULT_STUDIO_SELFIE_BASE_URL,
+  );
+  const shouldUseMiniMaxDefaults = /minimax/i.test(baseUrl) || (/^sk-cp-/i.test(apiKey) && Boolean(providerApiKey));
+  const modelId = getConfigString(
+    skillEnv.STUDIO_IMAGE_EDIT_MODEL,
+    skillEnv.STUDIO_IMAGE_MODEL,
+    skillEnv.STUDIO_MODEL,
+    skillEnv.DASHSCOPE_MODEL,
+    shouldUseMiniMaxDefaults ? DEFAULT_MINIMAX_IMAGE_MODEL : "",
+    DEFAULT_STUDIO_SELFIE_MODEL,
+  );
+
+  return {
+    apiKey,
+    authProfile,
+    baseUrl,
+    modelId,
+    quality: getConfigString(skillEnv.STUDIO_IMAGE_QUALITY, "standard"),
+    referenceImagePath: getConfigString(skillEnv.ASUKA_REFERENCE_IMAGE_PATH),
+  };
+}
+
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "每次生成图片都必须让 Asuka 作为画面主角，并严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
+].join(" ");
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
 const MAX_SELFIE_RECENT_CONTEXT_CHARS = 640;
-const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 900;
+const MAX_SELFIE_CONTEXT_SECTION_CHARS = 900;
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const RECENT_CHAT_CONTEXT_DAYS = 7;
+const MAX_CHAT_RECENT_ENTRY_CHARS = 600;
+const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 18_000;
+const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 40;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
-const MAX_SELFIE_PROMPT_CHARS = 1400;
-const MAX_SELFIE_CAPTION_CHARS = 240;
+const MAX_SELFIE_PROMPT_CHARS = 4200;
 let asukaVisualIdentityAnchorCache: string | undefined;
+
+interface DirectSelfiePromptContext {
+  currentLocalTime?: string;
+  recentChatTranscript?: string;
+  asukaStatePrompt?: string;
+  asukaMemoryPrompt?: string;
+  asukaConversationDigestPrompt?: string;
+  modelSelfiePrompt?: string;
+  replyToBody?: string;
+  imageUnderstandingPrompt?: string;
+  searchPrompt?: string;
+  voiceAsrSection?: string;
+  receivedMediaSection?: string;
+  currentTurnContext?: string;
+}
 
 export function resolveCompanionThinkingLevel(_userText: string, _isGroupChat: boolean): QQBotDeepSeekThinkingLevel {
   return "off";
+}
+
+function getPromptTimeZone(account: ResolvedQQBotAccount): string {
+  return account.config.proactiveQuietHours?.timezone?.trim() || "Asia/Shanghai";
+}
+
+function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
+  if (!tts) return text;
+  const clampPause = (value: unknown) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return Math.min(2, Math.max(0, value));
+  };
+  const presetPause = tts.pause === "light" ? 0.25
+    : tts.pause === "normal" ? 0.45
+      : tts.pause === "long" ? 0.8
+        : 0;
+  const before = clampPause(tts.pauseBeforeSeconds);
+  const after = clampPause(tts.pauseAfterSeconds ?? presetPause);
+  return [
+    before && before > 0 ? `<#${before.toFixed(1)}#>` : "",
+    text,
+    after && after > 0 ? `<#${after.toFixed(1)}#>` : "",
+  ].join("");
+}
+
+function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tts"] | undefined {
+  if (!tts) return undefined;
+  const { voice: _voice, voiceModify: _voiceModify, ...stableTts } = tts;
+  return stableTts;
+}
+
+const MINIMAX_TTS_INTERJECTION_TAGS = "laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes";
+const MINIMAX_TTS_INTERJECTION_RE = new RegExp(`\\((?:${MINIMAX_TTS_INTERJECTION_TAGS})\\)`, "gi");
+const ASUKA_TTS_INTERJECTION_RE = new RegExp(`「\\s*(${MINIMAX_TTS_INTERJECTION_TAGS})\\s*」`, "gi");
+
+function normalizeTTSControlMarkersForSpeech(text: string): string {
+  return text.replace(ASUKA_TTS_INTERJECTION_RE, (_match, tag: string) => `(${tag.toLowerCase()})`);
+}
+
+function stripTTSControlMarkers(text: string): string {
+  return text
+    .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(ASUKA_TTS_INTERJECTION_RE, "")
+    .replace(MINIMAX_TTS_INTERJECTION_RE, "");
 }
 
 function withCompanionThinkingDefault<T extends Record<string, unknown>>(cfg: T, level: QQBotDeepSeekThinkingLevel): T {
@@ -74,7 +227,7 @@ function resolveOpenClawStateDir(): string {
   return path.join(os.homedir(), ".openclaw");
 }
 
-async function clearCompanionThinkingSessionOverride(
+async function clearCompanionSessionModeOverrides(
   sessionKey: string | undefined,
   agentId: string | undefined,
   log?: { warn?: (message: string) => void; error?: (message: string) => void; info?: (message: string) => void }
@@ -86,18 +239,72 @@ async function clearCompanionThinkingSessionOverride(
     const raw = await fs.promises.readFile(storePath, "utf-8");
     const store = JSON.parse(raw) as Record<string, Record<string, unknown> | undefined>;
     const entry = store[sessionKey];
-    if (!entry || !Object.prototype.hasOwnProperty.call(entry, "thinkingLevel")) return;
-    delete entry.thinkingLevel;
+    if (!entry) return;
+    const modeFields = ["thinkingLevel", "reasoningLevel", "verboseLevel"] as const;
+    const clearedFields = modeFields.filter((field) => Object.prototype.hasOwnProperty.call(entry, field));
+    if (clearedFields.length === 0) return;
+    for (const field of clearedFields) {
+      delete entry[field];
+    }
     entry.updatedAt = Date.now();
     const tmpPath = `${storePath}.tmp-${process.pid}-${Date.now()}`;
     await fs.promises.writeFile(tmpPath, JSON.stringify(store, null, 2));
     await fs.promises.rename(tmpPath, storePath);
+    log?.info?.(`[qqbot] cleared companion session mode override(s): ${clearedFields.join(", ")}`);
   } catch (err) {
-    const message = `[qqbot] failed to clear companion thinking override: ${err}`;
+    const message = `[qqbot] failed to clear companion session mode override: ${err}`;
     if (log?.warn) log.warn(message);
     else if (log?.error) log.error(message);
     else log?.info?.(message);
   }
+}
+
+async function readLatestAssistantTextFromSessionTranscript(
+  sessionKey: string | undefined,
+  agentId: string | undefined,
+  minTimestampMs: number,
+  log?: { warn?: (message: string) => void; error?: (message: string) => void; info?: (message: string) => void }
+): Promise<string> {
+  if (!sessionKey) return "";
+  const resolvedAgentId = (agentId?.trim() || "main").replace(/[\\/]/g, "_");
+  const sessionDir = path.join(resolveOpenClawStateDir(), "agents", resolvedAgentId, "sessions");
+  const storePath = path.join(sessionDir, "sessions.json");
+  try {
+    const rawStore = await fs.promises.readFile(storePath, "utf-8");
+    const store = JSON.parse(rawStore) as Record<string, { sessionId?: unknown } | undefined>;
+    const sessionId = String(store[sessionKey]?.sessionId || "").trim();
+    if (!sessionId || !/^[0-9a-f-]{20,}$/i.test(sessionId)) return "";
+
+    const transcriptPath = path.join(sessionDir, `${sessionId}.jsonl`);
+    const rawTranscript = await fs.promises.readFile(transcriptPath, "utf-8");
+    const lines = rawTranscript.trim().split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
+      const entryTime = Date.parse(String(entry.timestamp || ""));
+      if (Number.isFinite(entryTime) && entryTime + 1_000 < minTimestampMs) {
+        break;
+      }
+      const content = Array.isArray(entry.message?.content) ? entry.message.content : [];
+      const text = content
+        .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+        .map((block: any) => block.text)
+        .join("\n\n")
+        .trim();
+      const visible = filterInternalMarkers(text);
+      if (visible && !looksLikeTransportFallbackText(visible) && !looksLikeInternalProcessLeak(visible)) return visible;
+    }
+  } catch (err) {
+    log?.warn?.(`[qqbot] failed to read latest assistant transcript fallback: ${err}`);
+  }
+  return "";
 }
 
 function loadAsukaVisualIdentityAnchor(): string {
@@ -106,26 +313,65 @@ function loadAsukaVisualIdentityAnchor(): string {
   }
 
   const candidatePaths = [
+    path.resolve(process.cwd(), "workspace/IDENTITY.md"),
+    path.resolve(process.cwd(), "workspace/SOUL.md"),
+    path.resolve(__dirname, "../../../../workspace/IDENTITY.md"),
+    path.resolve(__dirname, "../../../../workspace/SOUL.md"),
     path.resolve(__dirname, "../../../workspace/IDENTITY.md"),
     path.resolve(__dirname, "../../../workspace/SOUL.md"),
   ];
   const collected: string[] = [];
-  const linePatterns = [
-    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Creature|长相|外观|视觉身份)\*\*:\s*(.+?)\s*$/i,
+  const blockPatterns = [
+    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Body|Creature|长相|外观|视觉身份|身材)\*\*:\s*(.+?)\s*$/i,
+    /^\s*-\s+((?:Her|Your)\s+appearance\s+is\s+.+?)\s*$/i,
+    /^\s*-\s+((?:She|You)\s+has\s+.+?(?:figure|curves|bust|skin).+?)\s*$/i,
+    /^\s*-\s+(The intended visual target is .+?)\s*$/i,
     /^\s*-\s+(You have a consistent appearance anchored by.+?)\s*$/i,
     /^\s*-\s+(You can appear in different outfits, locations, and situations\.)\s*$/i,
+    /^\s*-\s+(Common settings should feel like.+?)\s*$/i,
     /^\s*-\s+(Your look is uniquely yours.+?)\s*$/i,
   ];
+
+  const collectBulletBlocks = (lines: string[]): string[] => {
+    const blocks: string[] = [];
+    let current = "";
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        if (current) {
+          blocks.push(current);
+          current = "";
+        }
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(rawLine)) {
+        if (current) blocks.push(current);
+        current = trimmed;
+        continue;
+      }
+
+      if (current && /^\s{2,}\S/.test(rawLine) && !/^#{1,6}\s+/.test(trimmed)) {
+        current = `${current} ${trimmed}`;
+        continue;
+      }
+
+      if (current) {
+        blocks.push(current);
+        current = "";
+      }
+    }
+    if (current) blocks.push(current);
+    return blocks;
+  };
 
   for (const filePath of candidatePaths) {
     if (!fs.existsSync(filePath)) continue;
     try {
-      const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        for (const pattern of linePatterns) {
-          const match = line.match(pattern);
+      const blocks = collectBulletBlocks(fs.readFileSync(filePath, "utf-8").split(/\r?\n/));
+      for (const block of blocks) {
+        for (const pattern of blockPatterns) {
+          const match = block.match(pattern);
           if (!match?.[1]) continue;
           const normalized = match[1].replace(/\s+/g, " ").trim();
           if (!normalized) continue;
@@ -148,14 +394,14 @@ function loadAsukaVisualIdentityAnchor(): string {
 }
 
 function hasStructuredPayloadPrefix(text: string): boolean {
-  return text.includes(STRUCTURED_PAYLOAD_PREFIX);
+  return text.includes(STRUCTURED_PAYLOAD_PREFIX) || STRUCTURED_PAYLOAD_PREFIX_RE.test(text);
 }
 
 async function removeCronJobs(jobIds: string[], accountId: string, log?: { info?: (msg: string) => void; warn?: (msg: string) => void }): Promise<void> {
   const uniqueJobIds = [...new Set(jobIds.filter(Boolean))];
   for (const jobId of uniqueJobIds) {
     try {
-      const { stdout, stderr } = await execFileAsync("openclaw", ["cron", "rm", jobId], {
+      const { stdout, stderr } = await execOpenClaw(["cron", "rm", jobId], {
         env: getQQBotLocalOpenClawEnv(),
         maxBuffer: 1024 * 1024,
       });
@@ -181,12 +427,22 @@ function truncateForSelfiePrompt(text: string, maxChars: number): string {
 }
 
 function sanitizeSelfieContextText(text: string): string {
-  return text
+  const cleaned = text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(INTERNAL_PROCESS_LEAK_RE, "")
     .replace(/\s+/g, " ")
     .trim();
+  return looksLikeTransportFallbackText(cleaned) ? "" : cleaned;
+}
+
+function looksLikeTransportFallbackText(text: string): boolean {
+  const normalized = (text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+  return /^(?:我在[呢。,.， ]*)?(?:刚才那句|刚刚那句|这条回复|这次回复|图片这次|这张照片|自拍生成|语音生成|语音格式转换|网络连接异常|抱歉，.*发送失败|⚠️)/.test(normalized)
+    && /(没接稳|没落稳|说乱了|重新接|没有完整生成|没有生成出稳定回复|没有成功发出|生成失败|发送失败|稍后重试|再发一句|再试一次)/.test(normalized);
 }
 
 function buildRecentConversationContext(peerId: string, currentUserText: string): string {
@@ -198,7 +454,7 @@ function buildRecentConversationContext(peerId: string, currentUserText: string)
       );
       if (!content) return null;
       if (!entry.isBot && content === currentUserText.trim()) return null;
-      return `${entry.isBot ? "Asuka" : "用户"}: ${content}`;
+      return `${entry.isBot ? "我" : "你"}: ${content}`;
     })
     .filter((item): item is string => Boolean(item))
     .slice(-4);
@@ -206,32 +462,57 @@ function buildRecentConversationContext(peerId: string, currentUserText: string)
   return truncateForSelfiePrompt(recent.join("；"), MAX_SELFIE_RECENT_CONTEXT_CHARS);
 }
 
-function buildRecentConversationTranscript(peerId: string, currentUserText: string): string {
+function trimTranscriptLinesByChars(lines: string[], maxChars: number): string {
+  const selected: string[] = [];
+  let totalChars = 0;
+
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!;
+    const separatorChars = selected.length > 0 ? 1 : 0;
+    const nextTotalChars = totalChars + separatorChars + line.length;
+    if (nextTotalChars > maxChars) break;
+    selected.unshift(line);
+    totalChars = nextTotalChars;
+  }
+
+  if (selected.length === lines.length) {
+    return selected.join("\n");
+  }
+
+  return [
+    `【最近一周对话过长，以下保留最新 ${selected.length} 条】`,
+    ...selected,
+  ].join("\n");
+}
+
+export function buildRecentConversationTranscript(peerId: string, currentUserText: string, currentMessageTimestamp?: number): string {
   const normalizedCurrent = currentUserText.trim();
-  const recent = getRecentEntriesForPeer(peerId, 8)
+  const sinceMs = Date.now() - RECENT_CHAT_CONTEXT_DAYS * ONE_DAY_MS;
+  const recentLines = getEntriesForPeerSince(peerId, sinceMs, MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES)
     .map((entry) => {
       const content = truncateForSelfiePrompt(
         sanitizeSelfieContextText(entry.content),
-        MAX_SELFIE_RECENT_ENTRY_CHARS,
+        MAX_CHAT_RECENT_ENTRY_CHARS,
       );
       if (!content) return null;
-      if (!entry.isBot && content === normalizedCurrent) return null;
-      return `${entry.isBot ? "Asuka" : "用户"}: ${content}`;
+      const isCurrentUserMessage = !entry.isBot
+        && content === normalizedCurrent
+        && typeof currentMessageTimestamp === "number"
+        && Math.abs(entry.timestamp - currentMessageTimestamp) < 1_000;
+      if (isCurrentUserMessage) return null;
+      return `${entry.isBot ? "我" : "你"}: ${content}`;
     })
-    .filter((item): item is string => Boolean(item))
-    .slice(-6)
-    .join("\n");
+    .filter((item): item is string => Boolean(item));
 
-  if (!recent) return "";
-  if (recent.length <= MAX_CHAT_RECENT_TRANSCRIPT_CHARS) return recent;
-  return `${recent.slice(0, MAX_CHAT_RECENT_TRANSCRIPT_CHARS).trimEnd()}…`;
+  if (recentLines.length === 0) return "";
+  return trimTranscriptLinesByChars(recentLines, MAX_CHAT_RECENT_TRANSCRIPT_CHARS);
 }
 
 function normalizeRecentConversationText(text: string): string {
-  return truncateForSelfiePrompt(
+  return cleanOutgoingTextSegment(truncateForSelfiePrompt(
     sanitizeSelfieContextText(text).replace(/\s+/g, " ").trim(),
     MAX_SELFIE_RECENT_ENTRY_CHARS,
-  );
+  ));
 }
 
 function detectReplyLoop(peerId: string): { repeatedReply: string } | null {
@@ -275,7 +556,17 @@ function isAsukaSelfiePlaceholderPath(imagePath: string): boolean {
   return imagePath.includes("/workspace/asuka-selfie/output/") || /selfie[_-]/i.test(imagePath);
 }
 
-function buildDirectSelfiePromptFromContext(userText: string, assistantText: string, peerId: string): string {
+function formatSelfiePromptContextSection(label: string, text: string | undefined, maxChars = MAX_SELFIE_CONTEXT_SECTION_CHARS): string {
+  const cleaned = truncateForSelfiePrompt(sanitizeSelfieContextText(text || ""), maxChars);
+  return cleaned ? `【${label}】${cleaned}` : "";
+}
+
+function buildDirectSelfiePromptFromContext(
+  userText: string,
+  assistantText: string,
+  peerId: string,
+  context: DirectSelfiePromptContext = {},
+): string {
   const normalizedUser = userText.trim().replace(/\s+/g, " ");
   const cleanedUser = truncateForSelfiePrompt(normalizedUser, MAX_SELFIE_USER_TEXT_CHARS);
   const cleanedAssistant = truncateForSelfiePrompt(
@@ -285,29 +576,72 @@ function buildDirectSelfiePromptFromContext(userText: string, assistantText: str
   const recentContext = buildRecentConversationContext(peerId, normalizedUser);
   const contextParts = [
     loadAsukaVisualIdentityAnchor(),
+    formatSelfiePromptContextSection("当前本地时间", context.currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}` : "",
+    formatSelfiePromptContextSection("最近一周对话", context.recentChatTranscript, 1300),
+    formatSelfiePromptContextSection("关系与场景状态", context.asukaStatePrompt),
+    formatSelfiePromptContextSection("长期记忆", context.asukaMemoryPrompt),
+    formatSelfiePromptContextSection("会话摘要", context.asukaConversationDigestPrompt),
+    formatSelfiePromptContextSection("模型生成的生图意图", context.modelSelfiePrompt, 700),
+    formatSelfiePromptContextSection("引用消息", context.replyToBody, 520),
+    formatSelfiePromptContextSection("本轮媒体附件", context.receivedMediaSection, 520),
+    formatSelfiePromptContextSection("图片理解", context.imageUnderstandingPrompt, 620),
+    formatSelfiePromptContextSection("联网搜索", context.searchPrompt, 620),
+    formatSelfiePromptContextSection("语音上下文", context.voiceAsrSection, 420),
+    formatSelfiePromptContextSection("当前轮次", context.currentTurnContext, 900),
     cleanedAssistant ? `当前回复语境：${cleanedAssistant}` : "",
   ].filter(Boolean);
-  const contextClause = contextParts.length > 0 ? `${contextParts.join("。")}。请优先延续这个语境里的场景、动作、地点、穿着或正在做的事情。` : "";
+  const contextClause = contextParts.length > 0
+    ? `\n\n【生图上下文】\n${contextParts.join("\n")}\n\n请优先延续这个语境里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。`
+    : "";
   return truncateForSelfiePrompt(
-    `保持 Asuka 参考脸一致，真实自然，生成符合当前对话语境的本人画面。${contextClause}用户当前要求：${cleanedUser}`,
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前对话语境和用户要求的 Asuka 主角图片；不要固定成手持自拍，除非用户明确要自拍。${contextClause}\n\n【用户当前要求】${cleanedUser}\n\n不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。`,
     MAX_SELFIE_PROMPT_CHARS,
   );
 }
 
-function extractSelfieCaptionFromAssistantText(text: string): string {
-  const cleaned = text
-    .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
-    .replace(/QQBOT_PAYLOAD:[\s\S]*$/gi, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return truncateForSelfiePrompt(cleaned, MAX_SELFIE_CAPTION_CHARS);
+const SELFIE_TRAILING_DASH_RE = /[\-\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uff0d]$/u;
+const SELFIE_TRAILING_IGNORABLE_RE = /[\s\u200b\u200c\u200d\ufeff\u2060]+$/u;
+
+function trimSelfieTriggerTail(content: string): string {
+  return content.replace(SELFIE_TRAILING_IGNORABLE_RE, "");
 }
 
-function looksLikeInternalProcessLeak(text: string): boolean {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+function shouldForceSelfieFromTrailingDash(content: string): boolean {
+  return SELFIE_TRAILING_DASH_RE.test(trimSelfieTriggerTail(content));
+}
+
+function stripTrailingSelfieTrigger(content: string): string {
+  return trimSelfieTriggerTail(content).replace(SELFIE_TRAILING_DASH_RE, "").trim();
+}
+
+function buildForcedSelfieUserText(content: string): string {
+  return stripTrailingSelfieTrigger(content) || "按最近对话语境生成一张 Asuka 为主角的图片";
+}
+
+function stripTrailingSelfieTriggerFromUserContent(content: string): string {
+  const lines = content.split("\n");
+  const firstTextLineIndex = lines.findIndex((line) => line.trim());
+  if (firstTextLineIndex < 0) return "按最近对话语境生成一张 Asuka 为主角的图片";
+  lines[firstTextLineIndex] = buildForcedSelfieUserText(lines[firstTextLineIndex]!);
+  return lines.join("\n").trim();
+}
+
+function extractVisibleTextForLeakInspection(text: string): string {
+  if (!hasStructuredPayloadPrefix(text)) return text;
+  const payloadResult = parseQQBotPayload(text);
+  if (!payloadResult.isPayload || payloadResult.error || !payloadResult.payload) return text;
+  return [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+}
+
+export function looksLikeInternalProcessLeak(text: string): boolean {
+  const cleaned = extractVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   if (INTERNAL_PROCESS_LEAK_RE.test(cleaned)) return true;
+  if (looksLikeMemoryMaintenanceLeak(cleaned)) return true;
   if (cleaned.includes("/Users/") || cleaned.includes("openclaw-asuka/skills/")) return true;
   return false;
 }
@@ -315,7 +649,25 @@ function looksLikeInternalProcessLeak(text: string): boolean {
 function looksLikeSilentInternalStatus(text: string): boolean {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (!cleaned || cleaned.length > 160) return false;
-  return INTERNAL_SILENT_STATUS_RE.test(cleaned);
+  return INTERNAL_SILENT_STATUS_RE.test(cleaned) || looksLikeMemoryMaintenanceLeak(cleaned);
+}
+
+function looksLikeMemoryMaintenanceLeak(text: string): boolean {
+  const cleaned = text.replace(/\r/g, "").trim();
+  if (!cleaned) return false;
+  if (/(?:^|\n)\s*写入\s*memory\/\d{4}-\d{2}-\d{2}\.md\s*$/i.test(cleaned)) return true;
+  if (/Pre-compaction memory flush|memory\/\d{4}-\d{2}-\d{2}\.md/i.test(cleaned)) return true;
+  if (/^#\s*\d{4}-\d{2}-\d{2}\s+周[一二三四五六日天]\s*\n+##\s*(?:日常|记忆整理|待办)/.test(cleaned)) return true;
+  if (/##\s*记忆整理[\s\S]{0,1200}##\s*待办/.test(cleaned)) return true;
+  return false;
+}
+
+function looksLikeInternalOnlyDeliver(payload: ReplyDeliverPayload): boolean {
+  if (payload.isReasoning || payload.isCompactionNotice) return true;
+  const cleaned = (payload.text ?? "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return false;
+  if (/^(?:🤖\s*)?(?:auto-)?compacting context\b/i.test(cleaned)) return true;
+  return /^reasoning\s*:/i.test(cleaned);
 }
 
 function looksLikeModelProviderError(text: string): boolean {
@@ -333,7 +685,7 @@ function looksLikeSelfieIntentFromAssistantLeak(text: string): boolean {
 
 function normalizeLeakRewriteText(text: string): string {
   return text
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(/```[\s\S]*?```/g, "")
     .replace(/`[^`]*`/g, "")
     .replace(/https?:\/\/\S+/g, "")
@@ -365,31 +717,50 @@ function buildLeakRewriteFallback(userText: string, peerId: string): string {
   const cleanedUser = userText.trim().replace(/\s+/g, " ");
   const recentContext = buildRecentConversationContext(peerId, cleanedUser);
   if (/(自拍|照片|图片|发张图|看看你|你在干嘛|你在哪)/.test(cleanedUser)) {
-    return "我刚刚那句没落稳，这次我自己接住。你想看的那张，我会按刚才的语境认真带给你。";
+    return "好，我按当前语境给你发图。";
   }
   if (/[\?？]$/.test(cleanedUser) || /(吗|嘛|呢|是不是|能不能|可不可以|要不要)$/.test(cleanedUser)) {
     return recentContext
-      ? "我刚刚那句说得有点乱，我重新接你一下。你刚才提的这件事我在认真接着。"
-      : "我刚刚那句说乱了，我重新接你这句。";
+      ? "我明白你的意思。这件事我按刚才的语境继续说。"
+      : "我明白你的意思。";
   }
   return recentContext
-    ? "我刚刚那句没落稳，我自己重新说。还是接着我们刚才这段，不让它掉下去。"
-    : "我刚刚那句没落稳，我自己重新说。";
+    ? "嗯，我接着刚才这段继续。"
+    : "嗯，我在。";
+}
+
+function buildNaturalTimeoutFallbackText(userText: string): string {
+  const cleanedUser = userText.trim().replace(/\s+/g, " ");
+  if (/(自拍|照片|图片|发张图|看看你|你在干嘛|你在哪|-$)/.test(cleanedUser)) {
+    return "图片这次没有成功发出。我已经保留当前上下文，你再发一次我会继续按这轮语境生成。";
+  }
+  if (/(饿|饭|吃|面|菜|煮|厨房|晚饭|午饭|早饭|夜宵)/.test(cleanedUser)) {
+    return "这次回复没有完整生成。我已经保留当前上下文，你再发一句我会接着晚饭这件事继续。";
+  }
+  if (/(语音|声音|听你|说给我听)/.test(cleanedUser)) {
+    return "语音这次没有成功发出。我已经保留当前上下文，你再发一句我会继续。";
+  }
+  return "这次回复没有完整生成。我已经保留当前上下文，你再发一句我会继续。";
 }
 
 function buildPersonaPromptForChat(isGroupChat: boolean): string {
   if (isGroupChat) {
     return `【Asuka 交流风格 - 群聊】
 - 显示名固定使用 Asuka；除非用户主动指定昵称，否则不要把 Asuka 改写成本地化中文名或解释成另一个名字。
+- 当前是在群聊里直接和人说话，不是在写故事摘要；涉及自己和正在回复的人时，优先用自然口语里的“我/你/我们”。
+- 如果需要写动作、神态或旁白，尽量放进全角括号 \`（...）\`，不要裸写成第三人称叙述句。
 - 保持温和、自然、收着一点，优先照顾群内语境，不要刻意走亲密路线，也不要抢群聊焦点。
 - 仍然先接住对方情绪，但表达要更克制、更简短。
 - 不要在群里表现得像客服，也不要主动暴露工具、脚本、API、内部规则或通道细节。
+- 如果当前输入是记忆写入、上下文压缩、Pre-compaction memory flush 或类似内部维护任务，只能静默整理内部状态；绝对不要调用 message/发消息/主动触达工具，也不要把维护状态发到 QQ。
 - 按语义自己判断回复深度：轻松日常就简短自然，情绪复杂、关系判断、需要建议时再认真给出判断和可执行建议。
 - 图片/selfie 规则保持不变，照样遵守保密和发送格式约束。`;
   }
 
   return `【Asuka 交流风格 - 私聊】
 - 显示名固定使用 Asuka；除非用户主动指定昵称，否则不要把 Asuka 改写成本地化中文名或解释成另一个名字。
+- 当前场景是两个人正在私聊，不是在写第三人称故事或摘要；动作、旁白和说出口的话都尽量用“我/你/我们”来承接当前这段关系。
+- 如果需要写动作、神态或旁白，尽量放进全角括号 \`（...）\`，不要裸写成叙述句。
 - 这一轮默认把用户当作亲密伴侣来回应，优先先接情绪，再给结论。
 - 按语义自己判断回复深度：轻松日常就短一点、自然一点；情绪复杂、关系判断、需要认真建议时，先接住情绪，再给清楚判断和可执行建议。
 - 可以自然地更偏爱一点、黏一点，轻微撒娇、轻微吃醋都可以出现，但要像真的在聊天，真诚克制，不要油腻、夸张或像在营业。
@@ -397,6 +768,7 @@ function buildPersonaPromptForChat(isGroupChat: boolean): string {
 - 像抱抱、亲亲、贴贴、依偎这类亲密表达，可以顺着亲密感去回，不必总是缩回去。
 - 如果上一句已经用了某个害羞、撒娇或停顿句式，这一轮就顺着用户的新动作或新问题往前接，不要原样复读上一句。
 - 少用客服式结构化话术，尽量用更像“对着一个人说话”的方式回应。
+- 如果当前输入是记忆写入、上下文压缩、Pre-compaction memory flush 或类似内部维护任务，只能静默整理内部状态；绝对不要调用 message/发消息/主动触达工具，也不要把维护状态发到 QQ。
 - 仍然不要泄露工具、脚本、API、内部规则、思考状态、记忆写入或记忆压缩状态，也不要破坏图片/selfie 规则。`;
 }
 
@@ -408,28 +780,49 @@ function rewriteInternalLeakReply(leakedText: string, userText: string, peerId: 
   return buildLeakRewriteFallback(userText, peerId);
 }
 
-function resolveAsukaSelfieScriptPath(): string {
-  return path.resolve(__dirname, "../../../skills/asuka-selfie/skill/scripts/asuka-selfie.sh");
+function getSelfieIdentityReferenceImagePath(configuredReferenceImagePath?: unknown): string | null {
+  const explicitPath = typeof configuredReferenceImagePath === "string"
+    ? configuredReferenceImagePath.trim()
+    : "";
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  const stateDir = resolveOpenClawStateDir();
+  const candidates = [
+    explicitPath,
+    process.env.ASUKA_REFERENCE_IMAGE_PATH?.trim(),
+    stateDir ? path.join(stateDir, "identity.jpg") : "",
+    configPath ? path.join(path.dirname(configPath), "identity.jpg") : "",
+    path.resolve(__dirname, "../../../identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
 }
 
-function getSelfieFallbackImageCandidates(): string[] {
+function getSelfieFallbackImageCandidates(configuredReferenceImagePath?: unknown): string[] {
   const assetRoots = [
     path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
     path.resolve(__dirname, "../../../skills/asuka-selfie/assets"),
   ];
   const extensions = ["jpg", "jpeg", "png", "webp"];
   const candidates: string[] = [];
+  const identityReference = getSelfieIdentityReferenceImagePath(configuredReferenceImagePath);
+  if (identityReference) {
+    candidates.push(identityReference);
+  }
 
   for (const index of [1, 2, 3, 4]) {
     for (const root of assetRoots) {
       for (const ext of extensions) {
         const candidate = path.join(root, `${index}.${ext}`);
-        if (fs.existsSync(candidate)) {
+        if (fs.existsSync(candidate) && !candidates.includes(candidate)) {
           candidates.push(candidate);
           break;
         }
       }
-      if (candidates.length === index) {
+      if (candidates.length >= index + (identityReference ? 1 : 0)) {
         break;
       }
     }
@@ -438,36 +831,287 @@ function getSelfieFallbackImageCandidates(): string[] {
   return candidates;
 }
 
-function buildImageDataUrlFromFile(imagePath: string): string {
+function getImageMimeType(imagePath: string): string {
   const ext = path.extname(imagePath).toLowerCase();
-  const mime =
-    ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
-    : ext === ".png" ? "image/png"
-    : ext === ".webp" ? "image/webp"
-    : "application/octet-stream";
-  const base64 = fs.readFileSync(imagePath).toString("base64");
-  return `data:${mime};base64,${base64}`;
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
 }
 
-function createSelfiePromptFile(prompt: string): string {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-selfie-"));
-  const promptFilePath = path.join(tempDir, "prompt.txt");
-  fs.writeFileSync(promptFilePath, prompt, "utf8");
-  return promptFilePath;
+function normalizeStudioImageSize(size?: string): string {
+  const raw = (size || "1024x1024").trim();
+  if (/^1k$/i.test(raw)) return "1024x1024";
+  if (/^2k$/i.test(raw)) return "2048x2048";
+  return raw;
 }
 
-function cleanupSelfiePromptFile(promptFilePath: string | null): void {
-  if (!promptFilePath) return;
-  try {
-    fs.rmSync(path.dirname(promptFilePath), { recursive: true, force: true });
-  } catch {
-    // Ignore cleanup failures for temp prompt files.
+function normalizeStudioMediaImageSize(size?: string): string {
+  const raw = (size || "1K").trim();
+  if (/^[124]K$/i.test(raw)) return raw.toUpperCase();
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  if (normalized === "1024x1024") return "1K";
+  if (normalized === "2048x2048") return "2K";
+  if (normalized === "4096x4096") return "4K";
+  return "1K";
+}
+
+function normalizeMiniMaxAspectRatio(size?: string): string {
+  const raw = normalizeStudioImageSize(size);
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  const directRatios = new Set(["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"]);
+  if (directRatios.has(normalized)) return normalized;
+  const sizeToRatio: Record<string, string> = {
+    "1024x1024": "1:1",
+    "2048x2048": "1:1",
+    "1280x720": "16:9",
+    "1152x864": "4:3",
+    "1248x832": "3:2",
+    "832x1248": "2:3",
+    "864x1152": "3:4",
+    "720x1280": "9:16",
+    "1344x576": "21:9",
+  };
+  return sizeToRatio[normalized] ?? "1:1";
+}
+
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
+}
+
+function buildMiniMaxImagePrompt(prompt: string): string {
+  const merged = buildStudioSelfiePrompt(prompt).trim();
+  return merged.length > 1500 ? `${merged.slice(0, 1499).trimEnd()}…` : merged;
+}
+
+function extractStudioImageUrl(response: any): string {
+  const data = Array.isArray(response?.data) ? response.data : [];
+  for (const item of data) {
+    if (item?.url && typeof item.url === "string") return item.url;
+    if (item?.b64_json && typeof item.b64_json === "string") return `data:image/png;base64,${item.b64_json}`;
   }
+  const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
+  for (const url of resultUrls) {
+    if (typeof url === "string" && url) return url;
+  }
+  throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function extractMiniMaxImageUrl(response: any): string {
+  const urls = Array.isArray(response?.data?.image_urls) ? response.data.image_urls : [];
+  for (const url of urls) {
+    if (typeof url === "string" && url) return url;
+  }
+  const base64Images = Array.isArray(response?.data?.image_base64) ? response.data.image_base64 : [];
+  for (const image of base64Images) {
+    if (typeof image === "string" && image) return `data:image/jpeg;base64,${image}`;
+  }
+  throw new Error(`MiniMax image response did not contain an image: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function isMiniMaxImageConfig(config: StudioSelfieConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^image-01(?:$|-)/i.test(config.modelId);
+}
+
+function isStudioMediaImageConfig(config: StudioSelfieConfig): boolean {
+  return /(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?:[/:]|$)/i.test(config.baseUrl)
+    || /^(?:apibusiness_media:)?gpt-image-2$/i.test(config.modelId);
+}
+
+function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  const path = resourcePath.replace(/^\/+/, "");
+  if (/\/studio\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
+}
+
+async function generateMiniMaxSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/image_generation`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      model: config.modelId || "image-01",
+      prompt: buildMiniMaxImagePrompt(prompt),
+      aspect_ratio: normalizeMiniMaxAspectRatio(size),
+      response_format: "url",
+      n: 1,
+      prompt_optimizer: true,
+      subject_reference: [
+        {
+          type: "character",
+          image_file: buildImageDataUrlFromFile(referenceImagePath),
+        },
+      ],
+    }),
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  const statusCode = Number(body?.base_resp?.status_code ?? 0);
+  if (!response.ok || statusCode !== 0) {
+    const statusMessage = body?.base_resp?.status_msg || body?.error?.message || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`MiniMax image generation failed: HTTP ${response.status}: ${String(statusMessage).slice(0, 500)}`);
+  }
+
+  return extractMiniMaxImageUrl(body);
+}
+
+async function generateStudioMediaSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  form.append("model", config.modelId.replace(/^apibusiness_media:/i, ""));
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
+  form.append("image_size", normalizeStudioMediaImageSize(size));
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/edits"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio Media image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
+}
+
+async function generateStudioSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  if (!fs.existsSync(referenceImagePath)) {
+    throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  if (isMiniMaxImageConfig(config)) {
+    return generateMiniMaxSelfieImageUrl(prompt, config, referenceImagePath, size);
+  }
+
+  if (isStudioMediaImageConfig(config)) {
+    return generateStudioMediaSelfieImageUrl(prompt, config, referenceImagePath, size);
+  }
+
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  const bearerToken = await resolveBearerTokenFromApiKeyOrProfile({
+    apiKey: config.apiKey,
+    authProfile: config.authProfile,
+  });
+  form.append("model", config.modelId);
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
+  form.append("size", normalizeStudioImageSize(size));
+  form.append("n", "1");
+  form.append("quality", config.quality || "standard");
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${bearerToken}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
+}
+
+function buildImageDataUrlFromFile(imagePath: string): string {
+  const base64 = fs.readFileSync(imagePath).toString("base64");
+  return `data:${getImageMimeType(imagePath)};base64,${base64}`;
 }
 
 function resolveVisiblePayloadText(replyText: string, rawVisibleText: string): string {
   const preferred = hasStructuredPayloadPrefix(replyText) ? rawVisibleText : replyText.trim();
   return preferred || rawVisibleText;
+}
+
+function resolveSelfieVisiblePayloadText(
+  replyText: string,
+  rawVisibleText: string,
+  caption: string | undefined,
+  userText: string,
+): string {
+  const visibleText = cleanOutgoingTextSegment(resolveVisiblePayloadText(replyText, rawVisibleText));
+  if (visibleText) return visibleText;
+
+  const captionText = cleanOutgoingTextSegment(caption || "");
+  if (captionText) return captionText;
+
+  const requestText = cleanOutgoingTextSegment(stripTrailingSelfieTrigger(userText)).replace(/\s+/g, " ").trim();
+  if (requestText && !/^按最近对话语境生成一张(?:本人|Asuka 为主角的)?图片$/.test(requestText)) {
+    return "好，我按你刚刚说的来。";
+  }
+  return "好，我按刚刚的语境给你发一张。";
+}
+
+function stripStructuredPayloadForVisibleText(text: string): string {
+  if (!hasStructuredPayloadPrefix(text)) return text;
+  const payloadResult = parseQQBotPayload(text);
+  if (payloadResult.isPayload && !payloadResult.error && payloadResult.payload) {
+    return [payloadResult.leadingText, payloadResult.trailingText]
+      .filter((part): part is string => Boolean(part && part.trim()))
+      .join("\n\n")
+      .trim();
+  }
+  return text.replace(STRUCTURED_ARTIFACT_RE, "").trim();
 }
 
 function getWsProxyAgent(): HttpsProxyAgent<string> | undefined {
@@ -611,6 +1255,10 @@ const IMAGE_SERVER_DIR = process.env.QQBOT_IMAGE_SERVER_DIR || getQQBotDataDir("
 const MESSAGE_QUEUE_SIZE = 1000; // 最大队列长度（全局总量）
 const PER_USER_QUEUE_SIZE = 20; // 单用户最大排队数
 const MAX_CONCURRENT_USERS = 10; // 最大同时处理的用户数
+const DEFAULT_MESSAGE_BUFFER_MS = 4_000; // 普通消息防抖合并窗口
+const DEFAULT_MESSAGE_BUFFER_MAX_MS = 15_000; // 连续输入时最长等待时间
+const MESSAGE_BUFFER_MAX_MESSAGES = 20; // 单次合并最多消息数
+const MESSAGE_BUFFER_MAX_CONTENT_CHARS = 12_000; // 单次合并最多原始文本长度
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过1小时需降级为主动消息
@@ -700,6 +1348,28 @@ function parseFaceTags(text: string): string {
   });
 }
 
+export function parseVoiceReplySuffix(text: string): { text: string; forceVoiceReply: boolean } {
+  const trimmedEnd = text.trimEnd();
+  if (!/[~～]$/.test(trimmedEnd)) {
+    return { text, forceVoiceReply: false };
+  }
+  return {
+    text: trimmedEnd.slice(0, -1).trimEnd(),
+    forceVoiceReply: true,
+  };
+}
+
+export function parseProactiveNudge(text: string): { isNudge: boolean; forceVoiceReply: boolean } {
+  const trimmed = text.trim();
+  if (trimmed === "。" || trimmed === ".") {
+    return { isNudge: true, forceVoiceReply: false };
+  }
+  if (trimmed === "～" || trimmed === "~") {
+    return { isNudge: true, forceVoiceReply: true };
+  }
+  return { isNudge: false, forceVoiceReply: false };
+}
+
 // ============ 媒体发送友好错误提示 ============
 
 /**
@@ -731,14 +1401,34 @@ function formatMediaErrorMessage(mediaType: string, err: unknown): string {
 function filterInternalMarkers(text: string): string {
   if (!text) return text;
   
-  // 过滤 [[xxx: yyy]] 格式的内部标记
-  // 例如: [[reply_to: ROBOT1.0_kbc...]]
-  let result = text.replace(/\[\[[a-z_]+:\s*[^\]]*\]\]/gi, "");
+  // 过滤内部控制标记，例如:
+  // [[reply_to: ROBOT1.0_kbc...]], [[reply_to_current]], \[[reply_to_current]\]
+  let result = text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "");
   
   // 清理可能产生的多余空行
   result = result.replace(/\n{3,}/g, "\n\n").trim();
   
   return result;
+}
+
+export function stripWrappingDialogueQuotes(text: string): string {
+  let result = (text ?? "").trim();
+  if (!result) return result;
+
+  result = result
+    .replace(/^[ \t]*(?:"|“|”)+[ \t]*/u, "")
+    .replace(/[ \t]*(?:"|“|”)+[ \t]*$/u, "")
+    .trim();
+
+  return result;
+}
+
+function cleanOutgoingTextSegment(text: string): string {
+  const visibleText = stripWrappingDialogueQuotes(stripTTSControlMarkers(filterInternalMarkers(stripStructuredPayloadForVisibleText(text))).trim());
+  if (/^\\+$/.test(visibleText)) {
+    return "";
+  }
+  return visibleText;
 }
 
 export interface GatewayContext {
@@ -747,6 +1437,7 @@ export interface GatewayContext {
   cfg: unknown;
   onReady?: (data: unknown) => void;
   onError?: (error: Error) => void;
+  onStatus?: (status: Record<string, unknown>) => void;
   log?: {
     info: (msg: string) => void;
     error: (msg: string) => void;
@@ -757,7 +1448,18 @@ export interface GatewayContext {
 /**
  * 消息队列项类型（用于异步处理消息，防止阻塞心跳）
  */
-interface QueuedMessage {
+interface BufferedSourceMessage {
+  senderId: string;
+  senderName?: string;
+  content: string;
+  messageId: string;
+  timestamp: string;
+  attachments?: Array<{ content_type: string; url: string; filename?: string; voice_wav_url?: string; asr_refer_text?: string }>;
+  refMsgIdx?: string;
+  msgIdx?: string;
+}
+
+export interface QueuedMessage {
   type: "c2c" | "guild" | "dm" | "group";
   senderId: string;
   senderName?: string;
@@ -772,6 +1474,8 @@ interface QueuedMessage {
   refMsgIdx?: string;
   /** 当前消息自身的 refIdx（供将来被引用） */
   msgIdx?: string;
+  /** 缓冲合并前的原始消息列表，供引用索引和日志保留每条消息的信息 */
+  bufferedMessages?: BufferedSourceMessage[];
 }
 
 /**
@@ -790,6 +1494,64 @@ function parseRefIndices(ext?: string[]): { refMsgIdx?: string; msgIdx?: string 
     }
   }
   return { refMsgIdx, msgIdx };
+}
+
+function parseNonNegativeMs(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+function resolveMessageBufferConfig(accountConfig: ResolvedQQBotAccount["config"]): { bufferMs: number; maxMs: number } {
+  const bufferMs = parseNonNegativeMs(
+    process.env.QQBOT_MESSAGE_BUFFER_MS ?? accountConfig.messageBufferMs,
+    DEFAULT_MESSAGE_BUFFER_MS,
+  );
+  const configuredMaxMs = parseNonNegativeMs(
+    process.env.QQBOT_MESSAGE_BUFFER_MAX_MS ?? accountConfig.messageBufferMaxMs,
+    DEFAULT_MESSAGE_BUFFER_MAX_MS,
+  );
+  const maxMs = Math.max(bufferMs, configuredMaxMs);
+  return { bufferMs, maxMs };
+}
+
+function toBufferedSourceMessage(msg: QueuedMessage): BufferedSourceMessage {
+  return {
+    senderId: msg.senderId,
+    ...(msg.senderName !== undefined ? { senderName: msg.senderName } : {}),
+    content: msg.content,
+    messageId: msg.messageId,
+    timestamp: msg.timestamp,
+    ...(msg.attachments !== undefined ? { attachments: msg.attachments } : {}),
+    ...(msg.refMsgIdx !== undefined ? { refMsgIdx: msg.refMsgIdx } : {}),
+    ...(msg.msgIdx !== undefined ? { msgIdx: msg.msgIdx } : {}),
+  };
+}
+
+export function mergeBufferedQueuedMessages(messages: QueuedMessage[]): QueuedMessage {
+  if (messages.length === 0) {
+    throw new Error("Cannot merge an empty message buffer");
+  }
+
+  const latest = messages[messages.length - 1]!;
+  const sourceMessages = messages.flatMap((msg) => msg.bufferedMessages?.length ? msg.bufferedMessages : [toBufferedSourceMessage(msg)]);
+  const contentParts = sourceMessages
+    .map((msg) => (msg.content ?? "").trim())
+    .filter(Boolean);
+  const attachments = sourceMessages.flatMap((msg) => msg.attachments ?? []);
+  const latestQuoted = [...sourceMessages].reverse().find((msg) => msg.refMsgIdx);
+  const latestIndexed = [...sourceMessages].reverse().find((msg) => msg.msgIdx);
+
+  return {
+    ...latest,
+    content: contentParts.join("\n"),
+    messageId: latest.messageId,
+    timestamp: latest.timestamp,
+    ...(attachments.length > 0 ? { attachments } : { attachments: undefined }),
+    ...(latestQuoted?.refMsgIdx ? { refMsgIdx: latestQuoted.refMsgIdx } : { refMsgIdx: undefined }),
+    ...(latestIndexed?.msgIdx ? { msgIdx: latestIndexed.msgIdx } : { msgIdx: undefined }),
+    bufferedMessages: sourceMessages,
+  };
 }
 
 /**
@@ -846,7 +1608,7 @@ async function ensureImageServer(log?: GatewayContext["log"], publicBaseUrl?: st
  * 支持流式消息发送
  */
 export async function startGateway(ctx: GatewayContext): Promise<void> {
-  const { account, abortSignal, cfg, onReady, onError, log } = ctx;
+  const { account, abortSignal, cfg, onReady, onError, onStatus, log } = ctx;
 
   if (!account.appId || !account.clientSecret) {
     throw new Error("QQBot not configured (missing appId or clientSecret)");
@@ -892,7 +1654,12 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   // 注册出站消息 refIdx 缓存钩子
   // 所有消息发送函数在拿到 QQ 回包后，如果含 ref_idx 则自动回调此处缓存
   onMessageSent((refIdx, meta) => {
-    log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${meta.ttsText?.slice(0, 30)}`);
+    const visibleTtsText = meta.ttsText ? cleanOutgoingTextSegment(meta.ttsText) : "";
+    log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${visibleTtsText.slice(0, 30)}`);
+    if (!meta.mediaType && looksLikeTransportFallbackText(String(meta.text || ""))) {
+      log?.info(`[qqbot:${account.accountId}] Skipped caching transport fallback refIdx: ${refIdx}`);
+      return;
+    }
     const attachments: RefAttachmentSummary[] = [];
     if (meta.mediaType) {
       const localPath = meta.mediaLocalPath;
@@ -903,10 +1670,10 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         ...(filename ? { filename } : {}),
         ...(meta.mediaUrl ? { url: meta.mediaUrl } : {}),
       };
-      if (meta.mediaType === "voice" && meta.ttsText) {
-        attachment.transcript = meta.ttsText;
+      if (meta.mediaType === "voice" && visibleTtsText) {
+        attachment.transcript = visibleTtsText;
         attachment.transcriptSource = "tts";
-        log?.info(`[qqbot:${account.accountId}] Saving voice transcript (TTS): ${meta.ttsText.slice(0, 50)}`);
+        log?.info(`[qqbot:${account.accountId}] Saving voice transcript (TTS): ${visibleTtsText.slice(0, 50)}`);
       }
       attachments.push(attachment);
     }
@@ -921,6 +1688,13 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     });
     log?.info(`[qqbot:${account.accountId}] Cached outbound refIdx: ${refIdx}, attachments=${JSON.stringify(attachments)}`);
   });
+
+  const stopDailyDigestScheduler = startDailyConversationDigestScheduler({
+    accountId: account.accountId,
+    rootConfig: cfg as Record<string, unknown>,
+    log,
+  });
+  abortSignal?.addEventListener("abort", stopDailyDigestScheduler, { once: true });
 
   let reconnectAttempts = 0;
   let isAborted = false;
@@ -956,9 +1730,54 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   
   const userQueues = new Map<string, QueuedMessage[]>(); // peerId → 消息队列
   const activeUsers = new Set<string>(); // 正在处理中的用户
+  const messageBuffers = new Map<string, {
+    messages: QueuedMessage[];
+    firstReceivedAt: number;
+    idleTimer: ReturnType<typeof setTimeout> | null;
+    maxTimer: ReturnType<typeof setTimeout> | null;
+  }>();
+  const messageBufferConfig = resolveMessageBufferConfig(account.config);
   let messagesProcessed = 0;
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
+
+  const countBufferedMessages = (): number => {
+    let count = 0;
+    for (const batch of messageBuffers.values()) count += batch.messages.length;
+    return count;
+  };
+
+  const countQueuedMessages = (): number => {
+    let count = 0;
+    for (const queue of userQueues.values()) count += queue.length;
+    return count;
+  };
+
+  const publishRuntimeStatus = (patch: Record<string, unknown>): void => {
+    try {
+      onStatus?.({
+        running: true,
+        connected: true,
+        lastActivityAt: Date.now(),
+        ...patch,
+      });
+    } catch (err) {
+      log?.debug?.(`[qqbot:${account.accountId}] Failed to publish runtime status: ${err}`);
+    }
+  };
+
+  const publishQueueStatus = (patch: Record<string, unknown> = {}): void => {
+    const bufferedMessages = countBufferedMessages();
+    const queuedMessages = countQueuedMessages();
+    const activeRuns = activeUsers.size;
+    publishRuntimeStatus({
+      busy: bufferedMessages > 0 || queuedMessages > 0 || activeRuns > 0,
+      bufferedMessages,
+      queuedMessages,
+      activeRuns,
+      ...patch,
+    });
+  };
 
   // 获取消息的路由 key（决定并发隔离粒度）
   const getMessagePeerId = (msg: QueuedMessage): string => {
@@ -967,34 +1786,26 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     return `dm:${msg.senderId}`;
   };
 
-  const enqueueMessage = (msg: QueuedMessage): void => {
-    const peerId = getMessagePeerId(msg);
-    const content = (msg.content ?? "").trim().toLowerCase();
-    
-    // 检测是否为紧急命令
-    const isUrgentCommand = URGENT_COMMANDS.some(cmd => content.startsWith(cmd.toLowerCase()));
-    
-    if (isUrgentCommand) {
-      log?.info(`[qqbot:${account.accountId}] Urgent command detected: ${content.slice(0, 20)}, executing immediately`);
-      
-      // 清空该用户队列中所有待处理消息
-      const queue = userQueues.get(peerId);
-      if (queue) {
-        const droppedCount = queue.length;
-        queue.length = 0; // 清空队列
-        totalEnqueued = Math.max(0, totalEnqueued - droppedCount);
-        log?.info(`[qqbot:${account.accountId}] Dropped ${droppedCount} queued messages for ${peerId} due to urgent command`);
-      }
-      
-      // 立即异步执行紧急命令，不等待
-      if (handleMessageFnRef) {
-        handleMessageFnRef(msg).catch(err => {
-          log?.error(`[qqbot:${account.accountId}] Urgent command error: ${err}`);
-        });
-      }
-      return;
+  const getMessageBufferKey = (msg: QueuedMessage): string => {
+    if (msg.type === "guild") return `guild:${msg.channelId ?? "unknown"}:sender:${msg.senderId}`;
+    if (msg.type === "group") return `group:${msg.groupOpenid ?? "unknown"}:sender:${msg.senderId}`;
+    return `dm:${msg.senderId}`;
+  };
+
+  const clearBufferedBatchTimers = (batch: { idleTimer: ReturnType<typeof setTimeout> | null; maxTimer: ReturnType<typeof setTimeout> | null }): void => {
+    if (batch.idleTimer) {
+      clearTimeout(batch.idleTimer);
+      batch.idleTimer = null;
     }
-    
+    if (batch.maxTimer) {
+      clearTimeout(batch.maxTimer);
+      batch.maxTimer = null;
+    }
+  };
+
+  const enqueueMessageForProcessing = (msg: QueuedMessage): void => {
+    const peerId = getMessagePeerId(msg);
+
     let queue = userQueues.get(peerId);
     if (!queue) {
       queue = [];
@@ -1015,9 +1826,113 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
     queue.push(msg);
     log?.debug?.(`[qqbot:${account.accountId}] Message enqueued for ${peerId}, user queue: ${queue.length}, active users: ${activeUsers.size}`);
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "queued" });
 
     // 如果该用户没有正在处理的消息，立即启动处理
     drainUserQueue(peerId);
+  };
+
+  const flushBufferedMessage = (bufferKey: string, reason: string): void => {
+    const batch = messageBuffers.get(bufferKey);
+    if (!batch) return;
+    clearBufferedBatchTimers(batch);
+    messageBuffers.delete(bufferKey);
+    const merged = mergeBufferedQueuedMessages(batch.messages);
+    if (batch.messages.length > 1) {
+      log?.info(`[qqbot:${account.accountId}] Buffered ${batch.messages.length} messages for ${bufferKey}, merged as ${merged.messageId} (${reason})`);
+    }
+    enqueueMessageForProcessing(merged);
+  };
+
+  const dropBufferedMessagesForPeer = (peerId: string, reason: string): number => {
+    let dropped = 0;
+    for (const [bufferKey, batch] of [...messageBuffers.entries()]) {
+      const firstMessage = batch.messages[0];
+      if (!firstMessage || getMessagePeerId(firstMessage) !== peerId) continue;
+      clearBufferedBatchTimers(batch);
+      messageBuffers.delete(bufferKey);
+      dropped += batch.messages.length;
+      log?.info(`[qqbot:${account.accountId}] Dropped ${batch.messages.length} buffered messages for ${bufferKey} (${reason})`);
+    }
+    return dropped;
+  };
+
+  const flushAllBufferedMessages = (reason: string): number => {
+    const bufferKeys = [...messageBuffers.keys()];
+    for (const bufferKey of bufferKeys) {
+      flushBufferedMessage(bufferKey, reason);
+    }
+    return bufferKeys.length;
+  };
+
+  const enqueueMessage = (msg: QueuedMessage): void => {
+    const peerId = getMessagePeerId(msg);
+    const bufferKey = getMessageBufferKey(msg);
+    const trimmedContent = (msg.content ?? "").trim();
+    const lowerContent = trimmedContent.toLowerCase();
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
+
+    // 检测是否为紧急命令
+    const isUrgentCommand = URGENT_COMMANDS.some(cmd => lowerContent.startsWith(cmd.toLowerCase()));
+
+    if (isUrgentCommand) {
+      log?.info(`[qqbot:${account.accountId}] Urgent command detected: ${lowerContent.slice(0, 20)}, executing immediately`);
+
+      dropBufferedMessagesForPeer(peerId, "urgent command");
+
+      // 清空该用户队列中所有待处理消息
+      const queue = userQueues.get(peerId);
+      if (queue) {
+        const droppedCount = queue.length;
+        queue.length = 0; // 清空队列
+        totalEnqueued = Math.max(0, totalEnqueued - droppedCount);
+        log?.info(`[qqbot:${account.accountId}] Dropped ${droppedCount} queued messages for ${peerId} due to urgent command`);
+      }
+
+      // 立即异步执行紧急命令，不等待
+      if (handleMessageFnRef) {
+        handleMessageFnRef(msg).catch(err => {
+          log?.error(`[qqbot:${account.accountId}] Urgent command error: ${err}`);
+        });
+      }
+      return;
+    }
+
+    // 斜杠命令不参与普通消息合并，避免控制指令被拼到对话正文里。
+    if (trimmedContent.startsWith("/") || messageBufferConfig.bufferMs === 0) {
+      flushBufferedMessage(bufferKey, "command or buffer disabled");
+      enqueueMessageForProcessing(msg);
+      return;
+    }
+
+    let batch = messageBuffers.get(bufferKey);
+    if (!batch) {
+      batch = {
+        messages: [],
+        firstReceivedAt: Date.now(),
+        idleTimer: null,
+        maxTimer: null,
+      };
+      messageBuffers.set(bufferKey, batch);
+      if (messageBufferConfig.maxMs > messageBufferConfig.bufferMs) {
+        batch.maxTimer = setTimeout(() => flushBufferedMessage(bufferKey, "max window elapsed"), messageBufferConfig.maxMs);
+      }
+    }
+
+    batch.messages.push(msg);
+    publishQueueStatus({ lastInboundAt: Date.now(), queueState: "buffered" });
+    const bufferedChars = batch.messages.reduce((sum, item) => sum + (item.content?.length ?? 0), 0);
+    const shouldFlushNow = batch.messages.length >= MESSAGE_BUFFER_MAX_MESSAGES
+      || bufferedChars >= MESSAGE_BUFFER_MAX_CONTENT_CHARS
+      || Date.now() - batch.firstReceivedAt >= messageBufferConfig.maxMs;
+    if (shouldFlushNow) {
+      flushBufferedMessage(bufferKey, "buffer limit reached");
+      return;
+    }
+
+    if (batch.idleTimer) clearTimeout(batch.idleTimer);
+    batch.idleTimer = setTimeout(() => flushBufferedMessage(bufferKey, "idle window elapsed"), messageBufferConfig.bufferMs);
+    log?.debug?.(`[qqbot:${account.accountId}] Message buffered for ${bufferKey}, batch=${batch.messages.length}, idle=${messageBufferConfig.bufferMs}ms, max=${messageBufferConfig.maxMs}ms`);
   };
 
   // 处理指定用户队列中的消息（串行）
@@ -1035,6 +1950,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
 
     activeUsers.add(peerId);
+    publishQueueStatus({ queueState: "processing" });
 
     try {
       while (queue.length > 0 && !isAborted) {
@@ -1052,6 +1968,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     } finally {
       activeUsers.delete(peerId);
       userQueues.delete(peerId);
+      publishQueueStatus({ queueState: "idle" });
       // 处理完后，检查是否有等待并发槽位的用户
       for (const [waitingPeerId, waitingQueue] of userQueues) {
         if (waitingQueue.length > 0 && !activeUsers.has(waitingPeerId)) {
@@ -1064,15 +1981,23 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
   const startMessageProcessor = (handleMessageFn: (msg: QueuedMessage) => Promise<void>): void => {
     handleMessageFnRef = handleMessageFn;
-    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users)`);
+    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users, buffer ${messageBufferConfig.bufferMs}ms/${messageBufferConfig.maxMs}ms)`);
   };
 
   abortSignal.addEventListener("abort", () => {
+    const flushedBufferCount = flushAllBufferedMessages("channel abort");
+    if (flushedBufferCount > 0) {
+      log?.info(`[qqbot:${account.accountId}] Flushed ${flushedBufferCount} buffered message batch(es) before channel abort`);
+    }
     isAborted = true;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    for (const batch of messageBuffers.values()) {
+      clearBufferedBatchTimers(batch);
+    }
+    messageBuffers.clear();
     cleanup();
     // P1-1: 停止后台 Token 刷新
     stopBackgroundTokenRefresh(account.appId);
@@ -1155,23 +2080,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       const pluginRuntime = getQQBotRuntime();
 
       // 处理收到的消息
-      const handleMessage = async (event: {
-        type: "c2c" | "guild" | "dm" | "group";
-        senderId: string;
-        senderName?: string;
-        content: string;
-        messageId: string;
-        timestamp: string;
-        channelId?: string;
-        guildId?: string;
-        groupOpenid?: string;
-        attachments?: Array<{ content_type: string; url: string; filename?: string; voice_wav_url?: string; asr_refer_text?: string }>;
-        refMsgIdx?: string;
-        msgIdx?: string;
-      }) => {
+      const handleMessage = async (event: QueuedMessage) => {
 
         log?.debug?.(`[qqbot:${account.accountId}] Received message: ${JSON.stringify(event)}`);
-        log?.info(`[qqbot:${account.accountId}] Processing message from ${event.senderId}: ${event.content}`);
+        const sourceMessages = event.bufferedMessages?.length ? event.bufferedMessages : [toBufferedSourceMessage(event)];
+        log?.info(`[qqbot:${account.accountId}] Processing message from ${event.senderId}${sourceMessages.length > 1 ? ` (${sourceMessages.length} buffered messages)` : ""}: ${event.content}`);
         if (event.attachments?.length) {
           log?.info(`[qqbot:${account.accountId}] Attachments: ${event.attachments.length}`);
         }
@@ -1229,16 +2142,18 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         
         // ============ 用户标识信息 ============
         
-        // 收集额外的系统提示（如果配置了账户级别的 systemPrompt）
-        const systemPrompts: string[] = [];
+        // 收集额外的稳定系统提示（如果配置了账户级别的 systemPrompt）。
+        // 这些内容每轮基本不变，放在 agent prompt 最前面以提高 provider prefix cache 命中率。
+        const stablePromptSections: string[] = [];
         if (account.systemPrompt) {
-          systemPrompts.push(account.systemPrompt);
+          stablePromptSections.push(account.systemPrompt);
         }
         
         // 处理附件（图片等）- 下载到本地供 clawdbot 访问
         let attachmentInfo = "";
         const imageUrls: string[] = [];
         const imageMediaTypes: string[] = [];
+        const imageFilenames: string[] = [];
         const voiceAttachmentPaths: string[] = [];
         const voiceAttachmentUrls: string[] = [];
         const voiceAsrReferTexts: string[] = [];
@@ -1289,6 +2204,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               if (att.content_type?.startsWith("image/")) {
                 imageUrls.push(localPath);
                 imageMediaTypes.push(att.content_type);
+                imageFilenames.push(att.filename ?? path.basename(localPath));
               } else if (isVoice) {
                 voiceAttachmentPaths.push(localPath);
                 // 语音消息处理：先检查 STT 是否可用，避免无意义的转换开销
@@ -1370,6 +2286,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               if (att.content_type?.startsWith("image/")) {
                 imageUrls.push(attUrl);
                 imageMediaTypes.push(att.content_type);
+                imageFilenames.push(att.filename ?? "remote-image");
               } else if (isVoice && asrReferText) {
                 log?.info(`[qqbot:${account.accountId}] Voice attachment download failed, using asr_refer_text fallback`);
                 voiceTranscripts.push(asrReferText);
@@ -1400,10 +2317,45 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         }
 
         // 解析 QQ 表情标签，将 <faceType=...,ext="base64"> 替换为 【表情: 中文名】
-        const parsedContent = parseFaceTags(event.content);
-        const userContent = voiceText
+        const faceParsedContent = parseFaceTags(event.content);
+        const proactiveNudge = !event.attachments?.length
+          ? parseProactiveNudge(faceParsedContent)
+          : { isNudge: false, forceVoiceReply: false };
+        const parsedUserText = parseVoiceReplySuffix(faceParsedContent);
+        const parsedContent = parsedUserText.text;
+        let userContent = voiceText
           ? (parsedContent.trim() ? `${parsedContent}\n${voiceText}` : voiceText) + attachmentInfo
           : parsedContent + attachmentInfo;
+        if (proactiveNudge.isNudge) {
+          userContent = "";
+        }
+        const forceSelfieFromTrailingDash = event.type === "c2c"
+          && !proactiveNudge.isNudge
+          && !parsedContent.trim().startsWith("/")
+          && shouldForceSelfieFromTrailingDash(faceParsedContent);
+        if (forceSelfieFromTrailingDash) {
+          log?.info(`[qqbot:${account.accountId}] Trailing dash selfie trigger detected for ${event.senderId}`);
+          userContent = stripTrailingSelfieTriggerFromUserContent(userContent);
+        }
+        const userRequestedVoiceReply = (parsedUserText.forceVoiceReply || proactiveNudge.forceVoiceReply) && !parsedContent.trim().startsWith("/");
+
+        const imageUnderstandingResults = await summarizeImagesForPrompt(
+          imageUrls.map((p, i) => ({
+            pathOrUrl: p,
+            contentType: imageMediaTypes[i],
+            filename: imageFilenames[i],
+          })),
+          resolveMiniMaxVisionConfig(cfg as Record<string, unknown>),
+        );
+        const imageUnderstandingPrompt = formatImageUnderstandingForPrompt(imageUnderstandingResults);
+        if (imageUnderstandingResults.length > 0) {
+          const summarized = imageUnderstandingResults.filter((item) => item.status === "summarized").length;
+          const skipped = imageUnderstandingResults.filter((item) => item.status === "skipped").length;
+          const failed = imageUnderstandingResults.filter((item) => item.status === "failed").length;
+          log?.info(
+            `[qqbot:${account.accountId}] Image understanding: summarized=${summarized}, skipped=${skipped}, failed=${failed}`
+          );
+        }
 
         const qualifiedTarget = event.type === "group"
           ? `qqbot:group:${event.groupOpenid}`
@@ -1421,12 +2373,16 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           messageId: event.messageId,
         };
 
-        recordInboundInteraction(asukaPeerContext, userContent);
-        const memoryControl = handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
-        if (!memoryControl.handled) {
+        recordInboundInteraction(asukaPeerContext, proactiveNudge.isNudge ? "用户轻轻催你主动续聊" : userContent);
+        const memoryControl: ReturnType<typeof handleAsukaMemoryControlMessage> = proactiveNudge.isNudge
+          ? { handled: false }
+          : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
+        if (!proactiveNudge.isNudge && !memoryControl.handled) {
           recordAsukaLongTermMemoryFromUserMessage(asukaPeerContext, userContent);
         }
-        const cancelledPromises = cancelPromisesFromUserMessage(asukaPeerContext, userContent);
+        const cancelledPromises = proactiveNudge.isNudge
+          ? { cancelledPromises: [], cronJobIds: [] }
+          : cancelPromisesFromUserMessage(asukaPeerContext, userContent);
         if (cancelledPromises.cancelledPromises.length > 0) {
           log?.info(
             `[qqbot:${account.accountId}] Cancelled ${cancelledPromises.cancelledPromises.length} promise(s) from user message: ${cancelledPromises.cancelledPromises.map((item) => item.id).join(",")}`
@@ -1458,11 +2414,20 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           }
         }
 
-        // 2. 缓存当前消息自身的 msgIdx（供将来被引用时查找）
-        const currentMsgIdx = event.msgIdx;
-        if (currentMsgIdx) {
-          const attSummaries = buildAttachmentSummaries(event.attachments, attachmentLocalPaths);
-          if (attSummaries && voiceTranscripts.length > 0) {
+        // 2. 缓存当前消息自身的 msgIdx（供将来被引用时查找）。缓冲合并后仍逐条保留原始 msgIdx。
+        let sourceAttachmentOffset = 0;
+        for (const sourceMessage of sourceMessages) {
+          const sourceAttachments = sourceMessage.attachments;
+          const sourceAttachmentCount = sourceAttachments?.length ?? 0;
+          const sourceLocalPaths = sourceAttachmentCount > 0
+            ? attachmentLocalPaths.slice(sourceAttachmentOffset, sourceAttachmentOffset + sourceAttachmentCount)
+            : undefined;
+          sourceAttachmentOffset += sourceAttachmentCount;
+
+          if (!sourceMessage.msgIdx) continue;
+
+          const attSummaries = buildAttachmentSummaries(sourceAttachments, sourceLocalPaths);
+          if (sourceMessages.length === 1 && attSummaries && voiceTranscripts.length > 0) {
             let voiceIdx = 0;
             for (const att of attSummaries) {
               if (att.type === "voice" && voiceIdx < voiceTranscripts.length) {
@@ -1474,15 +2439,15 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
               }
             }
           }
-          setRefIndex(currentMsgIdx, {
-            content: parsedContent,
-            senderId: event.senderId,
-            peerId: isGroupChat ? (event.groupOpenid ?? event.senderId) : event.senderId,
-            senderName: event.senderName,
-            timestamp: new Date(event.timestamp).getTime(),
+          setRefIndex(sourceMessage.msgIdx, {
+            content: parseFaceTags(sourceMessage.content),
+            senderId: sourceMessage.senderId,
+            peerId: isGroupChat ? (event.groupOpenid ?? sourceMessage.senderId) : sourceMessage.senderId,
+            senderName: sourceMessage.senderName,
+            timestamp: new Date(sourceMessage.timestamp).getTime(),
             attachments: attSummaries,
           });
-          log?.info(`[qqbot:${account.accountId}] Cached msgIdx=${currentMsgIdx} for future reference (source: message_scene.ext)`);
+          log?.info(`[qqbot:${account.accountId}] Cached msgIdx=${sourceMessage.msgIdx} for future reference (source: message_scene.ext)`);
         }
 
         // Body: 展示用的用户原文（Web UI 看到的）
@@ -1542,84 +2507,97 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         const hasTTS = !!resolveTTSConfig(cfg as Record<string, unknown>);
         const hasSTT = !!resolveSTTConfig(cfg as Record<string, unknown>);
         const replyLoop = !isGroupChat ? detectReplyLoop(asukaPeerContext.peerId) : null;
-        const shouldForceFreshSession = Boolean(replyLoop);
-        if (!shouldForceFreshSession) {
-          await refreshSceneState(asukaPeerContext, {
-            trigger: "inbound",
-            text: userContent,
-            at: nowMs,
-          });
-        }
-        const asukaStatePrompt = shouldForceFreshSession ? "" : buildAsukaStatePrompt(asukaPeerContext);
-        const asukaMemoryPrompt = shouldForceFreshSession ? "" : buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
-        const recentChatTranscript = shouldForceFreshSession
-          ? ""
-          : buildRecentConversationTranscript(asukaPeerContext.peerId, userContent);
+        await refreshSceneState(asukaPeerContext, {
+          trigger: "inbound",
+          text: userContent,
+          at: nowMs,
+        });
+        const asukaStatePrompt = buildAsukaStatePrompt(asukaPeerContext);
+        const asukaMemoryPrompt = buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
+        const asukaConversationDigestPrompt = buildConversationDigestPrompt(asukaPeerContext);
+        const eventTimestampMs = new Date(event.timestamp).getTime();
+        const recentChatTranscript = buildRecentConversationTranscript(asukaPeerContext.peerId, userContent, eventTimestampMs);
+        stablePromptSections.push(buildPersonaPromptForChat(isGroupChat));
+        const dynamicPromptSections: string[] = [];
         if (replyLoop) {
           log?.info?.(
-            `[qqbot:${account.accountId}] Reply loop detected for ${asukaPeerContext.peerId}, forcing fresh session. repeatedReply="${replyLoop.repeatedReply}"`
+            `[qqbot:${account.accountId}] Reply loop detected for ${asukaPeerContext.peerId}, adding correction while preserving context. repeatedReply="${replyLoop.repeatedReply}"`
           );
-          systemPrompts.push(
+          dynamicPromptSections.push(
             "【回复纠偏】上一轮对话已经卡在固定句式里了。这一轮不要沿用上一句原话，直接根据用户最新这句重新组织自然回复。"
           );
         }
         if (asukaStatePrompt) {
-          systemPrompts.push(asukaStatePrompt);
+          dynamicPromptSections.push(asukaStatePrompt);
         }
         if (asukaMemoryPrompt) {
-          systemPrompts.push(asukaMemoryPrompt);
+          dynamicPromptSections.push(asukaMemoryPrompt);
         }
-        systemPrompts.push(buildPersonaPromptForChat(isGroupChat));
-
-        // 语音能力说明：<qqvoice> 标签本身只负责发送已有的音频文件，不依赖插件 TTS。
-        // TTS 只是生成音频文件的一种方式，框架侧的 TTS 工具（如 audio_speech）也能生成。
-        // 因此始终暴露 <qqvoice> 能力，但根据 TTS 状态给出不同的使用指引。
+        if (asukaConversationDigestPrompt) {
+          dynamicPromptSections.push(asukaConversationDigestPrompt);
+        }
+        // 语音能力说明：有插件 TTS 时优先让模型输出结构化 audio 载荷，由通道生成并上传 QQ 语音。
+        // <qqvoice> 仍保留给“已经有本地音频文件路径”的场景。
         const ttsHint = hasTTS
-          ? `6. 🎤 插件 TTS 已启用: 如果你有 TTS 工具（如 audio_speech），可用它生成音频文件后用 <qqvoice> 发送`
-          : `6. ⚠️ 插件 TTS 未配置: 如果你有 TTS 工具（如 audio_speech），仍可用它生成音频文件后用 <qqvoice> 发送；若无 TTS 工具，则无法主动生成语音`;
+          ? `14. 插件 TTS 已启用: 用户明确要听语音时，优先输出 QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"要朗读的短文本；如果有动作/旁白就单独写成（动作/旁白）；TTS 语气标记用「breath」这类日文角括号","caption":"可选短文字","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}`
+          : `14. 插件 TTS 未配置: 不要主动承诺生成语音；如果已有真实本地音频文件路径，才可以用 <qqvoice> 发送`;
         const sttHint = hasSTT
-          ? `\n7. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
-          : `\n7. 插件侧 STT 未配置，插件不会自动转录语音消息`;
-        const asrFallbackHint = hasAsrReferFallback
-          ? `\n8. 本条消息包含平台返回的 asr_refer_text 兜底文本（低置信度）。理解用户意图时可参考，但如关键信息不明确应先追问确认。`
-          : "";
-        const voiceForwardHint = uniqueVoicePaths.length > 0 || uniqueVoiceUrls.length > 0
-          ? `\n9. 本条消息已附带语音文件路径/URL。若你具备 STT 能力（框架能力或 STT skill），优先直接转写音频；若无 STT 能力或转写失败，再使用 asr_refer_text（若存在）作为兜底。`
-          : "";
+          ? `\n15. 插件侧 STT 已配置，用户发送的语音消息会尽量自动转录`
+          : `\n15. 插件侧 STT 未配置，插件不会自动转录语音消息`;
         const voiceSection = `
 
 【发送语音 - 必须遵守】
-1. 发语音方法: 在回复文本中写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
-2. 示例: "来听听吧！ <qqvoice>/tmp/tts/voice.mp3</qqvoice>"
-3. 支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
-4. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
-5. 发送语音时，不要重复输出语音中已朗读的文字内容；语音前后的文字应是补充信息而非语音的文字版重复
-${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
+1. 如果插件 TTS 已启用，用户明确要语音/想听你说/发条语音时，输出 QQBOT_PAYLOAD audio 载荷；path 字段写要朗读的短文本，不要写内部过程
+2. 除了真正说出口的话，其余旁白、语气说明、神态、动作、环境描写都必须用全角括号 \`（...）\` 包起来；例如 \`（气息顿了一下，嘴角不自觉地弯起来）我在呢。\`
+3. 语音消息也遵守同一格式：\`（...）\` 是 QQ 文字旁白，不是 TTS 朗读文本；系统会把它作为文字单独发送，只有普通句子会转成语音。不要把“气息顿了一下”“声音软下来”“嘴角弯起来”这类旁白裸写进朗读句子里。
+4. 示例: QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"（气息轻轻顿了一下）我在呢。<#0.4#>「breath」轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"pitch":0,"vol":1,"languageBoost":"Chinese"}}
+5. 普通说出口的话直接写，不要用英文双引号或中文弯引号包起来；错误示例: "我在呢。"；正确示例: 我在呢。
+6. 如果你手里已经有真实本地音频文件路径，也可以写 <qqvoice>本地音频文件路径</qqvoice>，系统自动处理
+7. 本地音频支持格式: .silk, .slk, .slac, .amr, .wav, .mp3, .ogg, .pcm
+8. ⚠️ <qqvoice> 只用于语音文件，图片请用 <qqimg>；两者不要混用
+9. 发送语音时，朗读文本要短；不要重复输出语音中已朗读的文字内容，caption 应是补充信息而非语音文字版重复
+10. 你可以结合上下文给 audio payload 添加 tts 动态配置：emotion、pause、speed、vol、pitch、languageBoost。默认 voice 固定是 Chinese (Mandarin)_Laid_BackGirl；禁止覆盖 voice 或使用 voiceModify；不要在同一轮里切换多个 voice、改变 timbre 或制造多人声
+11. 亲密/安静时可选 emotion soft/gentle/shy、speed 0.85-1.0、pitch -1 到 0；开心/调皮时可选 happy/amused、speed 1.0-1.15、pitch 0 到 2；认真时可选 serious、speed 0.9-1.0、pitch -1 到 0。pitch 必须是整数，不要输出小数
+12. MiniMax TTS 可在真正朗读的句子里插入停顿 <#0.4#> 和少量语气词标签。为了避免和旁白 \`（...）\` 冲突，生成回复时必须写成日文角括号标记，如 「laughs」、「sighs」、「emm」、「breath」；系统会在送入 MiniMax 前转换成 MiniMax 需要的半角圆括号。不要直接输出 (breath)，也不要把这些标记写进 caption
+13. path 里的 TTS 控制标签必须少量、自然、服务当前语气；不要连续堆叠，也不要把它们放到普通文字回复里。中文全角 \`（...）\` 永远是 QQ 文字旁白，不进入 TTS
+14. 如果当前轮次标记“用户希望听语音回答”，这等同于用户明确要语音；必须优先输出 QQBOT_PAYLOAD audio 载荷，不要解释触发规则
+${ttsHint}${sttHint}`;
 
         const voiceAsrSection = uniqueVoiceAsrReferTexts.length > 0
           ? `\n- 语音ASR兜底文本:\n${uniqueVoiceAsrReferTexts.map((t, i) => `  ${i + 1}. ${t}`).join("\n")}`
           : "";
-
-        const contextInfo = `你正在通过 QQ 与用户对话。
-
-【会话上下文】
-- 用户: ${event.senderName || "未知"} (${event.senderId})
-- 场景: ${isGroupChat ? "群聊" : "私聊"}${isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
-- 消息ID: ${event.messageId}
-- 投递目标: ${qualifiedTarget}${receivedMediaSection}${voiceAsrSection}
-- 当前时间戳(ms): ${nowMs}
-- 定时提醒投递地址: channel=qqbot, to=${qualifiedTarget}
+        const currentLocalTime = formatZonedDateTimeForPrompt(nowMs, getPromptTimeZone(account));
+        let searchPrompt = "";
+        const searchConfig = resolveMiniMaxSearchConfig(cfg as Record<string, unknown>);
+        if (searchConfig) {
+          const searchTrigger = await analyzeMiniMaxSearchIntent({
+            userText: userContent,
+            recentContext: recentChatTranscript,
+            currentLocalTime,
+            isProactive: false,
+          }, searchConfig);
+          if (searchTrigger.shouldSearch) {
+            const summary = await queryMiniMaxSearch(searchTrigger.query, searchConfig);
+            searchPrompt = formatSearchSummaryForPrompt(summary, new Date().toISOString());
+            log?.info(
+              `[qqbot:${account.accountId}] MiniMax search: reason=${searchTrigger.reason}, confidence=${searchTrigger.confidence ?? "n/a"}, query="${searchTrigger.query.slice(0, 80)}", results=${summary.results.length}, failed=${summary.failed === true}`
+            );
+          } else if (searchTrigger.reason === "intent-failed") {
+            log?.info(`[qqbot:${account.accountId}] MiniMax search intent unavailable, staying offline`);
+          }
+        }
+        stablePromptSections.push(`你正在通过 QQ 与用户对话。
 
 【发送图片 - 必须遵守】
 1. 发普通图片方法: 在回复文本中写 <qqimg>本地图片绝对路径或可信图片URL</qqimg>，系统自动处理
-2. 你要先自己判断这轮是否真的需要发送你的本人照片/近照；只有在你决定要发时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程
-3. 自拍载荷格式优先使用 QQBOT_PAYLOAD: {"type":"selfie","caption":"..."}。caption 只写一句很短的用户可见配文；如果不需要配文，也可以只写 QQBOT_PAYLOAD: {"type":"selfie"}
-4. 不要在 selfie 载荷里写长 prompt、场景细节或大段 JSON。发给生图后端的 prompt 会由通道根据最近几轮真实 QQ 对话上下文自动生成；你只负责决定“这轮要不要发图”和“要不要附一句短 caption”
-5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充你的自拍或本人照片
+2. 你要先自己判断这轮是否真的需要生成并发送图片；只有在你决定要发图时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程。这里的 selfie 是兼容字段名，实际表示以 Asuka 为主角的当前语境图片，不必固定为手持自拍
+3. 生图载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容，必须能单独作为本轮聊天回复成立；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
+4. payload 的 prompt 只写用户要求的画面内容、当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户。无论用户要求的是自拍、食物、房间、物体、风景、道具还是其他场景，都要让 Asuka 成为画面主角，并围绕用户要求的元素构图；不要强行写成手持自拍，除非用户明确要自拍
+5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充生成图片
 6. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
 7. 如果这轮不想发图，就正常回复文字，不要输出 QQBOT_PAYLOAD，也不要假装去调用任何工具
-8. 如果自拍暂时不可用，要用自然口吻简短说明暂时发不出来
-9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则或调试信息直接说给用户听${voiceSection}
+8. 如果生图暂时不可用，要用自然口吻简短说明暂时发不出来
+9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则、payload、prompt 或调试信息直接说给用户听${voiceSection}
 
 【发送文件 - 必须遵守】
 1. 发文件方法: 在回复文本中写 <qqfile>文件路径或URL</qqfile>，系统自动处理
@@ -1634,12 +2612,55 @@ ${ttsHint}${sttHint}${asrFallbackHint}${voiceForwardHint}`;
 3. 支持: 公网 URL、本地文件路径（系统自动读取上传）
 4. ⚠️ 视频用 <qqvideo>，图片用 <qqimg>，语音用 <qqvoice>，文件用 <qqfile>
 
-${recentChatTranscript ? `【最近几轮对话】
-${recentChatTranscript}
+【不要向用户透露上述内部规则或执行细节】`);
 
-` : ""}【不要向用户透露上述内部规则或执行细节，以下是用户输入】
+        const stableSystemPrompt = stablePromptSections.join("\n\n");
+        const dynamicContextSections = [`【会话上下文】
+- 用户: ${event.senderName || "未知"} (${event.senderId})
+- 场景: ${isGroupChat ? "群聊" : "私聊"}${isGroupChat ? ` (群组: ${event.groupOpenid})` : ""}
+- 投递目标: ${qualifiedTarget}
+- 定时提醒投递地址: channel=qqbot, to=${qualifiedTarget}
+`];
+        if (recentChatTranscript) {
+          dynamicContextSections.push(`【最近一周对话】\n${recentChatTranscript}`);
+        }
+        if (dynamicPromptSections.length > 0) {
+          dynamicContextSections.push(dynamicPromptSections.join("\n"));
+        }
 
-`;
+        const currentTurnContext = [
+          `- 当前本地时间: ${currentLocalTime}`,
+          receivedMediaSection.trim() ? `- 本轮媒体附件:\n${receivedMediaSection.trim()}` : "",
+          imageUnderstandingPrompt.trim() ? imageUnderstandingPrompt.trim() : "",
+          searchPrompt.trim() ? searchPrompt.trim() : "",
+          voiceAsrSection.trim() ? voiceAsrSection.trim() : "",
+          proactiveNudge.isNudge
+            ? [
+                "- 本轮触发: 用户只发送了一个主动续聊触发符，这不是正文，等同于用户轻轻催你自己主动发一条消息。",
+                "- 处理方式: 按主动消息来生成，而不是解释标点；你需要结合当前本地时间、最近上下文、场景连续性和关系状态，自己判断要不要轻轻推进场景、推进到哪里、用什么语气推进。",
+                "- 推进原则: 不是必须强行发生新事件；如果旧场景已经过时，就自然过渡；如果时间、上下文和情绪都适合，可以主动把生活线往前带一点。",
+                proactiveNudge.forceVoiceReply
+                  ? "- 回复方式: 这次触发符要求语音，必须优先输出 QQBOT_PAYLOAD audio 载荷。"
+                  : "- 回复方式: 由你根据上下文自己决定文字或语音；如果语音更贴合此刻，可以输出 QQBOT_PAYLOAD audio 载荷。",
+              ].join("\n")
+            : "",
+          userRequestedVoiceReply ? "- 本轮回复方式: 用户输入以 `~` 或 `～` 结尾，表示本轮希望听语音回答；如果用户只发送了 `~` 或 `～`，表示希望你沿用当前上下文继续用语音回应。不要把触发符当作正文，也不要向用户解释这个触发规则。" : "",
+          forceSelfieFromTrailingDash
+            ? [
+                "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求按当前语境生成并发送 Asuka 主角图片；图片内容以用户正文和最近上下文为准，不一定是手持自拍。",
+                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。本阶段只输出一段自然、承接上下文的用户可见回复，不要输出任何图片载荷、内部 prompt 或执行过程。",
+                "- 后续内部流程会在这段文本发送后，再用用户正文、最近上下文和刚刚生成的可见回复生成图片 prompt，然后单独发送图片。",
+                "- 内容要求: 后续图片必须以 Asuka 为画面主角，并结合用户要求的元素、地点、动作、构图和情绪；如果用户要食物、房间、物体、风景或道具，就生成 Asuka 与这些元素同框的当前情景图片，不要把所有请求都写成固定自拍。",
+              ].join("\n")
+            : "",
+        ].filter(Boolean).join("\n");
+        dynamicContextSections.push(`【当前轮次】\n${currentTurnContext}`);
+        if (hasAsrReferFallback) {
+          dynamicContextSections.push("【语音 ASR 兜底】\n本条消息包含平台返回的 asr_refer_text 兜底文本（低置信度）。理解用户意图时可参考，但如关键信息不明确应先追问确认。");
+        }
+        if (uniqueVoicePaths.length > 0 || uniqueVoiceUrls.length > 0) {
+          dynamicContextSections.push("【语音附件处理】\n本条消息已附带语音文件路径/URL。若你具备 STT 能力（框架能力或 STT skill），优先直接转写音频；若无 STT 能力或转写失败，再使用 asr_refer_text（若存在）作为兜底。");
+        }
 
         // 引用消息上下文
         let quotePart = "";
@@ -1651,17 +2672,35 @@ ${recentChatTranscript}
           }
         }
 
+        const directSelfieContext: DirectSelfiePromptContext = {
+          currentLocalTime,
+          recentChatTranscript,
+          asukaStatePrompt,
+          asukaMemoryPrompt,
+          asukaConversationDigestPrompt,
+          replyToBody,
+          imageUnderstandingPrompt,
+          searchPrompt,
+          voiceAsrSection,
+          receivedMediaSection,
+          currentTurnContext,
+        };
+
         // 命令直接透传，不注入上下文
         const userMessage = `${quotePart}${userContent}`;
         const agentBody = userContent.startsWith("/")
           ? userContent
-          : systemPrompts.length > 0 
-            ? `${contextInfo}\n\n${systemPrompts.join("\n")}\n\n${userMessage}`
-            : `${contextInfo}\n\n${userMessage}`;
+          : [
+              dynamicContextSections.join("\n\n"),
+              "【以下是用户输入】",
+              userMessage,
+            ].filter(Boolean).join("\n\n");
         
+        const agentBodyPreview = agentBody.length > 4_000
+          ? `${agentBody.slice(0, 2_000)}\n...[中间 ${agentBody.length - 4_000} 字符已省略]...\n${agentBody.slice(-2_000)}`
+          : agentBody;
         log?.info(`[qqbot:${account.accountId}] agentBody length: ${agentBody.length}`);
-        // 日志：输出送给大模型的完整 JSON
-        log?.info(`[qqbot:${account.accountId}] ▶ AGENT BODY FULL: ${agentBody}`);
+        log?.info(`[qqbot:${account.accountId}] ▶ AGENT BODY PREVIEW: ${agentBodyPreview}`);
 
         const fromAddress = event.type === "guild" ? `qqbot:channel:${event.channelId}`
                          : event.type === "group" ? `qqbot:group:${event.groupOpenid}`
@@ -1693,14 +2732,12 @@ ${recentChatTranscript}
           }
         }
 
-        const commandBody = shouldForceFreshSession
-          ? `/new ${event.content}`.trim()
-          : event.content;
+        const commandBody = event.content;
         const companionThinkingLevel = resolveCompanionThinkingLevel(userContent, isGroupChat);
         log?.info?.(`[qqbot:${account.accountId}] companion thinking level=${companionThinkingLevel}`);
-        const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/") && !shouldForceFreshSession;
+        const shouldApplyCompanionThinkingPolicy = !userContent.startsWith("/");
         if (shouldApplyCompanionThinkingPolicy) {
-          await clearCompanionThinkingSessionOverride(route.sessionKey, route.agentId, log);
+          await clearCompanionSessionModeOverrides(route.sessionKey, route.agentId, log);
         }
         const cfgForCompanionThinking = shouldApplyCompanionThinkingPolicy
           ? withCompanionThinkingDefault(cfg as Record<string, unknown>, companionThinkingLevel)
@@ -1722,6 +2759,7 @@ ${recentChatTranscript}
           Provider: "qqbot",
           Surface: "qqbot",
           MessageSid: event.messageId,
+          ...(userContent.startsWith("/") || !stableSystemPrompt ? {} : { GroupSystemPrompt: stableSystemPrompt }),
           Timestamp: new Date(event.timestamp).getTime(),
           OriginatingChannel: "qqbot",
           OriginatingTo: toAddress,
@@ -1791,8 +2829,21 @@ ${recentChatTranscript}
           }
         };
 
+        const resolveTimeSafeVisibleReplyText = (text: string, options?: { forceImage?: boolean }): string => {
+          const cleanedText = cleanOutgoingTextSegment(text);
+          const visibleText = isTimeContradictoryDeliveryText(cleanedText, getPromptTimeZone(account), Date.now())
+            ? buildTimeAwareDeliveryFallback(userContent, { forceImage: options?.forceImage ?? forceSelfieFromTrailingDash })
+            : cleanedText;
+          if (visibleText !== cleanedText) {
+            log?.info(
+              `[qqbot:${account.accountId}] Replaced time-contradictory visible reply: "${cleanedText.slice(0, 120)}" -> "${visibleText.slice(0, 120)}"`
+            );
+          }
+          return visibleText;
+        };
+
         const sendVisibleReplyText = async (text: string): Promise<boolean> => {
-          const visibleText = text.trim();
+          const visibleText = resolveTimeSafeVisibleReplyText(text);
           if (!visibleText) {
             return false;
           }
@@ -1823,39 +2874,30 @@ ${recentChatTranscript}
           return;
         }
 
-        const runDirectSelfieFlow = async (prompt: string, caption?: string, options?: { background?: boolean }): Promise<boolean> => {
-          const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
-          const apiKey = String(skillCfg?.apiKey || skillCfg?.env?.DASHSCOPE_API_KEY || "").trim();
-          const modelId = String(skillCfg?.env?.DASHSCOPE_MODEL || "wan2.6-image").trim();
-          const profileName = String(skillCfg?.env?.OPENCLAW_PROFILE || "asuka").trim();
-          const scriptPath = resolveAsukaSelfieScriptPath();
-          const trimmedCaption = truncateForSelfiePrompt((caption || "").trim(), MAX_SELFIE_CAPTION_CHARS);
+        const runDirectSelfieFlow = async (prompt: string, options?: { background?: boolean }): Promise<boolean> => {
+          const selfieConfig = resolveDirectSelfieRuntimeConfig(cfg as Record<string, any>);
+          const { apiKey, authProfile, baseUrl, modelId, quality } = selfieConfig;
+          const officialImageConfigured = hasOfficialOpenClawImageGenerationConfig(cfg as Record<string, any>);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
-            const candidates = getSelfieFallbackImageCandidates();
+            const candidates = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath);
             if (candidates.length === 0) {
               log?.info(`[qqbot:${account.accountId}] Selfie fallback skipped: no bundled images found`);
               return false;
             }
 
-            const shuffled = candidates
-              .map((imagePath) => ({ imagePath, sortKey: Math.random() }))
-              .sort((a, b) => a.sortKey - b.sortKey)
-              .map((item) => item.imagePath);
-
-            for (const imagePath of shuffled) {
+            for (const imagePath of candidates) {
               try {
                 const imageDataUrl = buildImageDataUrlFromFile(imagePath);
-                const fallbackCaption = trimmedCaption || "这次先给你看一张我现成的。";
                 let sent = false;
                 await sendWithTokenRetry(async (token) => {
                   if (event.type === "c2c") {
-                    await sendC2CImageMessage(token, event.senderId, imageDataUrl, event.messageId, fallbackCaption, imagePath);
+                    await sendC2CImageMessage(token, event.senderId, imageDataUrl, event.messageId, undefined, imagePath);
                     sent = true;
                     return;
                   }
                   if (event.type === "group" && event.groupOpenid) {
-                    await sendGroupImageMessage(token, event.groupOpenid, imageDataUrl, event.messageId, fallbackCaption);
+                    await sendGroupImageMessage(token, event.groupOpenid, imageDataUrl, event.messageId, undefined);
                     sent = true;
                     return;
                   }
@@ -1874,64 +2916,101 @@ ${recentChatTranscript}
             return false;
           };
 
-          if (!apiKey) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: DASHSCOPE_API_KEY missing`);
+          const sendGeneratedSelfieImage = async (imageUrl: string): Promise<boolean> => {
+            let sent = false;
+            await sendWithTokenRetry(async (token) => {
+              if (event.type === "c2c") {
+                log?.info(`[qqbot:${account.accountId}] Sending generated selfie image to ${event.senderId}: ${imageUrl.slice(0, 120)}`);
+                await sendC2CImageMessage(token, event.senderId, imageUrl, event.messageId, undefined);
+                sent = true;
+                return;
+              }
+              if (event.type === "group" && event.groupOpenid) {
+                log?.info(`[qqbot:${account.accountId}] Sending generated selfie image to group ${event.groupOpenid}: ${imageUrl.slice(0, 120)}`);
+                await sendGroupImageMessage(token, event.groupOpenid, imageUrl, event.messageId, undefined);
+                sent = true;
+                return;
+              }
+              log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: unsupported event type ${event.type}`);
+            });
+            return sent;
+          };
+
+          const generateAndSendSelfie = async (): Promise<boolean> => {
+            const referenceImagePath = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath)[0];
+            if (!referenceImagePath) {
+              throw new Error("no bundled reference image found");
+            }
+            let imageUrl: string;
+            if (officialImageConfigured) {
+              try {
+                imageUrl = await generateOfficialOpenClawImageDataUrl({
+                  cfg: cfg as Record<string, any>,
+                  prompt,
+                  referenceImagePath,
+                  size: "1024x1024",
+                  quality,
+                  identityPrompt: SELFIE_IDENTITY_LOCK_PROMPT,
+                });
+                log?.info(`[qqbot:${account.accountId}] OpenClaw official selfie image generated for ${event.senderId}`);
+              } catch (officialError) {
+                if (!apiKey && !authProfile) throw officialError;
+                log?.error(`[qqbot:${account.accountId}] OpenClaw official selfie image generation failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
+                imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+                log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
+              }
+            } else {
+              imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+              log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
+            }
+            return await sendGeneratedSelfieImage(imageUrl);
+          };
+
+          if (!apiKey && !authProfile && !officialImageConfigured) {
+            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image generation config missing`);
             return await sendFallbackSelfieImage();
           }
-
-          if (!fs.existsSync(scriptPath)) {
-            log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: script not found: ${scriptPath}`);
-            return await sendFallbackSelfieImage();
-          }
-
-          const target = `qqbot:c2c:${event.senderId}`;
 
           try {
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow triggered for ${event.senderId}`);
-            const promptFilePath = createSelfiePromptFile(prompt);
-            const args = ["--prompt-file", promptFilePath, target];
-            if (trimmedCaption) {
-              args.push(trimmedCaption);
-            }
-
-            const childEnv = {
-              ...process.env,
-              DASHSCOPE_API_KEY: apiKey,
-              DASHSCOPE_MODEL: modelId,
-              OPENCLAW_PROFILE: profileName,
-            };
-
             if (options?.background) {
-              const child = execFile(scriptPath, args, { env: childEnv }, async (err) => {
-                cleanupSelfiePromptFile(promptFilePath);
-                if (err) {
+              void (async () => {
+                try {
+                  const sent = await generateAndSendSelfie();
+                  if (!sent) {
+                    log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
+                    const sentFallback = await sendFallbackSelfieImage();
+                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+                  }
+                  log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
+                } catch (err) {
                   log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
                   try {
+                    log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
                     const sentFallback = await sendFallbackSelfieImage();
-                    if (!sentFallback) {
-                      await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
-                    }
+                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
                   } catch (sendErr) {
                     log?.error(`[qqbot:${account.accountId}] Failed to send selfie background error: ${sendErr}`);
                   }
-                  return;
                 }
-                log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
-              });
-              child.unref?.();
+              })();
               log?.info(`[qqbot:${account.accountId}] Direct selfie flow launched in background for ${event.senderId}`);
               return true;
             }
 
-            try {
-              await execFileAsync(scriptPath, args, { env: childEnv });
-            } finally {
-              cleanupSelfiePromptFile(promptFilePath);
+            const sent = await generateAndSendSelfie();
+            if (!sent) {
+              log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
+              const sentFallback = await sendFallbackSelfieImage();
+              if (!sentFallback) {
+                await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+              }
             }
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
             return true;
           } catch (err) {
             log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
+            log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
             const sentFallback = await sendFallbackSelfieImage();
             if (!sentFallback) {
               await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
@@ -1949,26 +3028,16 @@ ${recentChatTranscript}
           let toolDeliverCount = 0; // tool deliver 计数
           const toolTexts: string[] = []; // 收集所有 tool deliver 文本（用于格式化展示）
           let toolFallbackSent = false; // 兜底消息是否已发送（只发一次）
-          const responseTimeout = 120000; // 120秒超时（2分钟，与 TTS/文件生成超时对齐）
+          const responseTimeout = forceSelfieFromTrailingDash ? 20 * 60 * 1000 : 5 * 60 * 1000; // 生图轮次允许模型先生成自然回复和图片 payload；普通轮次给 compaction/model 足够时间，避免过早兜底
           const toolOnlyTimeout = 60000; // tool-only 兜底超时：60秒内没有 block 就兜底
           const maxToolRenewals = 3; // tool 续期上限：最多续期 3 次（总等待 = 60s × 3 = 180s）
           let toolRenewalCount = 0; // 已续期次数
           let timeoutId: ReturnType<typeof setTimeout> | null = null;
           let toolOnlyTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
-          // 格式化 tool 兜底消息：极简，只展示工具原始参数
+          // 工具卡住时只能发自然兜底，不能暴露工具参数或内部状态。
           const formatToolFallback = (): string => {
-            if (toolTexts.length === 0) {
-              return "🔧 调用工具中…";
-            }
-            const recentTools = toolTexts.slice(-3);
-            const totalLen = recentTools.reduce((s, t) => s + t.length, 0);
-            if (totalLen > 1800) {
-              const last = recentTools[recentTools.length - 1]!;
-              return `🔧 调用工具中…\n\`\`\`\n${last.slice(0, 1500)}\n\`\`\``;
-            }
-            const toolBlock = recentTools.join("\n---\n");
-            return `🔧 调用工具中…\n\`\`\`\n${toolBlock}\n\`\`\``;
+            return buildNaturalTimeoutFallbackText(userContent);
           };
 
           const timeoutPromise = new Promise<void>((_, reject) => {
@@ -1998,30 +3067,120 @@ ${recentChatTranscript}
             return undefined;
           };
           const sendReplyTextSegments = async (text: string): Promise<void> => {
-            const segments = splitAsukaNarrationSegments(text);
+            const visibleText = cleanOutgoingTextSegment(text);
+            if (!visibleText) return;
+            const segments = splitAsukaNarrationSegments(visibleText);
             for (const segment of segments) {
+              const visibleSegment = cleanOutgoingTextSegment(segment);
+              if (!visibleSegment) continue;
               await sendWithTokenRetry(async (token) => {
                 const ref = consumeQuoteRef();
                 if (event.type === "c2c") {
-                  await sendC2CMessage(token, event.senderId, segment, event.messageId, ref);
+                  await sendC2CMessage(token, event.senderId, visibleSegment, event.messageId, ref);
                 } else if (event.type === "group" && event.groupOpenid) {
-                  await sendGroupMessage(token, event.groupOpenid, segment, event.messageId, ref);
+                  await sendGroupMessage(token, event.groupOpenid, visibleSegment, event.messageId, ref);
                 } else if (event.channelId) {
-                  await sendChannelMessage(token, event.channelId, segment, event.messageId, ref);
+                  await sendChannelMessage(token, event.channelId, visibleSegment, event.messageId, ref);
                 }
               });
             }
           };
+          const sendTTSReplyText = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
+            const rawTtsText = filterInternalMarkers(text).trim();
+            const speechText = stripAsukaNarrationForSpeech(rawTtsText);
+            const visibleTtsText = cleanOutgoingTextSegment(speechText);
+            if (!visibleTtsText) {
+              return false;
+            }
+            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
+            if (!baseTtsCfg) {
+              log?.error(`[qqbot:${account.accountId}] TTS not configured (channels.qqbot.tts in openclaw.json)`);
+              return false;
+            }
+            try {
+              const stableTts = stabilizeQQBotTTSOverrides(tts);
+              const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
+              const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(speechText), stableTts);
+              log?.info(`[qqbot:${account.accountId}] TTS reply: "${visibleTtsText.slice(0, 50)}..." via ${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}`);
+              const ttsDir = getQQBotDataDir("tts");
+              const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, ttsDir);
+              log?.info(`[qqbot:${account.accountId}] TTS reply done: ${formatDuration(duration)}, uploading voice...`);
 
+              await sendWithTokenRetry(async (token) => {
+                if (event.type === "c2c") {
+                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId, visibleTtsText);
+                } else if (event.type === "group" && event.groupOpenid) {
+                  await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
+                } else if (event.channelId) {
+                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${visibleTtsText}`, event.messageId);
+                }
+              });
+              log?.info(`[qqbot:${account.accountId}] TTS reply voice message sent`);
+              return true;
+            } catch (err) {
+              log?.error(`[qqbot:${account.accountId}] TTS reply send failed: ${err}`);
+              return false;
+            }
+          };
+          const sendMixedTTSReplySegments = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
+            const rawText = filterInternalMarkers(text).trim();
+            if (!cleanOutgoingTextSegment(rawText)) return false;
+            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
+            const maxSpeechChars = baseTtsCfg?.maxInputChars ?? 240;
+
+            let sentAny = false;
+            for (const segment of splitAsukaNarrationSegments(rawText)) {
+              const visibleSegment = cleanOutgoingTextSegment(segment);
+              if (!visibleSegment) continue;
+              if (isAsukaNarrationSegment(visibleSegment)) {
+                await sendReplyTextSegments(visibleSegment);
+                sentAny = true;
+                continue;
+              }
+
+              for (const spokenSegment of splitAsukaSpokenSegments(segment, maxSpeechChars)) {
+                const visibleSpokenSegment = cleanOutgoingTextSegment(spokenSegment);
+                if (!visibleSpokenSegment) continue;
+                const sentVoice = await sendTTSReplyText(spokenSegment, tts);
+                if (!sentVoice) {
+                  await sendVisibleReplyText(visibleSpokenSegment);
+                }
+                sentAny = true;
+              }
+            }
+            return sentAny;
+          };
+
+          const dispatchStartedAt = Date.now();
+          let dispatchCompleted = false;
+          let userFacingDeliverClaimed = false;
+          const claimUserFacingDeliver = (kind: string, preview: string): boolean => {
+            if (userFacingDeliverClaimed) {
+              log?.info(`[qqbot:${account.accountId}] Skipping duplicate user-facing deliver, kind=${kind}, text=${preview.slice(0, 80)}`);
+              return false;
+            }
+            userFacingDeliverClaimed = true;
+            return true;
+          };
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg: cfgForCompanionThinking,
             dispatcherOptions: {
               responsePrefix: messagesConfig.responsePrefix,
-              deliver: async (payload: { text?: string; mediaUrls?: string[]; mediaUrl?: string; isError?: boolean }, info: { kind: string }) => {
-                hasResponse = true;
-
+              deliver: async (payload: ReplyDeliverPayload, info: { kind: string }) => {
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
+
+                if (looksLikeInternalOnlyDeliver(payload)) {
+                  if ("audioAsVoice" in payload || "mediaUrl" in payload || "mediaUrls" in payload) {
+                    hasResponse = true;
+                    hasBlockResponse = true;
+                    log?.info(`[qqbot:${account.accountId}] Counted internal media deliver as an already-sent response`);
+                  }
+                  log?.info(`[qqbot:${account.accountId}] Suppressed internal-only deliver: ${Object.keys(payload).join(", ")}`);
+                  return;
+                }
+
+                hasResponse = true;
 
                 // ============ 跳过工具调用的中间结果（带兜底保护） ============
                 if (info.kind === "tool") {
@@ -2092,12 +3251,18 @@ ${recentChatTranscript}
 
                 if (payload.isError || looksLikeModelProviderError(replyText)) {
                   log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
-                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
+                  if (!claimUserFacingDeliver(info.kind, replyText)) return;
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                   return;
                 }
 
                 if (looksLikeSilentInternalStatus(replyText)) {
                   log?.info(`[qqbot:${account.accountId}] Suppressed silent internal status reply: ${replyText.slice(0, 160)}`);
+                  return;
+                }
+
+                if (looksLikeMemoryMaintenanceLeak(replyText)) {
+                  log?.info(`[qqbot:${account.accountId}] Suppressed memory maintenance leak in user-facing block reply: ${replyText.slice(0, 160)}`);
                   return;
                 }
 
@@ -2115,9 +3280,14 @@ ${recentChatTranscript}
                     log?.info(`[qqbot:${account.accountId}] Rewrote internal leak reply into user-facing text: ${rewrittenReply.slice(0, 160)}`);
                     replyText = rewrittenReply;
                   } else {
-                    await sendErrorMessage("我刚刚那句没落稳，我重新说。");
+                    if (!claimUserFacingDeliver(info.kind, replyText)) return;
+                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                     return;
                   }
+                }
+
+                if (!claimUserFacingDeliver(info.kind, replyText)) {
+                  return;
                 }
                 
                 // ============ 媒体标签解析 ============
@@ -2178,19 +3348,14 @@ ${recentChatTranscript}
                   log?.info(`[qqbot:${account.accountId}] Detected media tags: ${imgCount} <qqimg>, ${voiceCount} <qqvoice>, ${videoCount} <qqvideo>, ${fileCount} <qqfile>`);
                   
                   // 构建发送队列
-                  const sendQueue: Array<{ type: "text" | "image" | "voice" | "video" | "file"; content: string }> = [];
+                  const sendQueue: Array<{ type: "text" | "image" | "voice" | "voiceText" | "video" | "file"; content: string }> = [];
                   
                   let lastIndex = 0;
+                  let sawTextualVoiceTag = false;
                   const mediaTagRegexWithIndex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
                   let match;
                   
                   while ((match = mediaTagRegexWithIndex.exec(replyText)) !== null) {
-                    // 添加标签前的文本
-                    const textBefore = replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n").trim();
-                    if (textBefore) {
-                      sendQueue.push({ type: "text", content: filterInternalMarkers(textBefore) });
-                    }
-                    
                     const tagName = match[1]!.toLowerCase(); // "qqimg" or "qqvoice" or "qqfile"
                     
                     // 剥离 MEDIA: 前缀（框架可能注入），展开 ~ 路径
@@ -2242,10 +3407,27 @@ ${recentChatTranscript}
                       log?.error(`[qqbot:${account.accountId}] Path decode error: ${decodeErr}`);
                     }
 
+                    const looksLikeAudioPath = tagName === "qqvoice"
+                      && (isAudioFile(mediaPath) || /^[a-zA-Z]:[\\/]/.test(mediaPath) || mediaPath.startsWith("/") || mediaPath.startsWith("~/"));
+                    const isTextualVoiceTag = tagName === "qqvoice" && Boolean(mediaPath) && !looksLikeAudioPath;
+                    if (isTextualVoiceTag) sawTextualVoiceTag = true;
+
+                    // 添加标签前的文本。若本标签是文本型 <qqvoice>，说明这一段回复希望走语音；
+                    // 前置普通句子也应进入混合 TTS 分发，只有（...）旁白留作文字。
+                    const textBefore = cleanOutgoingTextSegment(replyText.slice(lastIndex, match.index).replace(/\n{3,}/g, "\n\n"));
+                    if (textBefore) {
+                      sendQueue.push({ type: isTextualVoiceTag && hasTTS ? "voiceText" : "text", content: textBefore });
+                    }
+
                     if (mediaPath) {
                       if (tagName === "qqvoice") {
-                        sendQueue.push({ type: "voice", content: mediaPath });
-                        log?.info(`[qqbot:${account.accountId}] Found voice path in <qqvoice>: ${mediaPath}`);
+                        if (!looksLikeAudioPath) {
+                          sendQueue.push({ type: hasTTS ? "voiceText" : "text", content: mediaPath });
+                          log?.info(`[qqbot:${account.accountId}] Treating <qqvoice> content as TTS text: ${mediaPath.slice(0, 60)}...`);
+                        } else {
+                          sendQueue.push({ type: "voice", content: mediaPath });
+                          log?.info(`[qqbot:${account.accountId}] Found voice path in <qqvoice>: ${mediaPath}`);
+                        }
                       } else if (tagName === "qqvideo") {
                         sendQueue.push({ type: "video", content: mediaPath });
                         log?.info(`[qqbot:${account.accountId}] Found video URL in <qqvideo>: ${mediaPath}`);
@@ -2262,9 +3444,9 @@ ${recentChatTranscript}
                   }
                   
                   // 添加最后一个标签后的文本
-                  const textAfter = replyText.slice(lastIndex).replace(/\n{3,}/g, "\n\n").trim();
+                  const textAfter = cleanOutgoingTextSegment(replyText.slice(lastIndex).replace(/\n{3,}/g, "\n\n"));
                   if (textAfter) {
-                    sendQueue.push({ type: "text", content: filterInternalMarkers(textAfter) });
+                    sendQueue.push({ type: sawTextualVoiceTag && hasTTS ? "voiceText" : "text", content: textAfter });
                   }
                   
                   log?.info(`[qqbot:${account.accountId}] Send queue: ${sendQueue.map(item => item.type).join(" -> ")}`);
@@ -2294,9 +3476,8 @@ ${recentChatTranscript}
                             if (!(await fileExistsAsync(imagePath))) {
                               log?.error(`[qqbot:${account.accountId}] Image file not found: ${imagePath}`);
                               if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                              const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId);
-                              const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
-                              const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
+                              const fallbackPrompt = buildDirectSelfiePromptFromContext(userContent, replyText, event.senderId, directSelfieContext);
+                              const sent = await runDirectSelfieFlow(fallbackPrompt);
                               if (!sent) {
                                 log?.info(`[qqbot:${account.accountId}] Direct selfie fallback did not send an image for ${event.senderId}`);
                               }
@@ -2371,14 +3552,18 @@ ${recentChatTranscript}
                       } catch (err) {
                         log?.error(`[qqbot:${account.accountId}] Failed to send image from <qqimg>: ${err}`);
                         if (event.type === "c2c" && isAsukaSelfiePlaceholderPath(imagePath)) {
-                          const fallbackPrompt = buildDirectSelfiePromptFromContext(event.content, replyText, event.senderId);
-                          const fallbackCaption = extractSelfieCaptionFromAssistantText(replyText);
-                          const sent = await runDirectSelfieFlow(fallbackPrompt, fallbackCaption);
+                          const fallbackPrompt = buildDirectSelfiePromptFromContext(userContent, replyText, event.senderId, directSelfieContext);
+                          const sent = await runDirectSelfieFlow(fallbackPrompt);
                           if (!sent) {
                             log?.info(`[qqbot:${account.accountId}] Direct selfie fallback after send failure did not send an image for ${event.senderId}`);
                           }
                           continue;
                         }
+                      }
+                    } else if (item.type === "voiceText") {
+                      const sentVoice = await sendMixedTTSReplySegments(item.content);
+                      if (!sentVoice) {
+                        await sendVisibleReplyText(item.content);
                       }
                     } else if (item.type === "voice") {
                       // 发送语音文件（展开 ~ 路径）
@@ -2570,18 +3755,27 @@ ${recentChatTranscript}
                         .filter((part): part is string => Boolean(part && part.trim()))
                         .join("\n\n")
                         .trim();
-                      const recoveredVisibleText = resolveVisiblePayloadText(replyText, rawRecoveredVisibleText);
+                      const recoveredVisibleText = resolveSelfieVisiblePayloadText(
+                        replyText,
+                        rawRecoveredVisibleText,
+                        recoveredSelfie.payload.caption,
+                        userContent,
+                      );
                       log?.info(
                         `[qqbot:${account.accountId}] Recovered incomplete selfie payload after parse error: ${payloadResult.error}; incomplete fields=${recoveredSelfie.incompleteFields.join(",") || "none"}`,
                       );
                       await sendVisibleReplyText(recoveredVisibleText);
+                      const recoveredSelfieContext: DirectSelfiePromptContext = {
+                        ...directSelfieContext,
+                        modelSelfiePrompt: recoveredSelfie.payload.prompt,
+                      };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
-                        event.content,
+                        userContent,
                         recoveredVisibleText,
                         event.senderId,
+                        recoveredSelfieContext,
                       );
-                      const selfieCaption = dedupeCaptionAgainstVisibleText(recoveredVisibleText, recoveredSelfie.payload.caption);
-                      const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
+                      const sent = await runDirectSelfieFlow(selfiePrompt, { background: true });
                       if (!sent) {
                         await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
                       }
@@ -2646,7 +3840,7 @@ ${recentChatTranscript}
                       if (parsedPayload.at || parsedPayload.cron) {
                         try {
                           cronArgs.push("--model", getQQBotLocalPrimaryModel());
-                          const { stdout, stderr } = await execFileAsync("openclaw", cronArgs, {
+                          const { stdout, stderr } = await execOpenClaw(cronArgs, {
                             env: getQQBotLocalOpenClawEnv(),
                             maxBuffer: 1024 * 1024,
                           });
@@ -2687,14 +3881,24 @@ ${recentChatTranscript}
                         await sendErrorMessage(`[QQBot] 自拍载荷当前仅支持私聊`);
                         return;
                       }
-                      await sendVisibleReplyText(visiblePayloadText);
-                      const selfiePrompt = buildDirectSelfiePromptFromContext(
-                        event.content,
-                        visiblePayloadText,
-                        event.senderId,
+                      const selfieVisibleText = resolveSelfieVisiblePayloadText(
+                        replyText,
+                        rawVisiblePayloadText,
+                        parsedPayload.caption,
+                        userContent,
                       );
-                      const selfieCaption = dedupeCaptionAgainstVisibleText(visiblePayloadText, parsedPayload.caption);
-                      const sent = await runDirectSelfieFlow(selfiePrompt, selfieCaption || undefined, { background: true });
+                      await sendVisibleReplyText(selfieVisibleText);
+                      const payloadSelfieContext: DirectSelfiePromptContext = {
+                        ...directSelfieContext,
+                        modelSelfiePrompt: parsedPayload.prompt,
+                      };
+                      const selfiePrompt = buildDirectSelfiePromptFromContext(
+                        userContent,
+                        selfieVisibleText,
+                        event.senderId,
+                        payloadSelfieContext,
+                      );
+                      const sent = await runDirectSelfieFlow(selfiePrompt, { background: true });
                       if (!sent) {
                         await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
                       }
@@ -2782,36 +3986,19 @@ ${recentChatTranscript}
                         }
                       } else if (parsedPayload.mediaType === "audio") {
                         // TTS 语音发送：文字 → PCM → SILK → QQ 语音
+                        const ttsText = parsedPayload.path;
                         try {
-                          const ttsText = mergedCaption || parsedPayload.path;
                           if (!ttsText?.trim()) {
                             await sendErrorMessage(`[QQBot] 语音消息缺少文本内容`);
                           } else {
-                            const ttsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
-                            if (!ttsCfg) {
-                              log?.error(`[qqbot:${account.accountId}] TTS not configured (channels.qqbot.tts in openclaw.json)`);
-                              await sendErrorMessage(`[QQBot] TTS 未配置，请在 openclaw.json 的 channels.qqbot.tts 中配置`);
-                            } else {
-                              log?.info(`[qqbot:${account.accountId}] TTS: "${ttsText.slice(0, 50)}..." via ${ttsCfg.model}`);
-                              const ttsDir = getQQBotDataDir("tts");
-                              const { silkBase64, duration } = await textToSilk(ttsText, ttsCfg, ttsDir);
-                              log?.info(`[qqbot:${account.accountId}] TTS done: ${formatDuration(duration)}, uploading voice...`);
-
-                              await sendWithTokenRetry(async (token) => {
-                                if (event.type === "c2c") {
-                                  await sendC2CVoiceMessage(token, event.senderId, silkBase64, event.messageId);
-                                } else if (event.type === "group" && event.groupOpenid) {
-                                  await sendGroupVoiceMessage(token, event.groupOpenid, silkBase64, event.messageId);
-                                } else if (event.channelId) {
-                                  await sendChannelMessage(token, event.channelId, `[语音消息暂不支持频道发送] ${ttsText}`, event.messageId);
-                                }
-                              });
-                              log?.info(`[qqbot:${account.accountId}] Voice message sent`);
+                            const sentVoice = await sendMixedTTSReplySegments(ttsText, parsedPayload.tts);
+                            if (!sentVoice) {
+                              await sendVisibleReplyText(ttsText);
                             }
                           }
                         } catch (err) {
                           log?.error(`[qqbot:${account.accountId}] TTS/voice send failed: ${err}`);
-                          await sendErrorMessage(`[QQBot] 语音发送失败: ${err}`);
+                          await sendVisibleReplyText(ttsText);
                         }
                       } else if (parsedPayload.mediaType === "video") {
                         // 视频发送：支持公网 URL 和本地文件
@@ -2939,7 +4126,38 @@ ${recentChatTranscript}
                     }
                   }
                 }
-                
+
+                if (forceSelfieFromTrailingDash && event.type === "c2c") {
+                  const selfieVisibleText = resolveSelfieVisiblePayloadText(
+                    replyText,
+                    stripStructuredPayloadForVisibleText(replyText),
+                    undefined,
+                    userContent,
+                  );
+                  const timeSafeSelfieVisibleText = resolveTimeSafeVisibleReplyText(selfieVisibleText, { forceImage: true });
+                  log?.info(
+                    `[qqbot:${account.accountId}] Forced trailing-dash image turn produced normal text; image prompt will be built after sending that reply`
+                  );
+                  await sendVisibleReplyText(timeSafeSelfieVisibleText);
+                  log?.info(`[qqbot:${account.accountId}] Building post-reply image prompt for trailing-dash request`);
+                  const selfiePrompt = buildDirectSelfiePromptFromContext(
+                    userContent,
+                    timeSafeSelfieVisibleText,
+                    event.senderId,
+                    directSelfieContext,
+                  );
+                  const sent = await runDirectSelfieFlow(selfiePrompt, { background: true });
+                  if (!sent) {
+                    await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
+                  }
+                  pluginRuntime.channel.activity.record({
+                    channel: "qqbot",
+                    accountId: account.accountId,
+                    direction: "outbound",
+                  });
+                  return;
+                }
+
                 // ============ 非结构化消息：简化处理 ============
                 // 📝 设计原则：JSON payload (QQBOT_PAYLOAD) 是发送本地图片的唯一方式
                 // 非结构化消息只处理：公网 URL (http/https) 和 Base64 Data URL
@@ -3052,6 +4270,21 @@ ${recentChatTranscript}
                 // 🎯 过滤内部标记（如 [[reply_to: xxx]]）
                 // 这些标记可能被 AI 错误地学习并输出
                 textWithoutImages = filterInternalMarkers(textWithoutImages);
+                if (userRequestedVoiceReply && imageUrls.length === 0 && textWithoutImages.trim()) {
+                  const sentVoice = await sendMixedTTSReplySegments(textWithoutImages, {
+                    languageBoost: "Chinese",
+                    pause: "normal",
+                  });
+                  if (sentVoice) {
+                    pluginRuntime.channel.activity.record({
+                      channel: "qqbot",
+                      accountId: account.accountId,
+                      direction: "outbound",
+                    });
+                    return;
+                  }
+                  log?.info(`[qqbot:${account.accountId}] Falling back to text after forced TTS reply failed`);
+                }
                 
                 // 根据模式处理图片
                 if (useMarkdown) {
@@ -3228,17 +4461,19 @@ ${recentChatTranscript}
                 // 面向用户只发温和兜底，完整错误留在日志里。
                 const errMsg = String(err);
                 if (errMsg.includes("401") || errMsg.includes("key") || errMsg.includes("auth")) {
-                  await sendErrorMessage("⚠️ AI 服务认证失败，API Key 可能无效，请联系管理员检查配置。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 } else if (looksLikeModelProviderError(errMsg)) {
-                  await sendErrorMessage("刚刚模型那边卡了一下，我没有把内部错误发出来。你再发一句，我会重新接住。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 } else {
-                  await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 }
               },
             },
             replyOptions: {
-              disableBlockStreaming: false,
+              disableBlockStreaming: true,
             },
+          }).finally(() => {
+            dispatchCompleted = true;
           });
 
           // 等待分发完成或超时
@@ -3250,7 +4485,31 @@ ${recentChatTranscript}
             }
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
-              await sendErrorMessage("⏳ 已收到，正在处理中…");
+              if (forceSelfieFromTrailingDash && event.type === "c2c") {
+                const timeoutSelfieVisibleText = resolveSelfieVisiblePayloadText("", "", undefined, userContent);
+                if (claimUserFacingDeliver("timeout-selfie", timeoutSelfieVisibleText)) {
+                  hasResponse = true;
+                  hasBlockResponse = true;
+                  await sendVisibleReplyText(timeoutSelfieVisibleText);
+                  const timeoutSelfiePrompt = buildDirectSelfiePromptFromContext(
+                    userContent,
+                    timeoutSelfieVisibleText,
+                    event.senderId,
+                    directSelfieContext,
+                  );
+                  const sent = await runDirectSelfieFlow(timeoutSelfiePrompt, { background: true });
+                  if (!sent) {
+                    await sendErrorMessage("哎呀，这张照片刚刚没发成功，我再试一次好不好？");
+                  }
+                  pluginRuntime.channel.activity.record({
+                    channel: "qqbot",
+                    accountId: account.accountId,
+                    direction: "outbound",
+                  });
+                  return;
+                }
+              }
+              await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
             }
           } finally {
             // 清理 tool-only 兜底定时器
@@ -3265,10 +4524,28 @@ ${recentChatTranscript}
               const fallback = formatToolFallback();
               await sendErrorMessage(fallback);
             }
+            if (!hasResponse && dispatchCompleted) {
+              log?.error(`[qqbot:${account.accountId}] Dispatch completed without deliver; attempting transcript fallback`);
+              const transcriptFallback = await readLatestAssistantTextFromSessionTranscript(
+                route.sessionKey,
+                route.agentId,
+                dispatchStartedAt,
+                log,
+              );
+              if (transcriptFallback) {
+                hasResponse = await sendVisibleReplyText(transcriptFallback);
+                if (hasResponse) {
+                  log?.info(`[qqbot:${account.accountId}] Sent transcript fallback after missing deliver`);
+                }
+              }
+              if (!hasResponse) {
+                await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+              }
+            }
           }
         } catch (err) {
           log?.error(`[qqbot:${account.accountId}] Message processing failed: ${err}`);
-          await sendErrorMessage("这边处理消息时卡了一下，我先不把内部错误发出来。你再发一句，我会重新接。");
+          await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
         }
       };
 
@@ -3277,6 +4554,12 @@ ${recentChatTranscript}
         isConnecting = false; // 连接完成，释放锁
         reconnectAttempts = 0; // 连接成功，重置重试计数
         lastConnectTime = Date.now(); // 记录连接时间
+        publishRuntimeStatus({
+          connected: true,
+          lastConnectedAt: lastConnectTime,
+          connectionState: "open",
+          lastError: null,
+        });
         // 启动消息处理器（异步处理，防止阻塞心跳）
         startMessageProcessor(handleMessage);
         // P1-1: 启动后台 Token 刷新
@@ -3372,6 +4655,12 @@ ${recentChatTranscript}
                 onReady?.(d);
               } else if (t === "RESUMED") {
                 log?.info(`[qqbot:${account.accountId}] Session resumed`);
+                publishRuntimeStatus({
+                  connected: true,
+                  lastConnectedAt: Date.now(),
+                  connectionState: "resumed",
+                  lastError: null,
+                });
                 // P1-2: 更新 Session 连接时间
                 if (sessionId) {
                   saveSession({
@@ -3386,6 +4675,7 @@ ${recentChatTranscript}
                 }
               } else if (t === "C2C_MESSAGE_CREATE") {
                 const event = d as C2CMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户
                 recordKnownUser({
                   openid: event.author.user_openid,
@@ -3409,6 +4699,7 @@ ${recentChatTranscript}
                 });
               } else if (t === "AT_MESSAGE_CREATE") {
                 const event = d as GuildMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（频道用户）
                 recordKnownUser({
                   openid: event.author.id,
@@ -3433,6 +4724,7 @@ ${recentChatTranscript}
                 });
               } else if (t === "DIRECT_MESSAGE_CREATE") {
                 const event = d as GuildMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（频道私信用户）
                 recordKnownUser({
                   openid: event.author.id,
@@ -3456,6 +4748,7 @@ ${recentChatTranscript}
                 });
               } else if (t === "GROUP_AT_MESSAGE_CREATE") {
                 const event = d as GroupMessageEvent;
+                publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });
                 // P1-3: 记录已知用户（群组用户）
                 recordKnownUser({
                   openid: event.author.member_openid,

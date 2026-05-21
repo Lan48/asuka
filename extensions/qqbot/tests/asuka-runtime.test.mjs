@@ -101,19 +101,55 @@ const selfieScriptPath = path.join(fixtureDir, "asuka-selfie.sh");
 fs.mkdirSync(promiseStateDir, { recursive: true });
 fs.writeFileSync(selfieScriptPath, "#!/usr/bin/env bash\n");
 fs.writeFileSync(configPath, JSON.stringify({
+  models: {
+    providers: {
+      minimax: {
+        baseUrl: "https://api.minimaxi.com/v1",
+        apiKey: "super-secret-minimax-key",
+        api: "openai-completions",
+        models: [
+          { id: "MiniMax-M2.7", name: "MiniMax M2.7" },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: {
+        primary: "minimax/MiniMax-M2.7",
+      },
+    },
+  },
   channels: {
     qqbot: {
       appId: "app-id",
       clientSecret: "super-secret-client-secret",
       imageServerBaseUrl: "https://images.example.test",
+      tts: {
+        enabled: true,
+        provider: "minimax",
+        model: "speech-2.8-hd",
+        voice: "Chinese (Mandarin)_Laid_BackGirl",
+      },
+      minimax: {
+        vision: {
+          enabled: true,
+          model: "MiniMax-M2.7",
+        },
+        search: {
+          enabled: true,
+          model: "MiniMax-M2.7",
+        },
+      },
     },
   },
   skills: {
     entries: {
       "asuka-selfie": {
         env: {
-          DASHSCOPE_API_KEY: "super-secret-dashscope-key",
-          DASHSCOPE_MODEL: "wan2.6-image",
+          STUDIO_API_KEY: "super-secret-studio-key",
+          STUDIO_API_BASE_URL: "https://api.minimaxi.com/v1",
+          STUDIO_IMAGE_MODEL: "image-01",
         },
       },
     },
@@ -143,9 +179,23 @@ assert.equal(health.promiseState.total, 3, "runtime health should count promises
 assert.equal(health.promiseState.cronJobIds, 2, "runtime health should count primary and follow-up cron job ids");
 assert.equal(health.promiseState.fallbackTracked, 1, "runtime health should count fallback metadata");
 assert.equal(health.media.selfieScript.exists, true, "runtime health should report selfie script presence");
-assert.equal(health.media.dashscopeApiKeyConfigured, true, "runtime health should report DashScope key presence as a boolean");
+assert.equal(health.media.studioApiKeyConfigured, true, "runtime health should report Studio key presence as a boolean");
+assert.equal(health.minimax.providerConfigured, true, "runtime health should report MiniMax provider readiness");
+assert.equal(health.minimax.capabilities.text.configured, true, "runtime health should report MiniMax text readiness");
+assert.equal(health.minimax.capabilities.text.implemented, true, "MiniMax text should be marked implemented");
+assert.equal(health.minimax.capabilities.image.configured, true, "runtime health should report MiniMax image readiness");
+assert.equal(health.minimax.capabilities.image.implemented, true, "MiniMax image should be marked implemented");
+assert.equal(health.minimax.capabilities.voice.configured, true, "runtime health should report MiniMax voice config readiness");
+assert.equal(health.minimax.capabilities.voice.implemented, true, "MiniMax voice should be marked implemented after Phase 18");
+assert.equal(health.minimax.capabilities.vision.configured, true, "runtime health should report MiniMax vision config readiness");
+assert.equal(health.minimax.capabilities.vision.implemented, true, "MiniMax vision should be marked implemented after Phase 19");
+assert.equal(health.minimax.capabilities.search.configured, true, "runtime health should report MiniMax search config readiness");
+assert.equal(health.minimax.capabilities.search.implemented, true, "MiniMax search should be marked implemented after Phase 20");
 const healthText = formatLocalRuntimeHealthReport(health);
 assert.ok(healthText.includes("QQBot runtime health: pass"), "formatted health should include overall status");
+assert.ok(healthText.includes("minimax:"), "formatted health should include MiniMax readiness");
+assert.ok(healthText.includes("text=yes:MiniMax-M2.7"), "formatted health should include MiniMax text model");
+assert.ok(healthText.includes("image=yes:image-01"), "formatted health should include MiniMax image model");
 assert.equal(healthText.includes("super-secret"), false, "formatted health should not leak secret values");
 assert.equal(JSON.stringify(health).includes("super-secret"), false, "structured health should not leak secret values");
 
@@ -161,5 +211,7 @@ assert.equal(missingHealth.status, "fail", "missing required cron patch should f
 assert.equal(missingHealth.qqDelivery.configExists, false, "missing config should be reported clearly");
 assert.equal(missingHealth.cronPatch.targets[0].status, "missing", "missing vendored runner should be reported clearly");
 assert.equal(missingHealth.media.selfieScript.exists, false, "missing selfie script should be reported clearly");
+assert.equal(missingHealth.minimax.providerConfigured, false, "missing config should report MiniMax provider missing");
+assert.equal(missingHealth.minimax.capabilities.voice.configured, false, "missing optional MiniMax voice config should not be configured");
 
 console.log("asuka-runtime tests passed");

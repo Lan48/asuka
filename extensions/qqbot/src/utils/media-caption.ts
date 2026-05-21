@@ -1,7 +1,7 @@
 function normalizeCaptionForCompare(text: string): string {
   return text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
-    .replace(/QQBOT_PAYLOAD:[\s\S]*$/gi, "")
+    .replace(/Q{1,2}BOT_PAYLOAD:[\s\S]*$/gi, "")
     .replace(/[“”]/g, '"')
     .replace(/[‘’]/g, "'")
     .replace(/\s+/g, "")

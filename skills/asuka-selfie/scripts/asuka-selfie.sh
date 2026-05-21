@@ -1,7 +1,7 @@
 #!/bin/bash
 # asuka-selfie.sh
-# Edit Asuka's reference image with Alibaba Cloud Bailian / DashScope
-# wan2.6-image and send it through OpenClaw.
+# Edit Asuka's reference image with a Studio OpenAI-compatible media API
+# and send it through OpenClaw.
 
 set -euo pipefail
 
@@ -22,53 +22,23 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-if [ -z "${DASHSCOPE_API_KEY:-}" ]; then
-    log_error "DASHSCOPE_API_KEY environment variable not set"
-    echo "Please configure your Alibaba Cloud Bailian / DashScope API key first."
+if [ -z "${STUDIO_API_KEY:-}" ] && [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+    STUDIO_API_KEY="$DASHSCOPE_API_KEY"
+fi
+
+if [ -z "${STUDIO_API_KEY:-}" ]; then
+    log_error "STUDIO_API_KEY environment variable not set"
+    echo "Please configure your Studio media API key first."
     exit 1
 fi
 
-find_python_with_dashscope() {
-    local explicit="${ASUKA_SELFIE_PYTHON:-}"
-    local candidates=()
-    local candidate=""
+if ! command -v curl >/dev/null 2>&1; then
+    log_error "curl not found"
+    exit 1
+fi
 
-    if [ -n "$explicit" ]; then
-        candidates+=("$explicit")
-    fi
-
-    if command -v python3 >/dev/null 2>&1; then
-        candidates+=("$(command -v python3)")
-    fi
-
-    if command -v python >/dev/null 2>&1; then
-        candidates+=("$(command -v python)")
-    fi
-
-    candidates+=(
-        "/Users/zys/anaconda3/bin/python3"
-        "/opt/homebrew/bin/python3"
-        "/usr/local/bin/python3"
-        "/usr/bin/python3"
-    )
-
-    for candidate in "${candidates[@]}"; do
-        [ -n "$candidate" ] || continue
-        [ -x "$candidate" ] || continue
-        if "$candidate" -c 'import dashscope' >/dev/null 2>&1; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-PYTHON_BIN="$(find_python_with_dashscope || true)"
-if [ -z "$PYTHON_BIN" ]; then
-    log_error "No Python interpreter with dashscope SDK found"
-    echo "Install with: python3 -m pip install --user -U dashscope"
-    echo "Or set ASUKA_SELFIE_PYTHON to a Python that can import dashscope."
+if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq not found"
     exit 1
 fi
 
@@ -97,8 +67,11 @@ else
     SIZE="${4:-1K}"
 fi
 
-DASHSCOPE_API_URL="${DASHSCOPE_API_URL:-https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation}"
-DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-wan2.6-image}"
+STUDIO_API_BASE_URL="${STUDIO_API_BASE_URL:-https://api.awnjkankwik.asia/studio/v1}"
+STUDIO_API_BASE_URL="${STUDIO_API_BASE_URL%/}"
+STUDIO_IMAGE_MODEL="${STUDIO_IMAGE_EDIT_MODEL:-${STUDIO_IMAGE_MODEL:-${STUDIO_MODEL:-${DASHSCOPE_MODEL:-third_party_media:gemini-3-pro-image-preview}}}}"
+STUDIO_IMAGE_QUALITY="${STUDIO_IMAGE_QUALITY:-standard}"
+SELFIE_IDENTITY_LOCK_PROMPT="必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REFERENCE_IMAGE_PATH="${ASUKA_REFERENCE_IMAGE_PATH:-}"
 if [ -z "$REFERENCE_IMAGE_PATH" ]; then
@@ -114,6 +87,11 @@ EXTRA_REFERENCE_IMAGE_URLS="${ASUKA_EXTRA_REFERENCE_IMAGE_URLS:-}"
 
 find_bundled_reference() {
     for candidate in \
+        "${OPENCLAW_STATE_DIR:-}/identity.jpg" \
+        "$(dirname "${OPENCLAW_CONFIG_PATH:-/}")/identity.jpg" \
+        "$PWD/identity.jpg" \
+        "$SCRIPT_DIR/../../../../identity.jpg" \
+        "$SCRIPT_DIR/../../../identity.jpg" \
         "$SCRIPT_DIR/../assets/1.jpg" \
         "$SCRIPT_DIR/../assets/1.jpeg" \
         "$SCRIPT_DIR/../assets/1.png" \
@@ -155,10 +133,25 @@ find_bundled_extra_references() {
 }
 
 join_paths_csv() {
-    "$PYTHON_BIN" - "$@" <<'PY'
-import sys
-print(",".join(arg for arg in sys.argv[1:] if arg))
-PY
+    local result=""
+    local item=""
+    for item in "$@"; do
+        [ -n "$item" ] || continue
+        if [ -n "$result" ]; then
+            result="$result,$item"
+        else
+            result="$item"
+        fi
+    done
+    printf '%s\n' "$result"
+}
+
+normalize_studio_size() {
+    case "${1:-1024x1024}" in
+        1K|1k) printf '%s\n' "1024x1024" ;;
+        2K|2k) printf '%s\n' "2048x2048" ;;
+        *) printf '%s\n' "${1:-1024x1024}" ;;
+    esac
 }
 
 if [ -z "$REFERENCE_IMAGE_PATH" ]; then
@@ -202,7 +195,7 @@ if [ -z "$PROMPT_FILE" ] || [ -z "$CHANNEL" ]; then
     echo "  file     - UTF-8 text file containing the edit prompt"
     echo "  channel  - Target channel"
     echo "  caption  - Optional message caption"
-    echo "  size     - Output size (default: 1K; also supports 2K or WxH)"
+    echo "  size     - Output size (default: 1024x1024; legacy 1K maps to 1024x1024)"
     echo ""
     echo "Default bundled references:"
     echo "  Main  - assets/1.(jpg|jpeg|png|webp)"
@@ -213,30 +206,28 @@ if [ -z "$PROMPT_FILE" ] || [ -z "$CHANNEL" ]; then
     exit 1
 fi
 
-PROMPT_META="$(
-    PROMPT_FILE="$PROMPT_FILE" "$PYTHON_BIN" - <<'PY'
-import os
-from pathlib import Path
+if [ -z "$TEMP_PROMPT_DIR" ]; then
+    TEMP_PROMPT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/asuka-selfie.XXXXXX")"
+fi
+IDENTITY_PROMPT_FILE="$TEMP_PROMPT_DIR/prompt.identity.txt"
+{
+    printf '%s\n\n' "$SELFIE_IDENTITY_LOCK_PROMPT"
+    cat "$PROMPT_FILE"
+} > "$IDENTITY_PROMPT_FILE"
+PROMPT_FILE="$IDENTITY_PROMPT_FILE"
 
-prompt_path = Path(os.environ["PROMPT_FILE"])
-data = prompt_path.read_bytes()
-text = data.decode("utf-8", errors="replace")
-preview = " ".join(text.split())
-if len(preview) > 160:
-    preview = f"{preview[:160]}..."
+PROMPT_SIZE_BYTES="$(wc -c < "$PROMPT_FILE" | tr -d '[:space:]')"
+PROMPT_PREVIEW="$(tr '\r\n\t' '   ' < "$PROMPT_FILE" | tr -s ' ' | cut -c 1-160)"
+if [ "$PROMPT_SIZE_BYTES" -gt 160 ]; then
+    PROMPT_PREVIEW="${PROMPT_PREVIEW}..."
+fi
+NORMALIZED_SIZE="$(normalize_studio_size "$SIZE")"
 
-print(len(data))
-print(preview)
-PY
-)"
-PROMPT_SIZE_BYTES="${PROMPT_META%%$'\n'*}"
-PROMPT_PREVIEW="${PROMPT_META#*$'\n'}"
-
-log_info "Editing Asuka reference image with wan2.6-image..."
-log_info "Using Python: $PYTHON_BIN"
+log_info "Editing Asuka reference image with Studio media API..."
 log_info "Prompt size: ${PROMPT_SIZE_BYTES} bytes"
 log_info "Prompt preview: $PROMPT_PREVIEW"
-log_info "Size: $SIZE"
+log_info "Model: $STUDIO_IMAGE_MODEL"
+log_info "Size: $NORMALIZED_SIZE"
 
 if [ -n "$REFERENCE_IMAGE_PATH" ] && [ -f "$REFERENCE_IMAGE_PATH" ]; then
     PRIMARY_REFERENCE_IMAGE="$REFERENCE_IMAGE_PATH"
@@ -244,101 +235,52 @@ else
     PRIMARY_REFERENCE_IMAGE="$REFERENCE_IMAGE_URL"
 fi
 
-IMAGE_URL="$(
-    PRIMARY_REFERENCE_IMAGE="$PRIMARY_REFERENCE_IMAGE" \
-    EXTRA_REFERENCE_IMAGE_PATHS="$EXTRA_REFERENCE_IMAGE_PATHS" \
-    EXTRA_REFERENCE_IMAGE_URLS="$EXTRA_REFERENCE_IMAGE_URLS" \
-    DASHSCOPE_API_KEY="$DASHSCOPE_API_KEY" \
-    DASHSCOPE_MODEL="$DASHSCOPE_MODEL" \
-    PROMPT_FILE="$PROMPT_FILE" \
-    SIZE="$SIZE" \
-    "$PYTHON_BIN" - <<'PY'
-import os
-import sys
-from pathlib import Path
-from dashscope.aigc.image_generation import ImageGeneration
+if [ -n "$EXTRA_REFERENCE_IMAGE_PATHS" ] || [ -n "$EXTRA_REFERENCE_IMAGE_URLS" ]; then
+    log_warn "Studio image edit API accepts a single multipart image; using the primary reference only"
+fi
 
+TEMP_REQUEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/asuka-selfie-api.XXXXXX")"
+cleanup_temp_request_dir() {
+    if [ -n "${TEMP_REQUEST_DIR:-}" ] && [ -d "$TEMP_REQUEST_DIR" ]; then
+        rm -rf "$TEMP_REQUEST_DIR" >/dev/null 2>&1 || true
+    fi
+}
+trap 'cleanup_temp_prompt_dir; cleanup_temp_request_dir' EXIT
 
-def split_csv(value: str) -> list[str]:
-    return [item.strip() for item in value.split(",") if item.strip()]
+UPLOAD_IMAGE="$PRIMARY_REFERENCE_IMAGE"
+if [[ "$UPLOAD_IMAGE" == http://* || "$UPLOAD_IMAGE" == https://* ]]; then
+    DOWNLOADED_REFERENCE="$TEMP_REQUEST_DIR/reference-image"
+    curl -fsSL "$UPLOAD_IMAGE" -o "$DOWNLOADED_REFERENCE"
+    UPLOAD_IMAGE="$DOWNLOADED_REFERENCE"
+fi
 
+if [ ! -f "$UPLOAD_IMAGE" ]; then
+    log_error "Reference image file not found: $UPLOAD_IMAGE"
+    exit 1
+fi
 
-def as_image_ref(value: str) -> str:
-    if not value:
-        return value
-    if value.startswith(("http://", "https://", "data:", "file://")):
-        return value
-    path = Path(value).expanduser()
-    if path.exists():
-        return path.resolve().as_uri()
-    return value
-
-
-refs = [as_image_ref(os.environ["PRIMARY_REFERENCE_IMAGE"])]
-
-for raw_path in split_csv(os.environ.get("EXTRA_REFERENCE_IMAGE_PATHS", "")):
-    path = Path(raw_path).expanduser()
-    if not path.exists():
-        print(f"[WARN] Extra reference image path not found, skipping: {raw_path}", file=sys.stderr)
-        continue
-    refs.append(path.resolve().as_uri())
-
-refs.extend(as_image_ref(url) for url in split_csv(os.environ.get("EXTRA_REFERENCE_IMAGE_URLS", "")))
-
-deduped: list[str] = []
-seen: set[str] = set()
-for ref in refs:
-    if ref and ref not in seen:
-        seen.add(ref)
-        deduped.append(ref)
-
-limited = deduped[:4]
-if len(deduped) > len(limited):
-    print(
-        f"[WARN] Wan image edit supports up to 4 reference images, truncating {len(deduped)} inputs to 4",
-        file=sys.stderr,
-    )
-
-messages = [
-    {
-        "role": "user",
-        "content": [{"text": Path(os.environ["PROMPT_FILE"]).read_text(encoding="utf-8")}] + [{"image": ref} for ref in limited],
-    }
-]
-
-response = ImageGeneration.call(
-    model=os.environ["DASHSCOPE_MODEL"],
-    api_key=os.environ["DASHSCOPE_API_KEY"],
-    messages=messages,
-    prompt_extend=True,
-    watermark=False,
-    n=1,
-    enable_interleave=False,
-    size=os.environ["SIZE"],
-)
-
-if response.get("code") and response.get("message"):
-    print(f"{response['code']}: {response['message']}", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    content = response["output"]["choices"][0]["message"]["content"]
-except (KeyError, IndexError, TypeError) as exc:
-    print(f"Failed to read image generation response: {exc}", file=sys.stderr)
-    print(response, file=sys.stderr)
-    sys.exit(1)
-
-for item in content:
-    image_url = item.get("image")
-    if image_url:
-        print(image_url)
-        sys.exit(0)
-
-print("Failed to extract image URL from response", file=sys.stderr)
-print(response, file=sys.stderr)
-sys.exit(1)
-PY
+RESPONSE_FILE="$TEMP_REQUEST_DIR/response.json"
+HTTP_STATUS="$(
+    curl -sS -w '%{http_code}' -o "$RESPONSE_FILE" \
+        -X POST "$STUDIO_API_BASE_URL/images/edits" \
+        -H "Authorization: Bearer $STUDIO_API_KEY" \
+        -H "Accept: application/json" \
+        -F "model=$STUDIO_IMAGE_MODEL" \
+        -F "prompt=<$PROMPT_FILE" \
+        -F "size=$NORMALIZED_SIZE" \
+        -F "n=1" \
+        -F "quality=$STUDIO_IMAGE_QUALITY" \
+        -F "response_format=url" \
+        -F "image=@$UPLOAD_IMAGE"
 )"
+
+if [ "${HTTP_STATUS:-0}" -ge 400 ]; then
+    ERROR_MESSAGE="$(jq -r '.error.message // .error // .' "$RESPONSE_FILE" 2>/dev/null || cat "$RESPONSE_FILE")"
+    log_error "Studio image edit failed: HTTP $HTTP_STATUS $ERROR_MESSAGE"
+    exit 1
+fi
+
+IMAGE_URL="$(jq -er 'first((.data[]?.url // empty), (.result_urls[]? // empty))' "$RESPONSE_FILE" 2>/dev/null || true)"
 
 if [ -z "$IMAGE_URL" ]; then
     log_error "Image edit failed"

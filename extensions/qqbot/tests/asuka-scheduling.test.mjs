@@ -6,12 +6,16 @@ import path from "node:path";
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "qqbot-asuka-scheduling-"));
 process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
+process.env.OPENCLAW_STATE_DIR = tmpHome;
+delete process.env.OPENCLAW_CONFIG_PATH;
+delete process.env.OPENCLAW_SCRIPT;
+delete process.env.OPENCLAW_WRAPPER;
 
 const tmpBin = path.join(tmpHome, "bin");
 const cronLog = path.join(tmpHome, "cron-log.jsonl");
 const cronSeq = path.join(tmpHome, "cron-seq.txt");
 fs.mkdirSync(tmpBin, { recursive: true });
-const openclawStub = path.join(tmpBin, "openclaw");
+const openclawStub = path.join(tmpBin, "openclaw.cjs");
 fs.writeFileSync(openclawStub, `#!/usr/bin/env node
 const fs = require("node:fs");
 const log = process.env.QQBOT_TEST_CRON_LOG;
@@ -23,6 +27,7 @@ if (log) fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + "\\n");
 process.stdout.write(JSON.stringify({ id: \`job-\${next}\` }));
 `);
 fs.chmodSync(openclawStub, 0o755);
+process.env.OPENCLAW_WRAPPER = openclawStub;
 process.env.PATH = `${tmpBin}${path.delimiter}${process.env.PATH ?? ""}`;
 process.env.QQBOT_TEST_CRON_LOG = cronLog;
 process.env.QQBOT_TEST_CRON_SEQ = cronSeq;

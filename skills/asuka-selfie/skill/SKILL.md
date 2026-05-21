@@ -1,14 +1,14 @@
 ---
 name: asuka-selfie
-description: Edit Asuka's bundled selfie reference set with wan2.6-image via Alibaba Cloud Bailian / DashScope and send selfies to OpenClaw channels
-metadata: {"openclaw":{"emoji":"📸","requires":{"bins":["curl","jq"],"env":["DASHSCOPE_API_KEY"]},"primaryEnv":"DASHSCOPE_API_KEY"}}
+description: Edit Asuka's bundled selfie reference with a Studio OpenAI-compatible media API and send selfies to OpenClaw channels
+metadata: {"openclaw":{"emoji":"📸","requires":{"bins":["curl","jq"],"env":["STUDIO_API_KEY"]},"primaryEnv":"STUDIO_API_KEY"}}
 allowed-tools: Bash(openclaw:*) Bash(curl:*) Bash(jq:*) Read Write WebFetch
 ---
 
 # Asuka Selfie
 
-Use Alibaba Cloud Bailian / DashScope `wan2.6-image` to edit Asuka's bundled
-reference set and send the result through OpenClaw messaging channels.
+Use the Studio OpenAI-compatible media API to edit Asuka's bundled reference
+image and send the result through OpenClaw messaging channels.
 
 This is a local skill, not an ACP sub-agent. Do not use `sessions_spawn`,
 `runtime:"acp"`, or `agentId:"asuka-selfie"` for selfie requests.
@@ -38,15 +38,16 @@ Use this skill when a user:
 ## Required Environment Variables
 
 ```bash
-DASHSCOPE_API_KEY=your_bailian_api_key
+STUDIO_API_KEY=your_studio_api_key
 OPENCLAW_PROFILE=asuka
 ```
 
 Optional:
 
 ```bash
-DASHSCOPE_API_URL=https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
-DASHSCOPE_MODEL=wan2.6-image
+STUDIO_API_BASE_URL=https://api.awnjkankwik.asia/studio/v1
+STUDIO_IMAGE_MODEL=third_party_media:gemini-3-pro-image-preview
+STUDIO_IMAGE_QUALITY=standard
 OPENCLAW_GATEWAY_TOKEN=...
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:19001
 ```
@@ -86,7 +87,7 @@ Preferred script:
 
 ```bash
 OPENCLAW_PROFILE=asuka \
-DASHSCOPE_API_KEY=... \
+STUDIO_API_KEY=... \
 /Users/zys/.openclaw-clawra/skills/asuka-selfie/skill/scripts/asuka-selfie.sh \
   "给她换成浅灰针织开衫，在杭州校园里拍一张真实自然的近照" \
   "qqbot:c2c:<user-id>"
@@ -96,7 +97,7 @@ TypeScript alternative:
 
 ```bash
 OPENCLAW_PROFILE=asuka \
-DASHSCOPE_API_KEY=... \
+STUDIO_API_KEY=... \
 npx ts-node /Users/zys/.openclaw-clawra/skills/asuka-selfie/skill/scripts/asuka-selfie.ts \
   "她在咖啡馆靠窗位置的照片，笑得自然一点" \
   "qqbot:c2c:<user-id>"
@@ -104,11 +105,7 @@ npx ts-node /Users/zys/.openclaw-clawra/skills/asuka-selfie/skill/scripts/asuka-
 
 ## Output Behavior
 
-- This skill sends the generated image back through OpenClaw by itself
+- Send the generated image back through OpenClaw
 - Use a short, natural caption
-- After invoking this skill, do not manually add another `<qqimg>` tag unless
-  you truly have a real image path or URL from some other workflow
-- Never fabricate local output paths such as
-  `/Users/.../workspace/asuka-selfie/output/selfie_xxx.png`
 - Never route this through `sessions_spawn` or an ACP worker
 - If generation fails, say so briefly and do not pretend a photo was sent

@@ -79,6 +79,22 @@ interface RefIndexLine {
 let cache: Map<string, RefIndexEntry & { _createdAt: number }> | null = null;
 let totalLinesOnDisk = 0; // 磁盘文件总行数（含过期 / 被覆盖的）
 
+function isLiveEntry(entry: RefIndexEntry & { _createdAt: number }, now: number): boolean {
+  return now - entry._createdAt <= TTL_MS;
+}
+
+function toPublicEntry(entry: RefIndexEntry & { _createdAt: number }): RefIndexEntry {
+  return {
+    content: entry.content,
+    senderId: entry.senderId,
+    peerId: entry.peerId,
+    senderName: entry.senderName,
+    timestamp: entry.timestamp,
+    isBot: entry.isBot,
+    attachments: entry.attachments,
+  };
+}
+
 /**
  * 从 JSONL 文件加载到内存（懒加载，首次访问时触发）
  */
@@ -344,18 +360,52 @@ export function getRecentEntriesForPeer(peerId: string, limit: number = 6): RefI
   const now = Date.now();
 
   return [...store.values()]
-    .filter((entry) => entry.peerId === peerId && now - entry._createdAt <= TTL_MS)
+    .filter((entry) => entry.peerId === peerId && isLiveEntry(entry, now))
     .sort((a, b) => a.timestamp - b.timestamp)
     .slice(-Math.max(1, limit))
-    .map((entry) => ({
-      content: entry.content,
-      senderId: entry.senderId,
-      peerId: entry.peerId,
-      senderName: entry.senderName,
-      timestamp: entry.timestamp,
-      isBot: entry.isBot,
-      attachments: entry.attachments,
-    }));
+    .map(toPublicEntry);
+}
+
+/**
+ * 读取某个会话对象在指定时间之后的对话消息。
+ * 用于给大上下文模型注入更长的近期历史，同时仍受 7 天 TTL 保护。
+ */
+export function getEntriesForPeerSince(peerId: string, sinceMs: number, maxEntries: number = MAX_ENTRIES): RefIndexEntry[] {
+  const store = loadFromFile();
+  const now = Date.now();
+  const normalizedSince = Number.isFinite(sinceMs) ? sinceMs : 0;
+  const normalizedLimit = Math.max(1, Math.floor(maxEntries));
+
+  return [...store.values()]
+    .filter((entry) => (
+      entry.peerId === peerId
+      && isLiveEntry(entry, now)
+      && entry.timestamp >= normalizedSince
+    ))
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .slice(-normalizedLimit)
+    .map(toPublicEntry);
+}
+
+/**
+ * 列出指定时间之后有对话活动的 peerId，按最新活动时间倒序。
+ * 用于每日 digest 维护任务批量刷新近期活跃会话摘要。
+ */
+export function getActivePeerIdsSince(sinceMs: number, maxPeers: number = 100): string[] {
+  const store = loadFromFile();
+  const now = Date.now();
+  const normalizedSince = Number.isFinite(sinceMs) ? sinceMs : 0;
+  const latestByPeer = new Map<string, number>();
+
+  for (const entry of store.values()) {
+    if (!entry.peerId || !isLiveEntry(entry, now) || entry.timestamp < normalizedSince) continue;
+    latestByPeer.set(entry.peerId, Math.max(latestByPeer.get(entry.peerId) ?? 0, entry.timestamp));
+  }
+
+  return [...latestByPeer.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, Math.max(1, Math.floor(maxPeers)))
+    .map(([peerId]) => peerId);
 }
 
 /**

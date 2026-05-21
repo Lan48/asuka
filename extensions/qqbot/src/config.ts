@@ -36,6 +36,19 @@ function resolveLocalOpenClawConfigPath(): string {
   return path.resolve(MODULE_DIR, "../../../../openclaw.json");
 }
 
+function resolveLocalOpenClawScript(stateDir: string): string | undefined {
+  const explicit = process.env.OPENCLAW_SCRIPT?.trim();
+  if (explicit) return explicit;
+  const candidates = [
+    path.resolve(stateDir, "lib", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
 function loadLocalOpenClawConfig(): any {
   if (localOpenClawConfigCache !== undefined) {
     return localOpenClawConfigCache;
@@ -53,7 +66,7 @@ function loadLocalOpenClawConfig(): any {
   for (const configPath of candidatePaths) {
     if (!fs.existsSync(configPath)) continue;
     try {
-      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8").replace(/^\uFEFF/, ""));
       return localOpenClawConfigCache;
     } catch {
       // ignore malformed optional config path and keep searching
@@ -67,11 +80,14 @@ function loadLocalOpenClawConfig(): any {
 export function getQQBotLocalOpenClawEnv(extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const configPath = resolveLocalOpenClawConfigPath();
   const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || path.dirname(configPath);
+  const explicitWrapper = process.env.OPENCLAW_WRAPPER?.trim();
+  const openClawScript = explicitWrapper ? undefined : resolveLocalOpenClawScript(stateDir);
   return {
     ...process.env,
     ...extraEnv,
     OPENCLAW_CONFIG_PATH: configPath,
     OPENCLAW_STATE_DIR: stateDir,
+    ...(openClawScript ? { OPENCLAW_SCRIPT: openClawScript } : {}),
   };
 }
 
@@ -340,6 +356,8 @@ export function resolveQQBotAccount(
       markdownSupport: qqbot?.markdownSupport ?? true,
       proactiveQuietHours: qqbot?.proactiveQuietHours,
       sceneInference: qqbot?.sceneInference,
+      messageBufferMs: qqbot?.messageBufferMs,
+      messageBufferMaxMs: qqbot?.messageBufferMaxMs,
     };
     appId = normalizeAppId(qqbot?.appId);
   } else {
@@ -359,10 +377,14 @@ export function resolveQQBotAccount(
             ...account?.sceneInference,
           }
         : undefined;
+    const inheritedMessageBufferMs = account?.messageBufferMs ?? qqbot?.messageBufferMs;
+    const inheritedMessageBufferMaxMs = account?.messageBufferMaxMs ?? qqbot?.messageBufferMaxMs;
     accountConfig = {
       ...(account ?? {}),
       ...(inheritedQuietHours ? { proactiveQuietHours: inheritedQuietHours } : {}),
       ...(inheritedSceneInference ? { sceneInference: inheritedSceneInference } : {}),
+      ...(inheritedMessageBufferMs !== undefined ? { messageBufferMs: inheritedMessageBufferMs } : {}),
+      ...(inheritedMessageBufferMaxMs !== undefined ? { messageBufferMaxMs: inheritedMessageBufferMaxMs } : {}),
     };
     appId = normalizeAppId(account?.appId);
   }

@@ -236,7 +236,7 @@ try {
   assert.match(selfSignal.key, /asuka:preference:closeness/, "assistant self signal should derive a stable key");
   assert.ok(selfSignal.expiresAt > selfSignal.updatedAt, "assistant self signal should stay bounded by expiry");
   const selfhoodPrompt = buildAsukaLongTermMemoryPrompt(direct, "你喜欢怎么靠近我", base + 15_600);
-  assertIncludes(selfhoodPrompt, "Asuka 自我生活线和稳定偏好", "direct prompt should label selfhood context explicitly");
+  assertIncludes(selfhoodPrompt, "我的生活线和稳定偏好", "direct prompt should label selfhood context explicitly");
   assertIncludes(selfhoodPrompt, "靠近你", "direct prompt should include relevant self signal");
   assertIncludes(selfhoodPrompt, "自我生活线只作为轻量连续性线索", "direct prompt should bound selfhood usage");
   assertIncludes(selfhoodPrompt, "承诺/补救", "direct prompt should preserve promise repair priority guidance");

@@ -2,12 +2,11 @@
  * QQ Bot 消息发送模块
  */
 
-import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "path";
-import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount } from "./types.js";
-import { decodeCronPayload } from "./utils/payload.js";
+import { decodeCronPayload, parseQQBotPayload, isMediaPayload, isSelfiePayload, wrapExactMessageForAgentTurn, type MediaPayload } from "./utils/payload.js";
 import {
   getAccessToken, 
   sendC2CMessage, 
@@ -24,19 +23,30 @@ import {
   sendC2CFileMessage,
   sendGroupFileMessage,
 } from "./api.js";
-import { isAudioFile, audioFileToSilkBase64, waitForFile } from "./utils/audio-convert.js";
+import { isAudioFile, audioFileToSilkBase64, waitForFile, resolveTTSConfig, applyTTSRuntimeOverrides, textToSilk, formatDuration } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
-import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName } from "./utils/platform.js";
+import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName, getQQBotDataDir } from "./utils/platform.js";
 import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, getPromiseRenderContext, markPromiseDelivered, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
+import { buildConversationDigestPrompt } from "./asuka-conversation-digest.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
 import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
-import { wrapExactMessageForAgentTurn } from "./utils/payload.js";
-import { splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments } from "./utils/narration-segments.js";
+import { execOpenClaw } from "./utils/openclaw-command.js";
+import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
+import { isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
+import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
+import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
+import {
+  generateOfficialOpenClawImageDataUrl,
+  hasOfficialOpenClawImageGenerationConfig,
+} from "./utils/openclaw-image-generation.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过 1 小时无法被动回复（需改为主动消息）
@@ -49,13 +59,26 @@ interface MessageReplyRecord {
 }
 
 const messageReplyTracker = new Map<string, MessageReplyRecord>();
-const execFileAsync = promisify(execFile);
-const INTERNAL_DELIVERY_LEAK_RE = /(任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|QQBOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey)/i;
+const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正在处理中|(?:任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|请直接原样输出下面这段内容|Q{1,2}BOT_(?:PAYLOAD|CRON)|工具调用|脚本|API|进程状态|以\s*Asuka\s*的身份|deliveryStatus|sessionId|sessionKey|reasoning_content|\b(?:exec|terminal|shell|command|write a file|read a file|tool call)\b)/i;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
-const DEBUG_PROBE_TEXT_RE = /^(?:test\d*|\.)$/i;
+const DEBUG_PROBE_TEXT_RE = /^(?:test(?:\s+again|\d*)?|\.)$/i;
 let openClawConfigCache: any | undefined;
 let asukaVisualIdentityAnchorCache: string | undefined;
 type DecodedCronPayload = NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>;
+interface StudioSelfieConfig {
+  apiKey: string;
+  authProfile?: string;
+  baseUrl: string;
+  modelId: string;
+  quality: string;
+}
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "每次生成图片都必须让 Asuka 作为画面主角，并严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
+].join(" ");
 const PROACTIVE_SEND_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_SEND_LOCK_TIMEOUT_MS = 45 * 1000;
 const proactiveSendDedupTracker = new Map<string, number>();
@@ -64,15 +87,6 @@ interface NormalizedProactiveQuietHours {
   startHour: number;
   endHour: number;
   timezone: string;
-}
-
-interface ZonedDateParts {
-  year: number;
-  month: number;
-  day: number;
-  hour: number;
-  minute: number;
-  second: number;
 }
 
 interface BufferedReplyPayload {
@@ -218,6 +232,7 @@ export interface OutboundContext {
   accountId?: string | null;
   replyToId?: string | null;
   account: ResolvedQQBotAccount;
+  skipContextRender?: boolean;
 }
 
 export interface MediaOutboundContext extends OutboundContext {
@@ -343,6 +358,27 @@ function buildPeerContextFromCronPayload(account: ResolvedQQBotAccount, payload:
   };
 }
 
+function buildDirectProactivePayload(account: ResolvedQQBotAccount, targetAddress: string, content: string): DecodedCronPayload {
+  return {
+    type: "cron_reminder",
+    mode: "ambient",
+    content,
+    targetType: "c2c",
+    targetAddress,
+    peerKey: `${account.accountId}:direct:${targetAddress}`,
+    advancePolicy: "hold",
+  };
+}
+
+function shouldRenderDirectProactiveWithSharedContext(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 240) return false;
+  if (/<(?:qqimg|qqvoice|qqvideo|qqfile)>/i.test(trimmed)) return false;
+  if (/Q{1,2}BOT_(?:PAYLOAD|CRON):/i.test(trimmed)) return false;
+  return true;
+}
+
 function buildProactiveMemoryCue(
   payload: DecodedCronPayload,
   renderContext?: ReturnType<typeof getPromiseRenderContext> | null,
@@ -395,32 +431,6 @@ function getNormalizedProactiveQuietHours(
     startHour,
     endHour,
     timezone: quietHours.timezone?.trim() || "Asia/Shanghai",
-  };
-}
-
-function getZonedDateParts(source: Date, timeZone: string): ZonedDateParts {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = formatter.formatToParts(source);
-  const read = (type: Intl.DateTimeFormatPartTypes): number => {
-    const value = parts.find(part => part.type === type)?.value;
-    return value ? Number(value) : 0;
-  };
-  return {
-    year: read("year"),
-    month: read("month"),
-    day: read("day"),
-    hour: read("hour"),
-    minute: read("minute"),
-    second: read("second"),
   };
 }
 
@@ -514,7 +524,7 @@ async function deferCronMessageUntilQuietEnds(
   ];
 
   try {
-    const { stdout, stderr } = await execFileAsync("openclaw", args, {
+    const { stdout, stderr } = await execOpenClaw(args, {
       env: getQQBotLocalOpenClawEnv(),
       maxBuffer: 1024 * 1024,
     });
@@ -569,13 +579,33 @@ async function maybeSendRepairBeforeProactive(
 
   if (repair.selfiePrompt && payload.targetType === "c2c") {
     const repairResult = await runDirectSelfieFlowForCron(account, repairPayload, deliveredRepairText);
-    if (repairResult.error) {
-      console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${repairResult.error}`);
-      markPromiseDeliveryFailed(repair.promiseId, repairResult.error, Date.now(), { failureKind: "selfie" });
+    if (repairResult.error || repairResult.skipped) {
+      const failureReason = repairResult.error || repairResult.skipReason || "generated selfie send skipped";
+      console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${failureReason}`);
+      markPromiseDeliveryFailed(repair.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
+      const fallbackResult = await sendCronSelfieFallbackImage(account, repairPayload, deliveredRepairText, failureReason);
+      if (fallbackResult.skipped) {
+        markPromiseDeliveryFallback(repair.promiseId, {
+          state: "skipped",
+          skipReason: fallbackResult.skipReason ?? "duplicate",
+        });
+        console.warn(
+          `[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback skipped for promise=${repair.promiseId}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
+        );
+        return;
+      }
+      markPromiseDeliveryFallback(repair.promiseId, fallbackResult.error
+        ? { state: "failed", error: fallbackResult.error }
+        : { state: "sent" });
+      if (fallbackResult.error) {
+        console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback failed for promise=${repair.promiseId}: ${fallbackResult.error}`);
+      } else {
+        console.log(`[${timestamp}] [qqbot] sendCronMessage: repair selfie identity fallback sent for promise=${repair.promiseId}`);
+      }
       return;
     }
   } else {
-    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText);
+    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText, { skipContextRender: true });
     if (repairResult.skipped) {
       console.log(
         `[${timestamp}] [qqbot] sendCronMessage: repair delivery skipped for promise=${repair.promiseId}, skipReason=${repairResult.skipReason ?? "duplicate"}`
@@ -604,6 +634,7 @@ async function maybeSendRepairBeforeProactive(
     sceneVersion: repair.sceneVersion,
     sceneSnapshotLabel: repair.sceneSnapshotLabel,
   });
+  await refreshProactiveSceneAfterDelivery(account, repairPayload, deliveredRepairText, timestamp);
 }
 
 /**
@@ -665,10 +696,181 @@ function parseTarget(to: string): { type: "c2c" | "group" | "channel"; id: strin
   return { type: "c2c", id };
 }
 
-function looksLikeInternalDeliveryLeak(text: string): boolean {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+export function looksLikeInternalDeliveryLeak(text: string): boolean {
+  const cleaned = extractOutboundVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
   return INTERNAL_DELIVERY_LEAK_RE.test(cleaned);
+}
+
+function extractOutboundVisibleTextForLeakInspection(text: string): string {
+  const payloadResult = parseQQBotPayload(text);
+  if (!payloadResult.isPayload || payloadResult.error || !payloadResult.payload) return text;
+  return [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+}
+
+function applyTTSPauseHints(text: string, tts?: MediaPayload["tts"]): string {
+  if (!tts) return text;
+  const clampPause = (value: unknown) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+    return Math.min(2, Math.max(0, value));
+  };
+  const presetPause = tts.pause === "light" ? 0.25
+    : tts.pause === "normal" ? 0.45
+      : tts.pause === "long" ? 0.8
+        : 0;
+  const before = clampPause(tts.pauseBeforeSeconds);
+  const after = clampPause(tts.pauseAfterSeconds ?? presetPause);
+  return [
+    before && before > 0 ? `<#${before.toFixed(1)}#>` : "",
+    text,
+    after && after > 0 ? `<#${after.toFixed(1)}#>` : "",
+  ].join("");
+}
+
+function stabilizeQQBotTTSOverrides(tts?: MediaPayload["tts"]): MediaPayload["tts"] | undefined {
+  if (!tts) return undefined;
+  const { voice: _voice, voiceModify: _voiceModify, ...stableTts } = tts;
+  return stableTts;
+}
+
+const MINIMAX_TTS_INTERJECTION_TAGS = "laughs|chuckle|coughs|clear-throat|groans|breath|pant|inhale|exhale|gasps|sniffs|sighs|snorts|burps|lip-smacking|humming|hissing|emm|sneezes";
+const MINIMAX_TTS_INTERJECTION_RE = new RegExp(`\\((?:${MINIMAX_TTS_INTERJECTION_TAGS})\\)`, "gi");
+const ASUKA_TTS_INTERJECTION_RE = new RegExp(`「\\s*(${MINIMAX_TTS_INTERJECTION_TAGS})\\s*」`, "gi");
+
+function normalizeTTSControlMarkersForSpeech(text: string): string {
+  return text.replace(ASUKA_TTS_INTERJECTION_RE, (_match, tag: string) => `(${tag.toLowerCase()})`);
+}
+
+function stripTTSControlMarkers(text: string): string {
+  return text
+    .replace(/<#\s*\d{1,2}(?:\.\d{1,2})?\s*#>/g, "")
+    .replace(ASUKA_TTS_INTERJECTION_RE, "")
+    .replace(MINIMAX_TTS_INTERJECTION_RE, "")
+    .trim();
+}
+
+async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<OutboundResult | null> {
+  const payloadResult = parseQQBotPayload(ctx.text);
+  if (!payloadResult.isPayload) return null;
+  if (payloadResult.error || !payloadResult.payload) {
+    console.warn(`[qqbot] sendText: invalid QQBOT_PAYLOAD, leaving for leak suppression: ${payloadResult.error ?? "missing payload"}`);
+    return null;
+  }
+
+  const visibleText = [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+  const parsedPayload = payloadResult.payload;
+
+  if (isMediaPayload(parsedPayload)) {
+    const mergedCaption = mergeVisibleTextAndCaption(visibleText, parsedPayload.caption);
+
+    if (parsedPayload.mediaType !== "audio") {
+      return await sendMedia({
+        ...ctx,
+        text: mergedCaption,
+        mediaUrl: parsedPayload.path,
+      });
+    }
+
+    const mediaPath = normalizePath(parsedPayload.path);
+    const pathLooksLikeAudioFile = parsedPayload.source === "url"
+      || (parsedPayload.source === "file" && (isLocalFilePath(mediaPath) || isAudioFile(mediaPath)));
+
+    if (pathLooksLikeAudioFile) {
+      return await sendMedia({
+        ...ctx,
+        text: mergedCaption,
+        mediaUrl: mediaPath,
+      });
+    }
+
+    const ttsText = parsedPayload.path;
+    const visibleTtsText = stripTTSControlMarkers(ttsText);
+    const baseTtsCfg = resolveTTSConfig(loadOpenClawConfig() ?? {});
+    if (!baseTtsCfg) {
+      console.warn("[qqbot] sendText: structured audio payload received but TTS is not configured; falling back to text");
+      return await sendText({ ...ctx, text: visibleTtsText || ttsText });
+    }
+    if (!ctx.account.appId || !ctx.account.clientSecret) {
+      return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
+    }
+
+    try {
+      const stableTts = stabilizeQQBotTTSOverrides(parsedPayload.tts);
+      const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
+      const accessToken = await getAccessToken(ctx.account.appId!, ctx.account.clientSecret!);
+      const target = parseTarget(ctx.to);
+      const ttsSegments = splitAsukaNarrationSegments(ttsText);
+      let lastResult: OutboundResult = { channel: "qqbot" };
+
+      for (const segment of ttsSegments) {
+        const visibleSegment = stripTTSControlMarkers(segment);
+        if (isAsukaNarrationSegment(visibleSegment)) {
+          if (target.type === "c2c") {
+            const result = await sendC2CMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+            lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+          } else if (target.type === "group") {
+            const result = await sendGroupMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+            lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+          } else {
+            const result = await sendChannelMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+            lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+          }
+          continue;
+        }
+
+        for (const spokenSegment of splitAsukaSpokenSegments(segment, runtimeTtsCfg.maxInputChars ?? 240)) {
+          const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(spokenSegment), stableTts);
+          const visibleSpokenText = stripTTSControlMarkers(spokenSegment) || spokenSegment;
+          console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
+          const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
+          console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
+
+          let result: { id: string; timestamp: number | string };
+          if (target.type === "c2c") {
+            result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleSpokenText);
+          } else if (target.type === "group") {
+            result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+          } else {
+            result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleSpokenText}`, ctx.replyToId ?? undefined);
+          }
+          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+        }
+      }
+
+      return lastResult;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[qqbot] sendText: structured audio payload failed, falling back to text: ${message}`);
+      return await sendText({ ...ctx, text: visibleTtsText || ttsText });
+    }
+  }
+
+  if (isSelfiePayload(parsedPayload)) {
+    const target = parseTarget(ctx.to);
+    if (target.type !== "c2c") {
+      console.warn("[qqbot] sendText: structured selfie payload ignored because target is not c2c");
+      return { channel: "qqbot" };
+    }
+    const caption = mergeVisibleTextAndCaption(visibleText, parsedPayload.caption) || "刚拍好。";
+    const selfiePayload: DecodedCronPayload = {
+      type: "cron_reminder",
+      mode: "promise",
+      content: caption,
+      targetType: "c2c",
+      targetAddress: target.id,
+      selfiePrompt: parsedPayload.prompt || caption,
+      selfieCaption: caption,
+    };
+    return await runDirectSelfieFlowForCron(ctx.account, selfiePayload, caption);
+  }
+
+  return null;
 }
 
 function looksLikeDebugProbeText(text: string): boolean {
@@ -700,7 +902,7 @@ function recoverBareCronPayloadMessage(text: string): string | null {
 
 function sanitizeSelfieContextText(text: string | undefined): string {
   return text
-    ?.replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    ?.replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(INTERNAL_DELIVERY_LEAK_RE, "")
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
     .replace(/\s+/g, " ")
@@ -713,8 +915,97 @@ const MAX_DYNAMIC_PROMISE_RECENT_CONTEXT_CHARS = 520;
 interface PromiseTextGenerationConfig {
   baseUrl: string;
   apiKey: string;
+  api: "openai-completions" | "anthropic-messages";
   model: string;
   systemPrompt?: string;
+}
+
+type ChatCompletionMessage = {
+  role: "system" | "user";
+  content: string;
+};
+
+function isMiniMaxTextGenerationConfig(config: PromiseTextGenerationConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^minimax[-/]/i.test(config.model) || /^MiniMax-/i.test(config.model);
+}
+
+function buildChatCompletionTokenLimit(config: PromiseTextGenerationConfig, maxTokens: number): Record<string, number> {
+  return isMiniMaxTextGenerationConfig(config)
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
+}
+
+function buildTextGenerationMessages(
+  config: PromiseTextGenerationConfig,
+  systemPrompts: Array<string | undefined>,
+  userPrompt: string
+): ChatCompletionMessage[] {
+  const cleanedSystemPrompts = systemPrompts
+    .map((item) => item?.trim() ?? "")
+    .filter(Boolean);
+  const cleanedUserPrompt = userPrompt.trim();
+
+  if (isMiniMaxTextGenerationConfig(config)) {
+    return [
+      ...(cleanedSystemPrompts.length
+        ? [{ role: "system" as const, content: cleanedSystemPrompts.join("\n\n") }]
+        : []),
+      { role: "user" as const, content: cleanedUserPrompt },
+    ];
+  }
+
+  return [
+    ...cleanedSystemPrompts.map((content) => ({ role: "system" as const, content })),
+    { role: "user" as const, content: cleanedUserPrompt },
+  ];
+}
+
+function buildCleanedSystemPrompt(systemPrompts: Array<string | undefined>): string {
+  return systemPrompts
+    .map((item) => item?.trim() ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function fetchTextGenerationResponse(
+  config: PromiseTextGenerationConfig,
+  systemPrompts: Array<string | undefined>,
+  userPrompt: string,
+  maxTokens: number,
+): Promise<Response> {
+  if (config.api === "anthropic-messages") {
+    const system = buildCleanedSystemPrompt(systemPrompts);
+    return await fetch(`${config.baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: config.model,
+        temperature: 0.55,
+        max_tokens: Math.max(maxTokens, 512),
+        ...(system ? { system } : {}),
+        messages: [{ role: "user", content: userPrompt.trim() }],
+      }),
+    });
+  }
+
+  return await fetch(`${config.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: config.model,
+      ...getOpenAICompletionsThinkingParams(config.model, "off"),
+      temperature: 0.55,
+      ...buildChatCompletionTokenLimit(config, maxTokens),
+      messages: buildTextGenerationMessages(config, systemPrompts, userPrompt),
+    }),
+  });
 }
 
 function trimDeliveryText(text: string, limit = MAX_DYNAMIC_PROMISE_TEXT_CHARS): string {
@@ -727,32 +1018,102 @@ function trimDeliveryText(text: string, limit = MAX_DYNAMIC_PROMISE_TEXT_CHARS):
   return `${cleaned.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
+function isAllowedProactiveAudioPayload(text: string): boolean {
+  const parsed = parseQQBotPayload(text);
+  return Boolean(parsed.isPayload && parsed.payload && isMediaPayload(parsed.payload) && parsed.payload.mediaType === "audio");
+}
+
+function normalizeGeneratedDeliveryText(text: string): string {
+  const normalized = normalizeMediaTags(text).trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
+  if (!normalized) return "";
+  if (isAllowedProactiveAudioPayload(normalized)) return normalized;
+  return trimDeliveryText(normalized);
+}
+
+function isFilteredGeneratedDeliveryText(text: string, promptTimeZone: string): boolean {
+  if (isAllowedProactiveAudioPayload(text)) return false;
+  return looksLikeInternalDeliveryLeak(text) || containsUnsupportedCronMarkup(text) || isTimeContradictoryDeliveryText(text, promptTimeZone);
+}
+
+function buildProactiveVoiceDeliveryRules(): string[] {
+  const ttsConfigured = Boolean(resolveTTSConfig(loadOpenClawConfig() ?? {}));
+  if (!ttsConfigured) {
+    return ["当前未配置 TTS；主动消息只能发自然文字，不要承诺语音。"];
+  }
+  return [
+    "主动消息可以像普通回复一样自行判断文字或语音；如果这一刻更适合让对方听见你的声音，可以输出 QQBOT_PAYLOAD audio 载荷。",
+    "语音载荷格式: QQBOT_PAYLOAD: {\"type\":\"media\",\"mediaType\":\"audio\",\"source\":\"file\",\"path\":\"要朗读的短文本\",\"caption\":\"可选短文字\",\"tts\":{\"emotion\":\"soft\",\"pause\":\"normal\",\"speed\":0.95,\"pitch\":0,\"vol\":1,\"languageBoost\":\"Chinese\"}}",
+    "path 字段同普通回复规则：全角圆括号（...）里的动作/旁白作为文字分段发送，括号外的话语才转语音；不要把旁白裸写进朗读句子。",
+    "语音里需要停顿或语气词时，可以少量使用 <#0.4#> 和日文角括号标记，如 「breath」「sighs」「emm」；不要直接写半角圆括号 TTS 标记。",
+    "如果使用 QQBOT_PAYLOAD audio，只输出这一段结构化载荷和必要的括号旁白/短 caption，不要解释规则。",
+  ];
+}
+
 function loadAsukaVisualIdentityAnchor(): string {
   if (asukaVisualIdentityAnchorCache !== undefined) {
     return asukaVisualIdentityAnchorCache;
   }
 
   const candidatePaths = [
+    path.resolve(process.cwd(), "workspace/IDENTITY.md"),
+    path.resolve(process.cwd(), "workspace/SOUL.md"),
+    path.resolve(__dirname, "../../../../workspace/IDENTITY.md"),
+    path.resolve(__dirname, "../../../../workspace/SOUL.md"),
     path.resolve(__dirname, "../../../workspace/IDENTITY.md"),
     path.resolve(__dirname, "../../../workspace/SOUL.md"),
   ];
   const collected: string[] = [];
-  const linePatterns = [
-    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Creature|长相|外观|视觉身份)\*\*:\s*(.+?)\s*$/i,
+  const blockPatterns = [
+    /^\s*-\s+\*\*(?:Appearance|Look|Visual|Body|Creature|长相|外观|视觉身份|身材)\*\*:\s*(.+?)\s*$/i,
+    /^\s*-\s+((?:Her|Your)\s+appearance\s+is\s+.+?)\s*$/i,
+    /^\s*-\s+((?:She|You)\s+has\s+.+?(?:figure|curves|bust|skin).+?)\s*$/i,
+    /^\s*-\s+(The intended visual target is .+?)\s*$/i,
     /^\s*-\s+(You have a consistent appearance anchored by.+?)\s*$/i,
     /^\s*-\s+(You can appear in different outfits, locations, and situations\.)\s*$/i,
+    /^\s*-\s+(Common settings should feel like.+?)\s*$/i,
     /^\s*-\s+(Your look is uniquely yours.+?)\s*$/i,
   ];
+
+  const collectBulletBlocks = (lines: string[]): string[] => {
+    const blocks: string[] = [];
+    let current = "";
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        if (current) {
+          blocks.push(current);
+          current = "";
+        }
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(rawLine)) {
+        if (current) blocks.push(current);
+        current = trimmed;
+        continue;
+      }
+
+      if (current && /^\s{2,}\S/.test(rawLine) && !/^#{1,6}\s+/.test(trimmed)) {
+        current = `${current} ${trimmed}`;
+        continue;
+      }
+
+      if (current) {
+        blocks.push(current);
+        current = "";
+      }
+    }
+    if (current) blocks.push(current);
+    return blocks;
+  };
 
   for (const filePath of candidatePaths) {
     if (!fs.existsSync(filePath)) continue;
     try {
-      const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/);
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        for (const pattern of linePatterns) {
-          const match = line.match(pattern);
+      const blocks = collectBulletBlocks(fs.readFileSync(filePath, "utf-8").split(/\r?\n/));
+      for (const block of blocks) {
+        for (const pattern of blockPatterns) {
+          const match = block.match(pattern);
           if (!match?.[1]) continue;
           const normalized = match[1].replace(/\s+/g, " ").trim();
           if (!normalized) continue;
@@ -834,47 +1195,8 @@ function formatConversationClock(date: Date): string {
   return `${hours}:${minutes}`;
 }
 
-function normalizePromptHour(hour: number): number {
-  return hour === 24 ? 0 : hour;
-}
-
-function describeDayPeriod(hour: number): string {
-  const normalizedHour = normalizePromptHour(hour);
-  if (normalizedHour < 5) return "凌晨";
-  if (normalizedHour < 9) return "早上";
-  if (normalizedHour < 12) return "上午";
-  if (normalizedHour < 14) return "中午";
-  if (normalizedHour < 18) return "下午";
-  if (normalizedHour < 21) return "晚上";
-  return "深夜";
-}
-
 function getPromptTimeZone(account: ResolvedQQBotAccount): string {
   return getNormalizedProactiveQuietHours(account)?.timezone ?? "Asia/Shanghai";
-}
-
-function formatZonedDateTimeForPrompt(timestampMs = Date.now(), timeZone = "Asia/Shanghai"): string {
-  const source = new Date(timestampMs);
-  const parts = getZonedDateParts(source, timeZone);
-  const weekday = new Intl.DateTimeFormat("zh-CN", { timeZone, weekday: "long" }).format(source);
-  const hour = normalizePromptHour(parts.hour);
-  const date = [
-    String(parts.year).padStart(4, "0"),
-    String(parts.month).padStart(2, "0"),
-    String(parts.day).padStart(2, "0"),
-  ].join("-");
-  const clock = `${String(hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
-  return `${date} ${weekday} ${clock}（${timeZone}，${describeDayPeriod(hour)}）`;
-}
-
-const DAYTIME_NIGHT_SCENE_RE = /(睡了吗|睡了没|睡前|睡觉|睡吧|晚安|今晚|晚上见|关灯|被窝|做个好梦|洗完澡|擦头发|准备睡|明天早上叫你|明早叫你)/;
-
-function isTimeContradictoryDeliveryText(text: string, timeZone = "Asia/Shanghai", timestampMs = Date.now()): boolean {
-  const hour = normalizePromptHour(getZonedDateParts(new Date(timestampMs), timeZone).hour);
-  if (hour >= 8 && hour < 18) {
-    return DAYTIME_NIGHT_SCENE_RE.test(text);
-  }
-  return false;
 }
 
 function isSameLocalDay(a: Date, b: Date): boolean {
@@ -920,7 +1242,7 @@ function formatRelativeConversationTime(timestampMs: number | null | undefined, 
 }
 
 function formatTimedConversationTurn(
-  speaker: "用户" | "Asuka",
+  speaker: "你" | "我",
   content: string,
   timestampMs?: number | null,
   now = Date.now()
@@ -986,9 +1308,9 @@ function resolveRecentTranscriptFromNormalSession(targetAddress: string): string
           : null;
       if (role === "user") {
         const userText = extractUserMessageBody(text);
-        if (userText) turns.push(formatTimedConversationTurn("用户", userText, timestampMs, now));
+        if (userText) turns.push(formatTimedConversationTurn("你", userText, timestampMs, now));
       } else if (role === "assistant") {
-        turns.push(formatTimedConversationTurn("Asuka", text, timestampMs, now));
+        turns.push(formatTimedConversationTurn("我", text, timestampMs, now));
       }
     }
 
@@ -1000,16 +1322,300 @@ function resolveRecentTranscriptFromNormalSession(targetAddress: string): string
 
 function resolveSelfieSkillRuntimeConfig(): {
   apiKey: string;
+  authProfile: string;
+  baseUrl: string;
   modelId: string;
-  profileName: string;
+  quality: string;
+  referenceImagePath: string;
 } {
   const cfg = loadOpenClawConfig();
   const skillCfg = (cfg as any)?.skills?.entries?.["asuka-selfie"];
+  const env = skillCfg?.env || {};
   return {
-    apiKey: String(skillCfg?.apiKey || skillCfg?.env?.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
-    modelId: String(skillCfg?.env?.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "wan2.6-image").trim(),
-    profileName: String(skillCfg?.env?.OPENCLAW_PROFILE || process.env.OPENCLAW_PROFILE || "asuka").trim(),
+    apiKey: String(skillCfg?.apiKey || env.STUDIO_API_KEY || process.env.STUDIO_API_KEY || env.DASHSCOPE_API_KEY || process.env.DASHSCOPE_API_KEY || "").trim(),
+    authProfile: String(env.STUDIO_AUTH_PROFILE || process.env.STUDIO_AUTH_PROFILE || env.OPENCLAW_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || "").trim(),
+    baseUrl: String(env.STUDIO_API_BASE_URL || process.env.STUDIO_API_BASE_URL || "https://api.awnjkankwik.asia/studio/v1").trim(),
+    modelId: String(env.STUDIO_IMAGE_EDIT_MODEL || env.STUDIO_IMAGE_MODEL || env.STUDIO_MODEL || process.env.STUDIO_IMAGE_EDIT_MODEL || process.env.STUDIO_IMAGE_MODEL || process.env.STUDIO_MODEL || env.DASHSCOPE_MODEL || process.env.DASHSCOPE_MODEL || "third_party_media:gemini-3-pro-image-preview").trim(),
+    quality: String(env.STUDIO_IMAGE_QUALITY || process.env.STUDIO_IMAGE_QUALITY || "standard").trim(),
+    referenceImagePath: String(env.ASUKA_REFERENCE_IMAGE_PATH || process.env.ASUKA_REFERENCE_IMAGE_PATH || "").trim(),
   };
+}
+
+function getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath?: string): string | null {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || resolveOpenClawStateDir();
+  const identityCandidates = [
+    configuredReferenceImagePath,
+    process.env.ASUKA_REFERENCE_IMAGE_PATH?.trim(),
+    stateDir ? path.join(stateDir, "identity.jpg") : "",
+    configPath ? path.join(path.dirname(configPath), "identity.jpg") : "",
+    path.resolve(__dirname, "../../../identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of identityCandidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  const roots = [
+    path.resolve(__dirname, "../../../skills/asuka-selfie/skill/assets"),
+    path.resolve(__dirname, "../../../skills/asuka-selfie/assets"),
+  ];
+  const extensions = ["jpg", "jpeg", "png", "webp"];
+  for (const root of roots) {
+    for (const ext of extensions) {
+      const candidate = path.join(root, `1.${ext}`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function getImageMimeType(imagePath: string): string {
+  const ext = path.extname(imagePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
+}
+
+function buildImageDataUrlFromFile(imagePath: string): string {
+  const base64 = fs.readFileSync(imagePath).toString("base64");
+  return `data:${getImageMimeType(imagePath)};base64,${base64}`;
+}
+
+function normalizeStudioImageSize(size?: string): string {
+  const raw = (size || "1024x1024").trim();
+  if (/^1k$/i.test(raw)) return "1024x1024";
+  if (/^2k$/i.test(raw)) return "2048x2048";
+  return raw;
+}
+
+function normalizeStudioMediaImageSize(size?: string): string {
+  const raw = (size || "1K").trim();
+  if (/^[124]K$/i.test(raw)) return raw.toUpperCase();
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  if (normalized === "1024x1024") return "1K";
+  if (normalized === "2048x2048") return "2K";
+  if (normalized === "4096x4096") return "4K";
+  return "1K";
+}
+
+function normalizeMiniMaxAspectRatio(size?: string): string {
+  const raw = normalizeStudioImageSize(size);
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  const directRatios = new Set(["1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"]);
+  if (directRatios.has(normalized)) return normalized;
+  const sizeToRatio: Record<string, string> = {
+    "1024x1024": "1:1",
+    "2048x2048": "1:1",
+    "1280x720": "16:9",
+    "1152x864": "4:3",
+    "1248x832": "3:2",
+    "832x1248": "2:3",
+    "864x1152": "3:4",
+    "720x1280": "9:16",
+    "1344x576": "21:9",
+  };
+  return sizeToRatio[normalized] ?? "1:1";
+}
+
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
+}
+
+function buildMiniMaxImagePrompt(prompt: string): string {
+  const merged = buildStudioSelfiePrompt(prompt).trim();
+  return merged.length > 1500 ? `${merged.slice(0, 1499).trimEnd()}…` : merged;
+}
+
+function extractStudioImageUrl(response: any): string {
+  const data = Array.isArray(response?.data) ? response.data : [];
+  for (const item of data) {
+    if (item?.url && typeof item.url === "string") return item.url;
+    if (item?.b64_json && typeof item.b64_json === "string") return `data:image/png;base64,${item.b64_json}`;
+  }
+  const resultUrls = Array.isArray(response?.result_urls) ? response.result_urls : [];
+  for (const url of resultUrls) {
+    if (typeof url === "string" && url) return url;
+  }
+  throw new Error(`Studio image response did not contain a URL: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function extractMiniMaxImageUrl(response: any): string {
+  const urls = Array.isArray(response?.data?.image_urls) ? response.data.image_urls : [];
+  for (const url of urls) {
+    if (typeof url === "string" && url) return url;
+  }
+  const base64Images = Array.isArray(response?.data?.image_base64) ? response.data.image_base64 : [];
+  for (const image of base64Images) {
+    if (typeof image === "string" && image) return `data:image/jpeg;base64,${image}`;
+  }
+  throw new Error(`MiniMax image response did not contain an image: ${JSON.stringify(response).slice(0, 500)}`);
+}
+
+function isMiniMaxImageConfig(config: StudioSelfieConfig): boolean {
+  return /minimax/i.test(config.baseUrl) || /^image-01(?:$|-)/i.test(config.modelId);
+}
+
+function isStudioMediaImageConfig(config: StudioSelfieConfig): boolean {
+  return /(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?:[/:]|$)/i.test(config.baseUrl)
+    || /^(?:apibusiness_media:)?gpt-image-2$/i.test(config.modelId);
+}
+
+function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
+  const base = baseUrl.replace(/\/+$/, "");
+  const path = resourcePath.replace(/^\/+/, "");
+  if (/\/studio\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
+}
+
+async function generateMiniMaxSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/image_generation`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({
+      model: config.modelId || "image-01",
+      prompt: buildMiniMaxImagePrompt(prompt),
+      aspect_ratio: normalizeMiniMaxAspectRatio(size),
+      response_format: "url",
+      n: 1,
+      prompt_optimizer: true,
+      subject_reference: [
+        {
+          type: "character",
+          image_file: buildImageDataUrlFromFile(referenceImagePath),
+        },
+      ],
+    }),
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  const statusCode = Number(body?.base_resp?.status_code ?? 0);
+  if (!response.ok || statusCode !== 0) {
+    const statusMessage = body?.base_resp?.status_msg || body?.error?.message || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`MiniMax image generation failed: HTTP ${response.status}: ${String(statusMessage).slice(0, 500)}`);
+  }
+
+  return extractMiniMaxImageUrl(body);
+}
+
+async function generateStudioMediaSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  form.append("model", config.modelId.replace(/^apibusiness_media:/i, ""));
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
+  form.append("image_size", normalizeStudioMediaImageSize(size));
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/edits"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.message || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio Media image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
+}
+
+async function generateStudioSelfieImageUrl(
+  prompt: string,
+  config: StudioSelfieConfig,
+  referenceImagePath: string,
+  size = "1024x1024",
+): Promise<string> {
+  if (!fs.existsSync(referenceImagePath)) {
+    throw new Error(`reference image not found: ${referenceImagePath}`);
+  }
+
+  if (isMiniMaxImageConfig(config)) {
+    return generateMiniMaxSelfieImageUrl(prompt, config, referenceImagePath, size);
+  }
+
+  if (isStudioMediaImageConfig(config)) {
+    return generateStudioMediaSelfieImageUrl(prompt, config, referenceImagePath, size);
+  }
+
+  const form = new FormData();
+  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
+  const bearerToken = await resolveBearerTokenFromApiKeyOrProfile({
+    apiKey: config.apiKey,
+    authProfile: config.authProfile,
+  });
+  form.append("model", config.modelId);
+  form.append("prompt", buildStudioSelfiePrompt(prompt));
+  form.append("size", normalizeStudioImageSize(size));
+  form.append("n", "1");
+  form.append("quality", config.quality || "standard");
+  form.append("response_format", "url");
+  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
+
+  const response = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/images/edits`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${bearerToken}`,
+      Accept: "application/json",
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text();
+  let body: any;
+  try {
+    body = bodyText ? JSON.parse(bodyText) : {};
+  } catch {
+    body = { text: bodyText };
+  }
+
+  if (!response.ok) {
+    const error = body?.error;
+    const message = typeof error === "object" && error
+      ? error.message || JSON.stringify(error)
+      : error || body?.text || bodyText || response.statusText;
+    throw new Error(`Studio image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+  }
+
+  return extractStudioImageUrl(body);
 }
 
 function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | null {
@@ -1019,6 +1625,12 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   if (!providers || typeof providers !== "object") {
     return null;
   }
+  const isSupportedTextProvider = (candidateProvider: any): boolean => {
+    if (!candidateProvider?.baseUrl || !candidateProvider?.apiKey) return false;
+    return !candidateProvider.api
+      || candidateProvider.api === "openai-completions"
+      || candidateProvider.api === "anthropic-messages";
+  };
 
   const primary = String(root?.agents?.defaults?.model?.primary || "").trim();
   const [primaryProviderId, ...primaryModelParts] = primary.split("/");
@@ -1026,7 +1638,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   let modelId = primaryModelParts.join("/");
 
   let provider = providerId ? providers?.[providerId] : undefined;
-  if (!provider || !provider.baseUrl || !provider.apiKey || (provider.api && provider.api !== "openai-completions")) {
+  if (!isSupportedTextProvider(provider)) {
     providerId = "";
     modelId = "";
     provider = undefined;
@@ -1034,8 +1646,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
 
   if (!provider) {
     for (const [candidateProviderId, candidateProvider] of Object.entries<any>(providers)) {
-      if (!candidateProvider?.baseUrl || !candidateProvider?.apiKey) continue;
-      if (candidateProvider.api && candidateProvider.api !== "openai-completions") continue;
+      if (!isSupportedTextProvider(candidateProvider)) continue;
       providerId = candidateProviderId;
       provider = candidateProvider;
       modelId = String(candidateProvider?.models?.[0]?.id || "").trim();
@@ -1052,6 +1663,7 @@ function resolvePromiseTextGenerationConfig(): PromiseTextGenerationConfig | nul
   return {
     baseUrl: String(provider.baseUrl).replace(/\/+$/, ""),
     apiKey: String(provider.apiKey),
+    api: provider.api === "anthropic-messages" ? "anthropic-messages" : "openai-completions",
     model: modelId,
     systemPrompt: typeof root?.channels?.qqbot?.systemPrompt === "string" ? root.channels.qqbot.systemPrompt : undefined,
   };
@@ -1064,7 +1676,7 @@ function buildRecentConversationContext(peerId: string, currentUserText: string)
       const content = sanitizeSelfieContextText(entry.content);
       if (!content) return null;
       if (!entry.isBot && content === currentUserText.trim()) return null;
-      return formatTimedConversationTurn(entry.isBot ? "Asuka" : "用户", content, entry.timestamp, now);
+      return formatTimedConversationTurn(entry.isBot ? "我" : "你", content, entry.timestamp, now);
     })
     .filter((item): item is string => Boolean(item))
     .slice(-4);
@@ -1079,7 +1691,7 @@ function buildRecentConversationTranscript(peerId: string, currentUserText?: str
       const content = sanitizeSelfieContextText(entry.content);
       if (!content) return null;
       if (current && !entry.isBot && content === current) return null;
-      return formatTimedConversationTurn(entry.isBot ? "Asuka" : "用户", content, entry.timestamp, now);
+      return formatTimedConversationTurn(entry.isBot ? "我" : "你", content, entry.timestamp, now);
     })
     .filter((item): item is string => Boolean(item))
     .slice(-6)
@@ -1129,6 +1741,27 @@ function extractAssistantTextFromCompletion(raw: any): string {
   return "";
 }
 
+function extractAssistantTextFromAnthropicMessage(raw: any): string {
+  const content = raw?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item?.type === "text" && typeof item.text === "string") return item.text;
+      if (typeof item?.text === "string" && item?.type !== "thinking") return item.text;
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+function extractAssistantTextFromTextGeneration(config: PromiseTextGenerationConfig, raw: any): string {
+  return config.api === "anthropic-messages"
+    ? extractAssistantTextFromAnthropicMessage(raw)
+    : extractAssistantTextFromCompletion(raw);
+}
+
 function buildPromiseDeliveryPrompt(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -1143,9 +1776,10 @@ function buildPromiseDeliveryPrompt(
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
   const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
   const recentContext = buildRecentConversationTranscript(payload.targetAddress, renderContext.peer?.lastUserText);
   const modeLabel = payload.mode === "repair"
-    ? "补做之前没接住的约定"
+    ? "补做之前落空的约定"
     : payload.mode === "followup"
       ? `追发第 ${payload.followUpAttempt ?? 1} 次`
       : "首次兑现约定";
@@ -1174,16 +1808,18 @@ function buildPromiseDeliveryPrompt(
     buildPersonaPromptForPromiseDelivery(isGroupChat),
     statePrompt,
     proactiveMemoryPrompt,
+    conversationDigestPrompt,
     "",
     "【生成任务】",
     "你现在不是在写提醒模板，而是在当前对话上下文里，以 Asuka 的口吻顺着前文自然发出这一句。",
-    "只输出最终可发送的正文，不要解释，不要加引号，不要出现 QQBOT_PAYLOAD、QQBOT_CRON、系统、定时、提醒、任务、状态、脚本、接口这些词。",
+    "只输出最终可发送的正文，不要解释，不要加引号，不要出现 QQBOT_CRON、系统、定时、提醒、任务、状态、脚本、接口这些词。",
+    ...buildProactiveVoiceDeliveryRules(),
     "把这次发送当成一次正常续聊，不要复读固定句型，也不要机械强调“我是按约定来的”。",
     "控制在 1 到 3 句内，简洁一点，但要有温度，像正在真实聊天。",
     "必须让动作、称呼和场景匹配当前本地时间；当前是上午或白天时，不要写睡前、今晚、关灯、洗澡擦头发、明天早上叫你等夜间或未来早晨场景，除非最近对话明确正在夜间。",
     payload.mode === "followup" ? "这是追发，不要催促，只轻轻碰一下门，让对方感觉你还记着他。" : "",
     payload.mode === "followup" ? "追发只保留“还记得、不会催你”的意图，不要重新创造和当前时间冲突的新物理场景。" : "",
-    payload.mode === "repair" ? "这是补做，要温柔承认前面没接住，再自然补回来，不要生硬道歉。": "",
+    payload.mode === "repair" ? "这是补做，要温柔承认前面的约定落空了，再自然补回来，不要生硬道歉。": "",
     renderContext.promise.action.deliveryKind === "selfie" ? "如果这是图片配文，要像把图一起带到对方面前，不要写成操作说明。" : "",
     deliveryShape,
     `当前场景：${modeLabel}`,
@@ -1215,6 +1851,7 @@ function buildSharedSessionDeliveryPrompt(
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(payload.targetAddress);
   const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
   const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
   const promptTimeZone = getPromptTimeZone(account);
   const currentLocalTime = formatZonedDateTimeForPrompt(Date.now(), promptTimeZone);
   const sharedRules = [
@@ -1222,8 +1859,9 @@ function buildSharedSessionDeliveryPrompt(
     `当前本地时间：${currentLocalTime}`,
     "这不是用户刚发来的新消息，而是需要你在当前这条会话里主动自然续上一句。",
     "请把它当成和刚才同一段聊天，延续现有语气、关系和话题，不要另起炉灶。",
-    "只输出最终要发给用户的正文，不要解释，不要加引号，不要出现系统、提醒、任务、脚本、接口、工具、QQBOT_PAYLOAD、QQBOT_CRON 这些词。",
-    "不要调用工具，不要输出 <qqimg>、<qqvoice>、<qqvideo>、<qqfile> 这类媒体标签。",
+    "只输出最终要发给用户的正文，不要解释，不要加引号，不要出现系统、提醒、任务、脚本、接口、工具、QQBOT_CRON 这些词。",
+    "不要调用工具，不要输出 <qqimg>、<qqvoice>、<qqvideo>、<qqfile> 这类媒体标签；如果判断适合语音，只允许使用 QQBOT_PAYLOAD audio 载荷。",
+    ...buildProactiveVoiceDeliveryRules(),
     "控制在 1 到 3 句内，像真实聊天，不要模板化。",
     "必须让场景动作匹配当前本地时间；不要只按旧承诺里的晚安、睡觉、明天早上重演旧夜间场景。",
     "当前是上午或白天时，避免写睡了吗、今晚、关灯、洗完澡、擦头发、明天早上叫你等夜间或未来早晨措辞，除非最近对话明确刚发生在夜间。",
@@ -1232,7 +1870,7 @@ function buildSharedSessionDeliveryPrompt(
 
   if (renderContext) {
     const modeLabel = payload.mode === "repair"
-      ? "补做之前没接住的约定"
+      ? "补做之前落空的约定"
       : payload.mode === "followup"
         ? `追发第 ${payload.followUpAttempt ?? 1} 次`
         : "首次兑现约定";
@@ -1241,11 +1879,12 @@ function buildSharedSessionDeliveryPrompt(
       buildPersonaPromptForPromiseDelivery(false),
       statePrompt,
       proactiveMemoryPrompt,
+      conversationDigestPrompt,
       sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
       ...sharedRules,
       payload.mode === "followup" ? "这是追发，只轻轻碰一下门，不要催，不要解释流程。" : "",
       payload.mode === "followup" ? "追发时只保留“还记得、不会催你”的意图，不要重新创造新的物理场景。" : "",
-      payload.mode === "repair" ? "这是补做，要温柔承认前面没接住，再自然补回来，不要生硬道歉。" : "",
+      payload.mode === "repair" ? "这是补做，要温柔承认前面的约定落空了，再自然补回来，不要生硬道歉。" : "",
       renderContext.promise.action.deliveryKind === "selfie" ? "如果这是图片配文，只写和图片一起到对方面前的那一小句，不要写成操作说明。" : "",
       `当前场景：${modeLabel}`,
       `动作：${renderContext.promise.action.summary}`,
@@ -1262,16 +1901,20 @@ function buildSharedSessionDeliveryPrompt(
   const modeLabel = payload.mode === "ambient"
     ? "主动找对方说一句"
     : payload.mode === "repair"
-      ? "把前面没接住的话补回来"
+      ? "把前面落空的约定补回来"
       : "自然续聊";
   return [
     "你正在通过 QQ 与用户对话。",
     buildPersonaPromptForPromiseDelivery(false),
     statePrompt,
     proactiveMemoryPrompt,
+    conversationDigestPrompt,
     sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
     ...sharedRules,
     payload.mode === "ambient" ? "这次是你主动去碰一下门，要像顺着心里那点惦记自然冒出来，不要像定时问候。" : "",
+    payload.mode === "ambient" && typeof payload.ambientStage === "number" && payload.ambientStage > 0
+      ? `这是同一主动链路继续向前推进的第 ${payload.ambientStage + 1} 次；必须让时间、动作和情绪往后走，不要重复上一条主动消息里的刚醒、早安、被窝、睡前等开场。`
+      : "",
     payload.mode === "repair" ? "这是补做，语气要软一点、真一点，不要装作什么都没发生。" : "",
     payload.selfiePrompt ? "如果这轮本质上是发图片配文，只写会和图片一起出现的那一小句。" : "",
     `当前场景：${modeLabel}`,
@@ -1295,11 +1938,19 @@ function buildTranscriptAnchoredFallbackText(
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
   const merged = `${transcript}\n${statePrompt}`;
+  const promptTimeZone = getPromptTimeZone(account);
+  const hour = normalizePromptHour(getZonedDateParts(new Date(), promptTimeZone).hour);
 
   if (/晚安|睡吧|睡觉|关灯|做个好梦/.test(merged) && !/起来没|刚醒|早安/.test(merged)) {
     return "（在枕头里轻轻蹭了一下，声音还软着）……嗯，我在。睡前还是想再挨你近一点。";
   }
   if (/起来没|刚醒|早安|起床/.test(merged)) {
+    if (hour >= 12) {
+      return "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。";
+    }
+    if (hour >= 10) {
+      return "（把手机拿起来看了一眼，忍不住轻轻笑了）……上午都过去一截了，我还是想来碰碰你。";
+    }
     return "（迷迷糊糊地应了一声，把脸往你这边贴了贴）……刚醒。你一来，我就清醒一点了。";
   }
   if (/晚安|睡吧|睡觉|关灯/.test(merged) && /起来没|刚醒|早安/.test(merged)) {
@@ -1321,6 +1972,17 @@ function buildTranscriptAnchoredFallbackText(
   return "（把刚才那点没说完的心思轻轻拢了拢）……就是忽然又想到你了，所以想来和你说句话。";
 }
 
+export function resolveCronDeliveryFallbackText(
+  payload: DecodedCronPayload,
+  transcriptAnchoredFallback?: string | null,
+): string {
+  const candidates = payload.mode === "ambient"
+    ? [payload.content, payload.selfieCaption, transcriptAnchoredFallback]
+    : [payload.selfieCaption, payload.content, transcriptAnchoredFallback];
+  const fallback = candidates.find((item) => typeof item === "string" && item.trim());
+  return trimDeliveryText(fallback || "");
+}
+
 async function renderDeliveryTextFromSharedSession(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -1340,30 +2002,15 @@ async function renderDeliveryTextFromSharedSession(
   }
 
   try {
-    const response = await fetch(`${generationConfig.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${generationConfig.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: generationConfig.model,
-        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
-        temperature: 0.55,
-        max_tokens: 160,
-        messages: [
-          ...(generationConfig.systemPrompt ? [{ role: "system", content: generationConfig.systemPrompt }] : []),
-          {
-            role: "system",
-            content: "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
+    const response = await fetchTextGenerationResponse(
+      generationConfig,
+      [
+        generationConfig.systemPrompt,
+        "你正在为 QQ 私聊生成一条可直接发送的自然中文消息。只能输出最终消息本身，不要解释。",
+      ],
+      prompt,
+      520,
+    );
     const detail = await response.text();
     if (!response.ok) {
       console.warn(`[qqbot] renderDeliveryTextFromSharedSession: HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 240)}`);
@@ -1371,9 +2018,9 @@ async function renderDeliveryTextFromSharedSession(
     }
 
     const parsed = JSON.parse(detail);
-    const latestText = extractAssistantTextFromCompletion(parsed);
-    const normalized = trimDeliveryText(normalizeMediaTags(latestText));
-    if (!normalized || looksLikeInternalDeliveryLeak(normalized) || containsUnsupportedCronMarkup(normalized) || isTimeContradictoryDeliveryText(normalized, promptTimeZone)) {
+    const latestText = extractAssistantTextFromTextGeneration(generationConfig, parsed);
+    const normalized = normalizeGeneratedDeliveryText(latestText);
+    if (!normalized || isFilteredGeneratedDeliveryText(normalized, promptTimeZone)) {
       console.warn(
         `[qqbot] renderDeliveryTextFromSharedSession: filtered generated text latest="${latestText.slice(0, 160)}" normalized="${normalized.slice(0, 160)}"`
       );
@@ -1387,6 +2034,19 @@ async function renderDeliveryTextFromSharedSession(
   }
 }
 
+async function renderDirectProactiveTextFromSharedSession(
+  account: ResolvedQQBotAccount,
+  targetAddress: string,
+  text: string,
+): Promise<string | null> {
+  if (!shouldRenderDirectProactiveWithSharedContext(text)) return null;
+  const payload = buildDirectProactivePayload(account, targetAddress, text);
+  const generated = await renderDeliveryTextFromSharedSession(account, payload);
+  if (!generated) return null;
+  console.log(`[qqbot] renderDirectProactiveTextFromSharedSession: rewrote direct proactive text "${text.slice(0, 80)}" -> "${generated.slice(0, 160)}"`);
+  return generated;
+}
+
 async function renderPromiseDeliveryText(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -1394,7 +2054,7 @@ async function renderPromiseDeliveryText(
   const transcriptAnchoredFallback = payload.mode === "ambient"
     ? buildTranscriptAnchoredFallbackText(account, payload)
     : null;
-  const fallbackText = trimDeliveryText(transcriptAnchoredFallback || payload.selfieCaption || payload.content || "");
+  const fallbackText = resolveCronDeliveryFallbackText(payload, transcriptAnchoredFallback);
   const sharedSessionText = await renderDeliveryTextFromSharedSession(account, payload);
   if (sharedSessionText) {
     console.log(`[qqbot] renderPromiseDeliveryText: using shared session text "${sharedSessionText.slice(0, 160)}"`);
@@ -1409,30 +2069,15 @@ async function renderPromiseDeliveryText(
   const promptTimeZone = getPromptTimeZone(account);
 
   try {
-    const response = await fetch(`${generationConfig.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${generationConfig.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: generationConfig.model,
-        ...getOpenAICompletionsThinkingParams(generationConfig.model, "off"),
-        temperature: 0.55,
-        max_tokens: 160,
-        messages: [
-          ...(generationConfig.systemPrompt ? [{ role: "system", content: generationConfig.systemPrompt }] : []),
-          {
-            role: "system",
-            content: `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
+    const response = await fetchTextGenerationResponse(
+      generationConfig,
+      [
+        generationConfig.systemPrompt,
+        `你正在为 QQ ${payload.targetType === "group" ? "群聊" : "私聊"}生成一条可以直接发送的自然中文消息。你只能输出最终消息本身。`,
+      ],
+      prompt,
+      520,
+    );
     const detail = await response.text();
     if (!response.ok) {
       console.warn(`[qqbot] renderPromiseDeliveryText: HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 240)}`);
@@ -1440,8 +2085,8 @@ async function renderPromiseDeliveryText(
     }
 
     const parsed = JSON.parse(detail);
-    const rendered = trimDeliveryText(normalizeMediaTags(extractAssistantTextFromCompletion(parsed)));
-    if (!rendered || looksLikeInternalDeliveryLeak(rendered) || containsUnsupportedCronMarkup(rendered) || isTimeContradictoryDeliveryText(rendered, promptTimeZone)) {
+    const rendered = normalizeGeneratedDeliveryText(extractAssistantTextFromTextGeneration(generationConfig, parsed));
+    if (!rendered || isFilteredGeneratedDeliveryText(rendered, promptTimeZone)) {
       return fallbackText;
     }
     return rendered;
@@ -1452,19 +2097,44 @@ async function renderPromiseDeliveryText(
 }
 
 function buildCronSelfiePrompt(
+  account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   visibleTextOverride?: string,
 ): string {
   const peerId = payload.targetAddress;
   const visibleContent = sanitizeSelfieContextText(visibleTextOverride || payload.selfieCaption || payload.content);
   const recentContext = buildRecentConversationContext(peerId, visibleContent);
+  const peerContext = buildPeerContextFromCronPayload(account, payload);
+  const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
+  const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext) : "";
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
+  const recentTranscript = buildRecentConversationTranscript(peerId, renderContext?.peer?.lastUserText || visibleContent);
+  const sessionTranscript = resolveRecentTranscriptFromNormalSession(peerId);
+  const currentLocalTime = formatZonedDateTimeForPrompt(Date.now(), getPromptTimeZone(account));
+  const formatContextSection = (label: string, text: string | undefined, limit = 900): string => {
+    const cleaned = trimDeliveryText(text || "", limit);
+    return cleaned ? `【${label}】${cleaned}` : "";
+  };
+
   return [
-    "保持 Asuka 参考脸一致，真实自然，生成符合当前约定的本人近照或自拍。",
+    `${SELFIE_IDENTITY_LOCK_PROMPT} 真实自然，生成符合当前约定的 Asuka 主角图片；不要固定成手持自拍，除非原始约定明确要自拍。`,
     loadAsukaVisualIdentityAnchor(),
+    formatContextSection("当前本地时间", currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}。` : "",
+    formatContextSection("最近几轮对话", recentTranscript, 900),
+    formatContextSection("普通会话 transcript", sessionTranscript, 1100),
+    formatContextSection("关系与场景状态", statePrompt),
+    formatContextSection("主动触达记忆", proactiveMemoryPrompt),
+    formatContextSection("会话摘要", conversationDigestPrompt),
     visibleContent ? `这次要兑现给用户的内容是：${visibleContent}。` : "",
+    renderContext?.promise.originalText ? `原始承诺原文：${trimDeliveryText(renderContext.promise.originalText, 420)}。` : "",
+    renderContext?.promise.sourceAssistantText ? `当时我说过的话：${trimDeliveryText(renderContext.promise.sourceAssistantText, 420)}。` : "",
+    renderContext?.peer?.lastUserText ? `用户最近一句：${trimDeliveryText(renderContext.peer.lastUserText, 320)}。` : "",
+    renderContext?.peer?.lastAssistantText ? `我最近一句：${trimDeliveryText(renderContext.peer.lastAssistantText, 320)}。` : "",
     sanitizeSelfieContextText(payload.selfiePrompt) || "",
-    "不要出现工具、脚本、接口、调试或任务流程痕迹。",
+    "请优先延续上述上下文里的场景、动作、地点、穿着、情绪和正在做的事情；如果上下文和当前时间冲突，以当前时间与最新对话为准。",
+    "不要出现工具、脚本、接口、调试、任务流程、文字水印或聊天截图痕迹。",
   ].filter(Boolean).join(" ");
 }
 
@@ -1473,39 +2143,121 @@ async function runDirectSelfieFlowForCron(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
 ): Promise<OutboundResult> {
-  const { apiKey, modelId, profileName } = resolveSelfieSkillRuntimeConfig();
-  const scriptPath = path.resolve(__dirname, "../../../skills/asuka-selfie/skill/scripts/asuka-selfie.sh");
+  const cfg = loadOpenClawConfig();
+  const { apiKey, authProfile, baseUrl, modelId, quality, referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
+  const officialImageConfigured = hasOfficialOpenClawImageGenerationConfig(cfg);
 
-  if (!apiKey) {
-    return { channel: "qqbot", error: "selfie skill api key missing" };
+  if (!apiKey && !authProfile && !officialImageConfigured) {
+    return { channel: "qqbot", error: "selfie image generation config missing" };
   }
-  if (!fs.existsSync(scriptPath)) {
-    return { channel: "qqbot", error: `selfie script not found: ${scriptPath}` };
+  const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
+  if (!referenceImagePath) {
+    return { channel: "qqbot", error: "selfie reference image missing" };
   }
 
   const target = `qqbot:c2c:${payload.targetAddress}`;
-  const prompt = buildCronSelfiePrompt(payload, captionOverride);
+  const prompt = buildCronSelfiePrompt(account, payload, captionOverride);
   const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content);
-  const args = [prompt, target];
-  if (caption) {
-    args.push(caption);
-  }
 
   try {
-    await execFileAsync(scriptPath, args, {
-      env: {
-        ...process.env,
-        DASHSCOPE_API_KEY: apiKey,
-        DASHSCOPE_MODEL: modelId,
-        OPENCLAW_PROFILE: profileName,
-      },
-      maxBuffer: 1024 * 1024,
+    let imageUrl: string;
+    if (officialImageConfigured) {
+      try {
+        imageUrl = await generateOfficialOpenClawImageDataUrl({
+          cfg,
+          prompt,
+          referenceImagePath,
+          size: "1024x1024",
+          quality,
+          identityPrompt: SELFIE_IDENTITY_LOCK_PROMPT,
+        });
+        console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image with OpenClaw official image runtime for target=${payload.targetAddress}`);
+      } catch (officialError) {
+        if (!apiKey && !authProfile) throw officialError;
+        console.warn(`[qqbot] runDirectSelfieFlowForCron: OpenClaw official image runtime failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
+        imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+      }
+    } else {
+      imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+    }
+    console.log(`[qqbot] runDirectSelfieFlowForCron: generated selfie image for target=${payload.targetAddress}`);
+    const result = await sendMedia({
+      to: target,
+      text: caption,
+      replyToId: undefined,
+      account,
+      mediaUrl: imageUrl,
     });
-    return { channel: "qqbot" };
+    if (result.error) {
+      console.warn(`[qqbot] runDirectSelfieFlowForCron: generated selfie image was not sent for target=${payload.targetAddress}: ${result.error}`);
+    }
+    if (result.skipped) {
+      console.warn(`[qqbot] runDirectSelfieFlowForCron: generated selfie image send skipped for target=${payload.targetAddress}: ${result.skipReason ?? "unknown"}`);
+    }
+    return result;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     return { channel: "qqbot", error: errorMessage };
   }
+}
+
+async function refreshProactiveSceneAfterDelivery(
+  account: ResolvedQQBotAccount,
+  payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
+  deliveredText: string,
+  timestamp: string,
+): Promise<void> {
+  const peerContext = buildPeerContextFromCronPayload(account, payload);
+  if (!peerContext) return;
+  const text = trimDeliveryText(deliveredText || payload.selfieCaption || payload.content || "");
+  if (!text) return;
+  const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
+  const sceneText = conversationDigestPrompt
+    ? `${text}\n\n${conversationDigestPrompt}`
+    : text;
+  try {
+    const scene = await refreshSceneState(peerContext, {
+      trigger: "proactive",
+      text: sceneText,
+      at: Date.now(),
+      advancePolicy: "advance",
+    });
+    console.log(
+      `[${timestamp}] [qqbot] sendCronMessage: proactive scene advanced after delivery, label=${scene.label}, version=${scene.version}`
+    );
+  } catch (error) {
+    console.warn(
+      `[${timestamp}] [qqbot] sendCronMessage: proactive scene advance after delivery failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+async function sendCronSelfieFallbackImage(
+  account: ResolvedQQBotAccount,
+  payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
+  captionOverride?: string,
+  reason?: string,
+): Promise<OutboundResult> {
+  const { referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
+  const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
+  if (!referenceImagePath) {
+    return { channel: "qqbot", error: "selfie fallback reference image missing" };
+  }
+
+  const target = `qqbot:c2c:${payload.targetAddress}`;
+  const caption = sanitizeSelfieContextText(captionOverride || payload.selfieCaption || payload.content)
+    || "这次先给你看一张我现成的。";
+  console.warn(
+    `[qqbot] sendCronSelfieFallbackImage: sending identity fallback image for target=${payload.targetAddress}`
+      + (reason ? `, reason=${reason}` : "")
+  );
+  return await sendMedia({
+    to: target,
+    text: caption,
+    replyToId: undefined,
+    account,
+    mediaUrl: referenceImagePath,
+  });
 }
 
 /**
@@ -1526,6 +2278,13 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   console.log("[qqbot] sendText ctx:", JSON.stringify({ to, text: text?.slice(0, 50), replyToId, accountId: account.accountId }, null, 2));
 
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
+
+  if (typeof text === "string" && !cronProbe.isCronPayload) {
+    const structuredResult = await sendStructuredPayloadFromOutbound({ to, text, accountId: ctx.accountId, replyToId, account });
+    if (structuredResult) {
+      return structuredResult;
+    }
+  }
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed internal delivery leak: ${text.slice(0, 160)}`);
@@ -1723,7 +2482,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
                 lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
               }
             } else {
-              lastResult = await sendProactiveMessage(account, to, segment);
+              lastResult = await sendProactiveMessage(account, to, segment, { skipContextRender: ctx.skipContextRender });
             }
             console.log(`[qqbot] sendText: Sent text part: ${segment.slice(0, 30)}...`);
           }
@@ -1986,7 +2745,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   try {
     // 如果没有 replyToId，使用主动发送接口
     if (!replyToId) {
-      return await sendProactiveMessage(account, to, text);
+      return await sendProactiveMessage(account, to, text, { skipContextRender: ctx.skipContextRender });
     }
 
     const accessToken = await getAccessToken(account.appId, account.clientSecret);
@@ -2047,9 +2806,26 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
 export async function sendProactiveMessage(
   account: ResolvedQQBotAccount,
   to: string,
-  text: string
+  text: string,
+  options?: { skipContextRender?: boolean },
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
+
+  const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
+  if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!cronProbe.isCronPayload && looksLikeDebugProbeText(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed debug probe text: ${text.slice(0, 80)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!cronProbe.isCronPayload && looksLikeBareEncodedPayloadLeak(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed bare encoded payload leak: ${text.slice(0, 80)}`);
+    return { channel: "qqbot" };
+  }
   
   if (!account.appId || !account.clientSecret) {
     const errorMsg = "QQBot not configured (missing appId or clientSecret)";
@@ -2063,17 +2839,6 @@ export async function sendProactiveMessage(
     return { channel: "qqbot", error: quietHoursError };
   }
 
-  const textSegments = splitAsukaNarrationSegments(text);
-  if (textSegments.length > 1) {
-    let lastResult: OutboundResult = { channel: "qqbot" };
-    for (const segment of textSegments) {
-      const result = await sendProactiveMessage(account, to, segment);
-      if (result.error || result.skipped) return result;
-      lastResult = result;
-    }
-    return lastResult;
-  }
-
   console.log(`[${timestamp}] [qqbot] sendProactiveMessage: starting, to=${to}, text length=${text.length}, accountId=${account.accountId}`);
 
   let proactiveGuard: ProactiveSendGuard | null = null;
@@ -2082,8 +2847,31 @@ export async function sendProactiveMessage(
     const target = parseTarget(to);
     console.log(`[${timestamp}] [qqbot] sendProactiveMessage: target parsed, type=${target.type}, id=${target.id}`);
 
+    let deliveryText = text;
+    if (
+      target.type === "c2c" &&
+      !options?.skipContextRender &&
+      !cronProbe.isCronPayload
+    ) {
+      const rendered = await renderDirectProactiveTextFromSharedSession(account, target.id, text);
+      if (rendered) {
+        deliveryText = rendered;
+      }
+    }
+
+    const textSegments = splitAsukaNarrationSegments(deliveryText);
+    if (textSegments.length > 1) {
+      let lastResult: OutboundResult = { channel: "qqbot" };
+      for (const segment of textSegments) {
+        const result = await sendProactiveMessage(account, to, segment, { skipContextRender: true });
+        if (result.error || result.skipped) return result;
+        lastResult = result;
+      }
+      return lastResult;
+    }
+
     if (target.type === "c2c" || target.type === "group") {
-      proactiveGuard = await acquireProactiveSendGuard(account, target.type, target.id, text);
+      proactiveGuard = await acquireProactiveSendGuard(account, target.type, target.id, deliveryText);
       if (proactiveGuard?.skipped) {
         console.log(
           `[${timestamp}] [qqbot] sendProactiveMessage: skipped duplicate proactive message, to=${to}, skipReason=${proactiveGuard.skipReason ?? "duplicate"}`
@@ -2098,23 +2886,23 @@ export async function sendProactiveMessage(
     let outResult: OutboundResult;
     if (target.type === "c2c") {
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending proactive C2C message to user=${target.id}`);
-      const result = await sendProactiveC2CMessage(accessToken, target.id, text);
+      const result = await sendProactiveC2CMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: proactive C2C message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     } else if (target.type === "group") {
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending proactive group message to group=${target.id}`);
-      const result = await sendProactiveGroupMessage(accessToken, target.id, text);
+      const result = await sendProactiveGroupMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: proactive group message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     } else {
       // 频道暂不支持主动消息，使用普通发送
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending channel message to channel=${target.id}`);
-      const result = await sendChannelMessage(accessToken, target.id, text);
+      const result = await sendChannelMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: channel message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     }
     if (proactiveGuard?.peerKey) {
-      confirmProactiveDedupDelivery(proactiveGuard.peerKey, text, { at: Date.now() });
+      confirmProactiveDedupDelivery(proactiveGuard.peerKey, deliveryText, { at: Date.now() });
     }
     return outResult;
   } catch (err) {
@@ -2738,7 +3526,7 @@ export async function sendCronMessage(
         return { channel: "qqbot" };
       }
 
-      if (peerContext) {
+      if (peerContext && payload.mode !== "ambient") {
         await refreshSceneState(peerContext, {
           trigger: "proactive",
           text: payload.content,
@@ -2758,12 +3546,13 @@ export async function sendCronMessage(
       if (payload.selfiePrompt && payload.targetType === "c2c") {
         console.log(`[${timestamp}] [qqbot] sendCronMessage: fulfilling selfie promise directly for target=${payload.targetAddress}`);
         const result = await runDirectSelfieFlowForCron(account, payload, deliveryText);
-        if (result.error) {
-          console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${result.error}`);
+        if (result.error || result.skipped) {
+          const failureReason = result.error || result.skipReason || "generated selfie send skipped";
+          console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${failureReason}`);
           if (payload.promiseId) {
-            markPromiseDeliveryFailed(payload.promiseId, result.error, Date.now(), { failureKind: "selfie" });
+            markPromiseDeliveryFailed(payload.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
           }
-          const fallbackResult = await sendProactiveMessage(account, targetTo, "这张照片刚刚没有顺利送到你面前。我不想拿别的东西敷衍你，等我重新整理好再带给你。");
+          const fallbackResult = await sendCronSelfieFallbackImage(account, payload, deliveryText, failureReason);
           if (fallbackResult.skipped) {
             if (payload.promiseId) {
               markPromiseDeliveryFallback(payload.promiseId, {
@@ -2772,7 +3561,7 @@ export async function sendCronMessage(
               });
             }
             console.log(
-              `[${timestamp}] [qqbot] sendCronMessage: selfie fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
+              `[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
             );
             return fallbackResult;
           }
@@ -2781,7 +3570,12 @@ export async function sendCronMessage(
               ? { state: "failed", error: fallbackResult.error }
               : { state: "sent" });
           }
-          return fallbackResult.error ? result : fallbackResult;
+          if (fallbackResult.error) {
+            console.error(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback failed for target=${payload.targetAddress}, error=${fallbackResult.error}`);
+          } else {
+            console.log(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback sent for target=${payload.targetAddress}`);
+          }
+          return fallbackResult;
         }
         if (payload.promiseId) {
           markPromiseDelivered(payload.promiseId, {
@@ -2796,11 +3590,12 @@ export async function sendCronMessage(
             stage: payload.ambientStage,
             advancePolicy,
             presenceOverride: payload.mode === "repair"
-              ? "你把前面没接住的话补回来以后，心里还是会轻轻惦记着对方。"
+              ? "你把前面落空的约定补回来以后，心里还是会轻轻惦记着对方。"
               : undefined,
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
+          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {
@@ -2814,7 +3609,14 @@ export async function sendCronMessage(
       console.log(`[${timestamp}] [qqbot] sendCronMessage: sending proactive message to targetTo=${targetTo}`);
       
       // 发送提醒内容
-      const result = await sendProactiveMessage(account, targetTo, deliveryText || payload.content);
+      const result = await sendText({
+        account,
+        accountId: account.accountId,
+        to: targetTo,
+        text: deliveryText || payload.content,
+        replyToId: null,
+        skipContextRender: true,
+      });
       if (result.skipped) {
         console.log(
           `[${timestamp}] [qqbot] sendCronMessage: proactive message skipped, skipReason=${result.skipReason ?? "duplicate"}`
@@ -2842,11 +3644,12 @@ export async function sendCronMessage(
             stage: payload.ambientStage,
             advancePolicy,
             presenceOverride: payload.mode === "repair"
-              ? "你把前面没接住的话补回来以后，心里还是会轻轻惦记着对方。"
+              ? "你把前面落空的约定补回来以后，心里还是会轻轻惦记着对方。"
               : undefined,
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
+          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText || payload.content, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {

@@ -29,12 +29,14 @@ try {
     markPromiseDelivered,
     markPromiseScheduled,
     markPromiseScheduleFailed,
+    markProactiveDelivered,
     prepareAmbientLifePayload,
     prepareRepairDelivery,
     recordAssistantReply,
     recordInboundInteraction,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
+  const { resolveCronDeliveryFallbackText } = await import("../dist/src/outbound.js");
 
   const parse = (text) => parseAssistantPromises(text, {
     now: new Date(base),
@@ -66,12 +68,12 @@ try {
   assert.ok(repair, "repair payload should exist for a schedule-failed promise");
   assert.equal(repair.promiseId, failedPromise.id, "repair should target the failed promise");
   assert.equal(repair.advancePolicy, "hold", "repair should hold scene advancement");
-  assert.match(repair.content, /没接住|补/, "repair content should acknowledge the miss lightly");
+  assert.match(repair.content, /落空|补|答应/, "repair content should acknowledge the miss lightly");
   const ambientRepair = prepareAmbientLifePayload(repairContext, base + 2_000);
   assert.equal(ambientRepair.mode, "repair", "ambient payload should directly surface repair candidates");
   assert.equal(ambientRepair.promiseId, failedPromise.id, "ambient repair should keep the promise id");
   assert.equal(ambientRepair.advancePolicy, "hold", "ambient repair should hold scene advancement");
-  assert.match(ambientRepair.content, /没接住|补/, "ambient repair content should stay repair-oriented");
+  assert.match(ambientRepair.content, /落空|补|答应/, "ambient repair content should stay repair-oriented");
 
   const followContext = directContext("user-follow-limit", "repair-m-2");
   const followPromise = createPromise(followContext, "拉钩，明天早上九点我来找你说早安。", 10_000);
@@ -103,6 +105,31 @@ try {
   const cancelled = cancelPromisesFromUserMessage(cancelContext, "不用发自拍了", base + 31_000);
   assert.equal(cancelled.cancelledPromises.length, 1, "selfie promise should be cancelled");
   assert.equal(shouldSendPromiseFollowUp(selfiePromise.id, base, base + 32_000), false, "follow-up should stop after cancellation");
+
+  const ambientContext = directContext("user-ambient-advance", "repair-m-5");
+  recordInboundInteraction(ambientContext, "早安，醒了吗", base + 40_000);
+  const firstAmbient = prepareAmbientLifePayload(ambientContext, base + 41_000);
+  assert.equal(firstAmbient.stage, 0, "new ambient thread should start at stage zero");
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。"),
+    firstAmbient.content,
+    "ambient fallback should prefer the current payload seed over transcript template text",
+  );
+  markProactiveDelivered("acct-test:direct:user-ambient-advance", {
+    at: base + 42_000,
+    content: "早，已经醒了。我先去把窗帘拉开。",
+    threadId: firstAmbient.threadId,
+    stage: firstAmbient.stage,
+    advancePolicy: "advance",
+  });
+  const secondAmbient = prepareAmbientLifePayload(ambientContext, base + 43_000);
+  assert.equal(secondAmbient.stage, 1, "delivered proactive ambient messages should advance the next stage");
 
   console.log("[qqbot:test] asuka-repair fixtures passed");
 } finally {

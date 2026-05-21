@@ -49,7 +49,7 @@ const SOFT_TRIGGER_PATTERNS: Array<{ phrase: string; regex: RegExp }> = [
 
 function stripPayloadArtifacts(text: string): string {
   return text
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(/Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
     .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
     .replace(/!\[[^\]]*]\([^)]+\)/g, "")
     .replace(/https?:\/\/\S+/g, "")

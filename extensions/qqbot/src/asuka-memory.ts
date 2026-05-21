@@ -76,9 +76,9 @@ const RECENT_SELF_THREAD_PROMPT_MS = 2 * DAY_MS;
 const SELF_THREAD_FRESHNESS_MS = RECENT_SELF_THREAD_PROMPT_MS;
 const cache: { state: AsukaMemoryStateFile | null } = { state: null };
 
-const STRUCTURED_ARTIFACT_RE = /QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 const MEDIA_TAG_RE = /<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
-const INTERNAL_LEAK_RE = /(asuka-selfie|QQBOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|提醒已发送|根据任务描述|工具调用|调试信息|API 调用|脚本|进程状态|通道规则)/i;
+const INTERNAL_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|提醒已发送|根据任务描述|工具调用|调试信息|API 调用|脚本|进程状态|通道规则)/i;
 const SECRET_RE = /(密码|口令|验证码|token|api[_-]?key|secret|密钥|身份证|银行卡|信用卡|私钥|助记词|cookie|authorization)/i;
 const EXPLICIT_MEMORY_RE = /(记住|记得|别忘|帮我记|你要记|以后你要记得|以后记得|这点很重要|这个很重要)/;
 const USER_PROFILE_RE = /(我叫|叫我|我的名字|我是|生日|纪念日|时区|城市|住在|在.*工作|在.*上学)/;
@@ -634,12 +634,22 @@ function formatMemoryFlags(item: AsukaMemoryItem): string {
   return flags.length > 0 ? `（${flags.join("，")}）` : "";
 }
 
+function normalizePromptPerspective(text: string): string {
+  return text
+    .replace(/Asuka\s*自己/g, "我")
+    .replace(/Asuka/g, "我")
+    .replace(/用户/g, "你")
+    .replace(/对方/g, "你")
+    .replace(/(?<!其)他/g, "你")
+    .replace(/她/g, "我");
+}
+
 function formatMemoryGroup(title: string, items: AsukaMemoryItem[], limit: number): string[] {
   const selected = items.slice(0, limit);
   if (selected.length === 0) return [];
   return [
     `${title}:`,
-    ...selected.map((item) => `- ${item.text}${formatMemoryFlags(item)}`),
+    ...selected.map((item) => `- ${normalizePromptPerspective(item.text)}${formatMemoryFlags(item)}`),
   ];
 }
 
@@ -949,10 +959,10 @@ export function buildAsukaLongTermMemoryPrompt(
     "- 使用原则: 只在和本轮自然相关时轻轻带上，不要像背档案，也不要逐条复述。",
     "- 自我生活线只作为轻量连续性线索；不要把它扩写成完整履历、固定日程或无关新设定。",
     "- 如果本轮涉及承诺/补救/用户明确请求，以承诺/补救/请求优先，自我生活线只能辅助语气。",
-    ...formatMemoryGroup("关于对方", userFacts, 5),
+    ...formatMemoryGroup("关于你", userFacts, 5),
     ...formatMemoryGroup("关系里的事", relationship, 3),
     ...formatMemoryGroup("未完话题", active, 2),
-    ...formatMemoryGroup("Asuka 自我生活线和稳定偏好", selfThreads, 2),
+    ...formatMemoryGroup("我的生活线和稳定偏好", selfThreads, 2),
   ];
 
   for (const item of memories.slice(0, 10)) {

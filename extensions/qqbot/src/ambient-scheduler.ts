@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { addCronJobDirectFromArgs, execOpenClaw } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { markAmbientScheduled, prepareAmbientLifePayload, shouldScheduleAmbientForPeer } from "./asuka-state.js";
-
-const execFileAsync = promisify(execFile);
 
 interface LoggerLike {
   info?: (msg: string) => void;
@@ -20,9 +17,10 @@ function plusHours(source: Date, hours: number): Date {
 }
 
 async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string | null> {
+  const env = getQQBotLocalOpenClawEnv();
   try {
-    const { stdout, stderr } = await execFileAsync("openclaw", args, {
-      env: getQQBotLocalOpenClawEnv(),
+    const { stdout, stderr } = await execOpenClaw(args, {
+      env,
       maxBuffer: 1024 * 1024,
     });
     if (stderr?.trim()) {
@@ -31,7 +29,14 @@ async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string |
     const parsed = JSON.parse(stdout) as { id?: string };
     return parsed.id ?? null;
   } catch (error) {
-    log?.warn?.(`[asuka-ambient] Failed to add ambient job: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    log?.warn?.(`[asuka-ambient] Failed to add ambient job through CLI: ${message}`);
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) {
+      log?.info?.(`[asuka-ambient] Added ambient job through direct cron store fallback: ${direct.jobId}`);
+      return direct.jobId;
+    }
+    log?.warn?.(`[asuka-ambient] Direct cron store fallback failed: ${direct.error}`);
     return null;
   }
 }

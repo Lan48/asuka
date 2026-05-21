@@ -88,6 +88,16 @@ metadata: {"openclaw":{"emoji":"📸","requires":{"config":["channels.qqbot"]}}}
 
 注意：语音发送需要有可用的音频文件（通常由 TTS 工具生成）。**如果会话上下文中的【语音消息说明】提示 TTS 未配置，则不要使用 `<qqvoice>` 标签。**
 
+当 QQBot 会话提示插件 TTS 已启用时，可以输出 `QQBOT_PAYLOAD` 的 `audio` 载荷，由插件把 `path` 文本转成 QQ 语音。MiniMax TTS 支持在朗读文本内插入停顿和少量语气词控制标签，例如：
+
+```text
+QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"(sighs)我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"languageBoost":"Chinese"}}
+```
+
+- 停顿标签写作 `<#0.4#>` 这类形式，只放在 `path` 朗读文本里
+- 可少量使用 `(laughs)`、`(sighs)`、`(emm)`、`(breath)` 等 MiniMax 语气词标签，只放在 `path` 朗读文本里
+- `caption` 写用户可见补充，不要重复完整朗读文本，也不要放 TTS 控制标签
+
 ## 发送视频
 
 使用 `<qqvideo>` 标签包裹**视频路径或公网 URL** 即可发送视频：

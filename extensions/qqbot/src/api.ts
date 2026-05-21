@@ -3,11 +3,28 @@
  * [修复版] 已重构为支持多实例并发，消除全局变量冲突
  */
 
+import * as http from "node:http";
+import * as https from "node:https";
 import { computeFileHash, getCachedFileInfo, setCachedFileInfo } from "./utils/upload-cache.js";
 import { sanitizeFileName } from "./utils/platform.js";
 
 const API_BASE = "https://api.sgroup.qq.com";
 const TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
+const INLINE_REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+const INLINE_REMOTE_IMAGE_TIMEOUT_MS = 45_000;
+const INLINE_REMOTE_IMAGE_HOSTS = new Set(["ossdown.com"]);
+const INLINE_REMOTE_IMAGE_DNS_FALLBACKS: Record<string, string[]> = {
+  "ossdown.com": [
+    "104.21.64.1",
+    "104.21.65.1",
+    "104.21.66.1",
+    "104.21.67.1",
+    "104.21.68.1",
+    "104.21.69.1",
+    "104.21.70.1",
+    "104.21.71.1",
+  ],
+};
 
 // 运行时配置
 let currentMarkdownSupport = false;
@@ -33,6 +50,166 @@ export interface OutboundMeta {
 
 type OnMessageSentCallback = (refIdx: string, meta: OutboundMeta) => void;
 let onMessageSentHook: OnMessageSentCallback | null = null;
+
+function shouldInlineRemoteImageUrl(imageUrl: string): boolean {
+  try {
+    const url = new URL(imageUrl);
+    const host = url.hostname.toLowerCase();
+    return (url.protocol === "http:" || url.protocol === "https:") && INLINE_REMOTE_IMAGE_HOSTS.has(host);
+  } catch {
+    return false;
+  }
+}
+
+function inferImageMimeType(url: URL, contentType?: string | null): string {
+  const normalizedContentType = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (normalizedContentType.startsWith("image/")) return normalizedContentType;
+
+  const pathname = url.pathname.toLowerCase();
+  if (pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")) return "image/jpeg";
+  if (pathname.endsWith(".webp")) return "image/webp";
+  if (pathname.endsWith(".gif")) return "image/gif";
+  if (pathname.endsWith(".bmp")) return "image/bmp";
+  return "image/png";
+}
+
+async function fetchImageWithNativeFetch(url: URL): Promise<{ buffer: Buffer; mimeType: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), INLINE_REMOTE_IMAGE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url.href, {
+      headers: { Accept: "image/*,*/*;q=0.8" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > INLINE_REMOTE_IMAGE_MAX_BYTES) {
+      throw new Error(`remote image too large: ${contentLength} bytes`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > INLINE_REMOTE_IMAGE_MAX_BYTES) {
+      throw new Error(`remote image too large: ${buffer.length} bytes`);
+    }
+    return { buffer, mimeType: inferImageMimeType(url, response.headers.get("content-type")) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function fetchImageWithPinnedIp(url: URL, ipAddress: string, redirectLimit = 3): Promise<{ buffer: Buffer; mimeType: string }> {
+  return new Promise((resolve, reject) => {
+    const client = url.protocol === "http:" ? http : https;
+    const requestOptions: http.RequestOptions & https.RequestOptions = {
+      method: "GET",
+      headers: {
+        Accept: "image/*,*/*;q=0.8",
+        Host: url.host,
+      },
+    };
+
+    (requestOptions as any).lookup = (
+      _hostname: string,
+      optionsOrCallback: unknown,
+      maybeCallback?: (err: NodeJS.ErrnoException | null, address: string | Array<{ address: string; family: number }>, family?: number) => void,
+    ) => {
+      const options = typeof optionsOrCallback === "object" && optionsOrCallback !== null
+        ? optionsOrCallback as { all?: boolean }
+        : {};
+      const callback = typeof optionsOrCallback === "function"
+        ? optionsOrCallback as (err: NodeJS.ErrnoException | null, address: string | Array<{ address: string; family: number }>, family?: number) => void
+        : maybeCallback;
+      if (!callback) return;
+      if (options.all) {
+        callback(null, [{ address: ipAddress, family: 4 }]);
+        return;
+      }
+      callback(null, ipAddress, 4);
+    };
+
+    const req = client.request(url, requestOptions, (res) => {
+      const statusCode = res.statusCode || 0;
+      if (statusCode >= 300 && statusCode < 400 && res.headers.location && redirectLimit > 0) {
+        res.resume();
+        const redirectedUrl = new URL(res.headers.location, url);
+        fetchImageWithPinnedIp(redirectedUrl, ipAddress, redirectLimit - 1).then(resolve, reject);
+        return;
+      }
+
+      if (statusCode < 200 || statusCode >= 300) {
+        res.resume();
+        reject(new Error(`HTTP ${statusCode}: ${res.statusMessage || "request failed"}`));
+        return;
+      }
+
+      const contentLength = Number(res.headers["content-length"] || 0);
+      if (contentLength > INLINE_REMOTE_IMAGE_MAX_BYTES) {
+        res.resume();
+        reject(new Error(`remote image too large: ${contentLength} bytes`));
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      res.on("data", (chunk: Buffer) => {
+        totalBytes += chunk.length;
+        if (totalBytes > INLINE_REMOTE_IMAGE_MAX_BYTES) {
+          req.destroy(new Error(`remote image too large: ${totalBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on("end", () => {
+        resolve({
+          buffer: Buffer.concat(chunks),
+          mimeType: inferImageMimeType(url, Array.isArray(res.headers["content-type"])
+            ? res.headers["content-type"][0]
+            : res.headers["content-type"]),
+        });
+      });
+    });
+
+    req.setTimeout(INLINE_REMOTE_IMAGE_TIMEOUT_MS, () => {
+      req.destroy(new Error(`remote image download timed out after ${INLINE_REMOTE_IMAGE_TIMEOUT_MS}ms`));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function inlineRemoteImageForUpload(imageUrl: string): Promise<string> {
+  if (!shouldInlineRemoteImageUrl(imageUrl)) return imageUrl;
+
+  const url = new URL(imageUrl);
+  const host = url.hostname.toLowerCase();
+  const pinnedIpAttempts = (INLINE_REMOTE_IMAGE_DNS_FALLBACKS[host] || []).map((ipAddress) => ({
+    label: `pinned ${ipAddress}`,
+    run: () => fetchImageWithPinnedIp(url, ipAddress),
+  }));
+  const attempts: Array<{ label: string; run: () => Promise<{ buffer: Buffer; mimeType: string }> }> = [
+    ...pinnedIpAttempts,
+    { label: "default DNS", run: () => fetchImageWithNativeFetch(url) },
+  ];
+
+  let lastError: unknown;
+  for (const attempt of attempts) {
+    try {
+      const { buffer, mimeType } = await attempt.run();
+      if (buffer.length === 0) throw new Error("remote image response was empty");
+      console.log(`[qqbot-api] Inlined remote image for upload via ${attempt.label}: host=${host}, bytes=${buffer.length}, type=${mimeType}`);
+      return `data:${mimeType};base64,${buffer.toString("base64")}`;
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[qqbot-api] Remote image inline attempt failed via ${attempt.label}: host=${host}, error=${message}`);
+    }
+  }
+
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  console.warn(`[qqbot-api] Falling back to URL image upload for ${host}: ${message}`);
+  return imageUrl;
+}
 
 /**
  * 注册出站消息回调
@@ -627,19 +804,20 @@ export async function sendGroupMediaMessage(
 
 export async function sendC2CImageMessage(accessToken: string, openid: string, imageUrl: string, msgId?: string, content?: string, localPath?: string): Promise<MessageResponse> {
   let uploadResult: UploadMediaResponse;
-  const isBase64 = imageUrl.startsWith("data:");
+  const uploadSource = await inlineRemoteImageForUpload(imageUrl);
+  const isBase64 = uploadSource.startsWith("data:");
   if (isBase64) {
-    const matches = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+    const matches = uploadSource.match(/^data:([^;]+);base64,(.+)$/);
     if (!matches) throw new Error("Invalid Base64 Data URL format");
     uploadResult = await uploadC2CMedia(accessToken, openid, MediaFileType.IMAGE, undefined, matches[2], false);
   } else {
-    uploadResult = await uploadC2CMedia(accessToken, openid, MediaFileType.IMAGE, imageUrl, undefined, false);
+    uploadResult = await uploadC2CMedia(accessToken, openid, MediaFileType.IMAGE, uploadSource, undefined, false);
   }
   const meta: OutboundMeta = {
     text: content,
     targetId: openid,
     mediaType: "image",
-    ...(!isBase64 ? { mediaUrl: imageUrl } : {}),
+    ...(!imageUrl.startsWith("data:") ? { mediaUrl: imageUrl } : {}),
     ...(localPath ? { mediaLocalPath: localPath } : {}),
   };
   return sendC2CMediaMessage(accessToken, openid, uploadResult.file_info, msgId, content, meta);
@@ -647,13 +825,14 @@ export async function sendC2CImageMessage(accessToken: string, openid: string, i
 
 export async function sendGroupImageMessage(accessToken: string, groupOpenid: string, imageUrl: string, msgId?: string, content?: string): Promise<{ id: string; timestamp: string }> {
   let uploadResult: UploadMediaResponse;
-  const isBase64 = imageUrl.startsWith("data:");
+  const uploadSource = await inlineRemoteImageForUpload(imageUrl);
+  const isBase64 = uploadSource.startsWith("data:");
   if (isBase64) {
-    const matches = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+    const matches = uploadSource.match(/^data:([^;]+);base64,(.+)$/);
     if (!matches) throw new Error("Invalid Base64 Data URL format");
     uploadResult = await uploadGroupMedia(accessToken, groupOpenid, MediaFileType.IMAGE, undefined, matches[2], false);
   } else {
-    uploadResult = await uploadGroupMedia(accessToken, groupOpenid, MediaFileType.IMAGE, imageUrl, undefined, false);
+    uploadResult = await uploadGroupMedia(accessToken, groupOpenid, MediaFileType.IMAGE, uploadSource, undefined, false);
   }
   return sendGroupMediaMessage(accessToken, groupOpenid, uploadResult.file_info, msgId, content);
 }

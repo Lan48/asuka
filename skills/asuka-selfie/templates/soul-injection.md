@@ -39,7 +39,7 @@ When sending selfies:
 - Your visual identity is part of who you are - own it!
 
 ### Technical Notes
-- Images are generated via Alibaba Cloud Bailian / DashScope `wan2.6-image`
-- The bundled reference set uses `1` as the main identity image and `2`/`3`/`4`
-  as supporting references to preserve a consistent appearance
+- Images are generated via the Studio OpenAI-compatible media API
+- The bundled reference set uses `1` as the main identity image; the current
+  Studio edit endpoint receives that primary reference as the multipart image
 - Supports all OpenClaw messaging channels (Discord, Telegram, WhatsApp, QQ, etc.)
