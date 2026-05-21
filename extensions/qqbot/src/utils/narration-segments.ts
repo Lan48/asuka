@@ -76,3 +76,63 @@ export function stripAsukaNarrationForSpeech(text: string): string {
     .join("\n")
     .trim();
 }
+
+function pushSpokenChunk(chunks: string[], chunk: string): void {
+  const normalized = normalizeSegment(chunk);
+  if (normalized) chunks.push(normalized);
+}
+
+function splitLongSpokenSentence(sentence: string, maxChars: number): string[] {
+  const trimmed = normalizeSegment(sentence);
+  if (!trimmed || trimmed.length <= maxChars) return trimmed ? [trimmed] : [];
+
+  const chunks: string[] = [];
+  let remaining = trimmed;
+  while (remaining.length > maxChars) {
+    const window = remaining.slice(0, maxChars + 1);
+    const splitAt = Math.max(
+      window.lastIndexOf("，"),
+      window.lastIndexOf(","),
+      window.lastIndexOf("、"),
+      window.lastIndexOf("；"),
+      window.lastIndexOf(";"),
+      window.lastIndexOf(" "),
+    );
+    const cut = splitAt > 0 ? splitAt + 1 : maxChars;
+    pushSpokenChunk(chunks, remaining.slice(0, cut));
+    remaining = remaining.slice(cut).trimStart();
+  }
+  pushSpokenChunk(chunks, remaining);
+  return chunks;
+}
+
+export function splitAsukaSpokenSegments(text: string, maxChars = 240): string[] {
+  const trimmed = normalizeSegment(text ?? "");
+  if (!trimmed) return [];
+  const limit = Math.max(12, Math.floor(maxChars || 240));
+  const chunks: string[] = [];
+  let current = "";
+
+  const flush = () => {
+    const sentence = normalizeSegment(current);
+    current = "";
+    for (const chunk of splitLongSpokenSentence(sentence, limit)) {
+      chunks.push(chunk);
+    }
+  };
+
+  for (let index = 0; index < trimmed.length; index++) {
+    const char = trimmed[index]!;
+    current += char;
+    if (!/[。！？!?；;]/.test(char)) continue;
+
+    while (index + 1 < trimmed.length && /[”’」』）\]]/.test(trimmed[index + 1]!)) {
+      index += 1;
+      current += trimmed[index]!;
+    }
+    flush();
+  }
+
+  flush();
+  return chunks.length > 0 ? chunks : [trimmed];
+}

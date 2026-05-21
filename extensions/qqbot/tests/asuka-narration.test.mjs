@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 const {
   isAsukaNarrationSegment,
   splitAsukaNarrationSegments,
+  splitAsukaSpokenSegments,
   stripAsukaNarrationForSpeech,
 } = await import("../dist/src/utils/narration-segments.js");
 
@@ -68,6 +69,18 @@ assert.equal(
   stripAsukaNarrationForSpeech("（低头看了一眼自己还剩小半杯的酒杯，没忍住笑出来）"),
   "",
   "pure narration should never be sent to TTS",
+);
+
+assert.deepEqual(
+  splitAsukaSpokenSegments("我在。先抱一下你。你慢慢说。", 40),
+  ["我在。", "先抱一下你。", "你慢慢说。"],
+  "spoken TTS text should split every sentence into its own voice item",
+);
+
+assert.deepEqual(
+  splitAsukaSpokenSegments("这句很长很长，已经超过限制，所以需要在逗号附近拆开继续说。", 18),
+  ["这句很长很长，已经超过限制，", "所以需要在逗号附近拆开继续说。"],
+  "long spoken sentences should be chunked before TTS length validation",
 );
 
 console.log("[qqbot:test] asuka-narration fixtures passed");

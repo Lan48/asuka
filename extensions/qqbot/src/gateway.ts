@@ -17,7 +17,7 @@ import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
-import { isAsukaNarrationSegment, splitAsukaNarrationSegments, stripAsukaNarrationForSpeech } from "./utils/narration-segments.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments, stripAsukaNarrationForSpeech } from "./utils/narration-segments.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
@@ -3057,6 +3057,8 @@ ${ttsHint}${sttHint}`;
           const sendMixedTTSReplySegments = async (text: string, tts?: MediaPayload["tts"]): Promise<boolean> => {
             const rawText = filterInternalMarkers(text).trim();
             if (!cleanOutgoingTextSegment(rawText)) return false;
+            const baseTtsCfg = resolveTTSConfig(cfg as Record<string, unknown>);
+            const maxSpeechChars = baseTtsCfg?.maxInputChars ?? 240;
 
             let sentAny = false;
             for (const segment of splitAsukaNarrationSegments(rawText)) {
@@ -3068,11 +3070,15 @@ ${ttsHint}${sttHint}`;
                 continue;
               }
 
-              const sentVoice = await sendTTSReplyText(segment, tts);
-              if (!sentVoice) {
-                await sendVisibleReplyText(visibleSegment);
+              for (const spokenSegment of splitAsukaSpokenSegments(segment, maxSpeechChars)) {
+                const visibleSpokenSegment = cleanOutgoingTextSegment(spokenSegment);
+                if (!visibleSpokenSegment) continue;
+                const sentVoice = await sendTTSReplyText(spokenSegment, tts);
+                if (!sentVoice) {
+                  await sendVisibleReplyText(visibleSpokenSegment);
+                }
+                sentAny = true;
               }
-              sentAny = true;
             }
             return sentAny;
           };

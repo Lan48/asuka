@@ -35,7 +35,7 @@ import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
 import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
-import { isAsukaNarrationSegment, splitAsukaNarrationSegments } from "./utils/narration-segments.js";
+import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments } from "./utils/narration-segments.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 import { isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
@@ -802,21 +802,23 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
           continue;
         }
 
-        const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(segment), stableTts);
-        const visibleSpokenText = stripTTSControlMarkers(segment) || segment;
-        console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
-        const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
-        console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
+        for (const spokenSegment of splitAsukaSpokenSegments(segment, runtimeTtsCfg.maxInputChars ?? 240)) {
+          const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(spokenSegment), stableTts);
+          const visibleSpokenText = stripTTSControlMarkers(spokenSegment) || spokenSegment;
+          console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
+          const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
+          console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
 
-        let result: { id: string; timestamp: number | string };
-        if (target.type === "c2c") {
-          result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleSpokenText);
-        } else if (target.type === "group") {
-          result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
-        } else {
-          result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleSpokenText}`, ctx.replyToId ?? undefined);
+          let result: { id: string; timestamp: number | string };
+          if (target.type === "c2c") {
+            result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleSpokenText);
+          } else if (target.type === "group") {
+            result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+          } else {
+            result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleSpokenText}`, ctx.replyToId ?? undefined);
+          }
+          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
         }
-        lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
       }
 
       return lastResult;
