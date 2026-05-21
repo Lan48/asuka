@@ -425,7 +425,11 @@ function isMiniMaxTTSConfig(ttsCfg: TTSConfig): boolean {
     || /^speech-/i.test(ttsCfg.model);
 }
 
-function enforceTTSRequestLimits(text: string, ttsCfg: TTSConfig): void {
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function enforceTTSRequestLimits(text: string, ttsCfg: TTSConfig): Promise<void> {
   const maxInputChars = ttsCfg.maxInputChars ?? DEFAULT_TTS_MAX_INPUT_CHARS;
   if (text.length > maxInputChars) {
     throw new Error(`TTS input too long: ${text.length}/${maxInputChars} chars`);
@@ -439,9 +443,10 @@ function enforceTTSRequestLimits(text: string, ttsCfg: TTSConfig): void {
   const last = ttsLastRequestByKey.get(key) ?? 0;
   const remainingMs = cooldownMs - (now - last);
   if (remainingMs > 0) {
-    throw new Error(`TTS cooldown active: wait ${Math.ceil(remainingMs / 1000)}s`);
+    console.log(`[tts] Cooldown wait: ${remainingMs}ms for ${ttsCfg.model}/${ttsCfg.voice}`);
+    await sleep(remainingMs);
   }
-  ttsLastRequestByKey.set(key, now);
+  ttsLastRequestByKey.set(key, Date.now());
 }
 
 function normalizeMiniMaxSpeed(speed?: number): number {
@@ -588,7 +593,7 @@ export async function textToSpeechPCM(
   text: string,
   ttsCfg: TTSConfig,
 ): Promise<{ pcmBuffer: Buffer; sampleRate: number }> {
-  enforceTTSRequestLimits(text, ttsCfg);
+  await enforceTTSRequestLimits(text, ttsCfg);
   if (isMiniMaxTTSConfig(ttsCfg)) {
     return textToSpeechPCMMiniMax(text, ttsCfg);
   }

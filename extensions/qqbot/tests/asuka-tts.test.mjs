@@ -221,4 +221,37 @@ try {
   globalThis.fetch = originalFetch;
 }
 
+let cooldownRequestCount = 0;
+const cooldownTtsConfig = {
+  ...ttsConfig,
+  model: "speech-2.8-hd-cooldown-fixture",
+  cooldownMs: 25,
+};
+
+globalThis.fetch = async () => {
+  cooldownRequestCount++;
+  return new Response(JSON.stringify({
+    data: {
+      audio: makePcmWavHex(),
+    },
+    base_resp: {
+      status_code: 0,
+      status_msg: "success",
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+};
+
+try {
+  const startedAt = Date.now();
+  await textToSpeechPCM("第一句", cooldownTtsConfig);
+  await textToSpeechPCM("第二句", cooldownTtsConfig);
+  assert.equal(cooldownRequestCount, 2, "TTS cooldown should queue follow-up sentences instead of dropping them");
+  assert.ok(Date.now() - startedAt >= 20, "TTS cooldown should wait before the next provider request");
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
 console.log("[qqbot:test] asuka-tts fixtures passed");
