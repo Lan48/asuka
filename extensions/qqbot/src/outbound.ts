@@ -232,6 +232,7 @@ export interface OutboundContext {
   accountId?: string | null;
   replyToId?: string | null;
   account: ResolvedQQBotAccount;
+  skipContextRender?: boolean;
 }
 
 export interface MediaOutboundContext extends OutboundContext {
@@ -355,6 +356,27 @@ function buildPeerContextFromCronPayload(account: ResolvedQQBotAccount, payload:
     senderId: payload.targetAddress,
     target: `qqbot:c2c:${payload.targetAddress}`,
   };
+}
+
+function buildDirectProactivePayload(account: ResolvedQQBotAccount, targetAddress: string, content: string): DecodedCronPayload {
+  return {
+    type: "cron_reminder",
+    mode: "ambient",
+    content,
+    targetType: "c2c",
+    targetAddress,
+    peerKey: `${account.accountId}:direct:${targetAddress}`,
+    advancePolicy: "hold",
+  };
+}
+
+function shouldRenderDirectProactiveWithSharedContext(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 240) return false;
+  if (/<(?:qqimg|qqvoice|qqvideo|qqfile)>/i.test(trimmed)) return false;
+  if (/Q{1,2}BOT_(?:PAYLOAD|CRON):/i.test(trimmed)) return false;
+  return true;
 }
 
 function buildProactiveMemoryCue(
@@ -583,7 +605,7 @@ async function maybeSendRepairBeforeProactive(
       return;
     }
   } else {
-    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText);
+    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText, { skipContextRender: true });
     if (repairResult.skipped) {
       console.log(
         `[${timestamp}] [qqbot] sendCronMessage: repair delivery skipped for promise=${repair.promiseId}, skipReason=${repairResult.skipReason ?? "duplicate"}`
@@ -1944,6 +1966,19 @@ async function renderDeliveryTextFromSharedSession(
   }
 }
 
+async function renderDirectProactiveTextFromSharedSession(
+  account: ResolvedQQBotAccount,
+  targetAddress: string,
+  text: string,
+): Promise<string | null> {
+  if (!shouldRenderDirectProactiveWithSharedContext(text)) return null;
+  const payload = buildDirectProactivePayload(account, targetAddress, text);
+  const generated = await renderDeliveryTextFromSharedSession(account, payload);
+  if (!generated) return null;
+  console.log(`[qqbot] renderDirectProactiveTextFromSharedSession: rewrote direct proactive text "${text.slice(0, 80)}" -> "${generated.slice(0, 160)}"`);
+  return generated;
+}
+
 async function renderPromiseDeliveryText(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -2379,7 +2414,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
                 lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
               }
             } else {
-              lastResult = await sendProactiveMessage(account, to, segment);
+              lastResult = await sendProactiveMessage(account, to, segment, { skipContextRender: ctx.skipContextRender });
             }
             console.log(`[qqbot] sendText: Sent text part: ${segment.slice(0, 30)}...`);
           }
@@ -2642,7 +2677,7 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   try {
     // 如果没有 replyToId，使用主动发送接口
     if (!replyToId) {
-      return await sendProactiveMessage(account, to, text);
+      return await sendProactiveMessage(account, to, text, { skipContextRender: ctx.skipContextRender });
     }
 
     const accessToken = await getAccessToken(account.appId, account.clientSecret);
@@ -2703,7 +2738,8 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
 export async function sendProactiveMessage(
   account: ResolvedQQBotAccount,
   to: string,
-  text: string
+  text: string,
+  options?: { skipContextRender?: boolean },
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
 
@@ -2735,17 +2771,6 @@ export async function sendProactiveMessage(
     return { channel: "qqbot", error: quietHoursError };
   }
 
-  const textSegments = splitAsukaNarrationSegments(text);
-  if (textSegments.length > 1) {
-    let lastResult: OutboundResult = { channel: "qqbot" };
-    for (const segment of textSegments) {
-      const result = await sendProactiveMessage(account, to, segment);
-      if (result.error || result.skipped) return result;
-      lastResult = result;
-    }
-    return lastResult;
-  }
-
   console.log(`[${timestamp}] [qqbot] sendProactiveMessage: starting, to=${to}, text length=${text.length}, accountId=${account.accountId}`);
 
   let proactiveGuard: ProactiveSendGuard | null = null;
@@ -2754,8 +2779,31 @@ export async function sendProactiveMessage(
     const target = parseTarget(to);
     console.log(`[${timestamp}] [qqbot] sendProactiveMessage: target parsed, type=${target.type}, id=${target.id}`);
 
+    let deliveryText = text;
+    if (
+      target.type === "c2c" &&
+      !options?.skipContextRender &&
+      !cronProbe.isCronPayload
+    ) {
+      const rendered = await renderDirectProactiveTextFromSharedSession(account, target.id, text);
+      if (rendered) {
+        deliveryText = rendered;
+      }
+    }
+
+    const textSegments = splitAsukaNarrationSegments(deliveryText);
+    if (textSegments.length > 1) {
+      let lastResult: OutboundResult = { channel: "qqbot" };
+      for (const segment of textSegments) {
+        const result = await sendProactiveMessage(account, to, segment, { skipContextRender: true });
+        if (result.error || result.skipped) return result;
+        lastResult = result;
+      }
+      return lastResult;
+    }
+
     if (target.type === "c2c" || target.type === "group") {
-      proactiveGuard = await acquireProactiveSendGuard(account, target.type, target.id, text);
+      proactiveGuard = await acquireProactiveSendGuard(account, target.type, target.id, deliveryText);
       if (proactiveGuard?.skipped) {
         console.log(
           `[${timestamp}] [qqbot] sendProactiveMessage: skipped duplicate proactive message, to=${to}, skipReason=${proactiveGuard.skipReason ?? "duplicate"}`
@@ -2770,23 +2818,23 @@ export async function sendProactiveMessage(
     let outResult: OutboundResult;
     if (target.type === "c2c") {
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending proactive C2C message to user=${target.id}`);
-      const result = await sendProactiveC2CMessage(accessToken, target.id, text);
+      const result = await sendProactiveC2CMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: proactive C2C message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     } else if (target.type === "group") {
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending proactive group message to group=${target.id}`);
-      const result = await sendProactiveGroupMessage(accessToken, target.id, text);
+      const result = await sendProactiveGroupMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: proactive group message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     } else {
       // 频道暂不支持主动消息，使用普通发送
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: sending channel message to channel=${target.id}`);
-      const result = await sendChannelMessage(accessToken, target.id, text);
+      const result = await sendChannelMessage(accessToken, target.id, deliveryText);
       console.log(`[${timestamp}] [qqbot] sendProactiveMessage: channel message sent successfully, messageId=${result.id}`);
       outResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
     }
     if (proactiveGuard?.peerKey) {
-      confirmProactiveDedupDelivery(proactiveGuard.peerKey, text, { at: Date.now() });
+      confirmProactiveDedupDelivery(proactiveGuard.peerKey, deliveryText, { at: Date.now() });
     }
     return outResult;
   } catch (err) {
@@ -3499,6 +3547,7 @@ export async function sendCronMessage(
         to: targetTo,
         text: deliveryText || payload.content,
         replyToId: null,
+        skipContextRender: true,
       });
       if (result.skipped) {
         console.log(
