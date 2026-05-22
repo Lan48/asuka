@@ -1253,6 +1253,13 @@ const RATE_LIMIT_DELAY = 60000; // 遇到频率限制时等待 60 秒
 const MAX_RECONNECT_ATTEMPTS = 100;
 const MAX_QUICK_DISCONNECT_COUNT = 3; // 连续快速断开次数阈值
 const QUICK_DISCONNECT_THRESHOLD = 5000; // 5秒内断开视为快速断开
+const HEARTBEAT_ACK_TIMEOUT_GRACE_MS = 30_000;
+const HEARTBEAT_ACK_TIMEOUT_MIN_MS = 10_000;
+
+export function resolveHeartbeatAckTimeoutMs(intervalMs: number): number {
+  const safeIntervalMs = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : 45_000;
+  return Math.max(safeIntervalMs * 2, safeIntervalMs + HEARTBEAT_ACK_TIMEOUT_GRACE_MS, HEARTBEAT_ACK_TIMEOUT_MIN_MS);
+}
 
 // 图床服务器配置（可通过环境变量覆盖）
 const IMAGE_SERVER_PORT = parseInt(process.env.QQBOT_IMAGE_SERVER_PORT || "18765", 10);
@@ -1766,12 +1773,16 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   let isAborted = false;
   let currentWs: WebSocket | null = null;
   let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  let heartbeatAckTimeout: ReturnType<typeof setTimeout> | null = null;
+  let awaitingHeartbeatAckSince: number | null = null;
+  let lastHeartbeatAckAt: number | null = null;
   let sessionId: string | null = null;
   let lastSeq: number | null = null;
   let lastConnectTime: number = 0; // 上次连接成功的时间
   let quickDisconnectCount = 0; // 连续快速断开次数
   let isConnecting = false; // 防止并发连接
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null; // 重连定时器
+  let suppressNextCloseReconnect = false;
   let shouldRefreshToken = false; // 下次连接是否需要刷新 token
   let intentLevelIndex = 0; // 当前尝试的权限级别索引
   let lastSuccessfulIntentLevel = -1; // 上次成功的权限级别
@@ -2073,13 +2084,23 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     flushRefIndex();
   });
 
-  const cleanup = () => {
+  const clearHeartbeatAckWatchdog = () => {
+    if (heartbeatAckTimeout) {
+      clearTimeout(heartbeatAckTimeout);
+      heartbeatAckTimeout = null;
+    }
+    awaitingHeartbeatAckSince = null;
+  };
+
+  const cleanup = (closeCode?: number, closeReason?: string) => {
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
       heartbeatInterval = null;
     }
+    clearHeartbeatAckWatchdog();
     if (currentWs && (currentWs.readyState === WebSocket.OPEN || currentWs.readyState === WebSocket.CONNECTING)) {
-      currentWs.close();
+      const safeReason = closeReason ? closeReason.slice(0, 120) : undefined;
+      currentWs.close(closeCode, safeReason);
     }
     currentWs = null;
   };
@@ -2111,6 +2132,28 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         connect();
       }
     }, delay);
+  };
+
+  const armHeartbeatAckWatchdog = (heartbeatIntervalMs: number) => {
+    if (heartbeatAckTimeout || awaitingHeartbeatAckSince === null) return;
+    const timeoutMs = resolveHeartbeatAckTimeoutMs(heartbeatIntervalMs);
+    heartbeatAckTimeout = setTimeout(() => {
+      heartbeatAckTimeout = null;
+      const sentAt = awaitingHeartbeatAckSince;
+      const waitedMs = sentAt ? Date.now() - sentAt : timeoutMs;
+      awaitingHeartbeatAckSince = null;
+      const lastAckDetail = lastHeartbeatAckAt ? `, lastAckAgo=${Date.now() - lastHeartbeatAckAt}ms` : ", lastAck=never";
+      log?.error(`[qqbot:${account.accountId}] Heartbeat ACK timeout after ${waitedMs}ms${lastAckDetail}; reconnecting WebSocket`);
+      publishRuntimeStatus({
+        connected: false,
+        connectionState: "heartbeat_ack_timeout",
+        lastError: `Heartbeat ACK timeout after ${waitedMs}ms`,
+      });
+      suppressNextCloseReconnect = true;
+      cleanup(4000, "heartbeat ack timeout");
+      scheduleReconnect();
+    }, timeoutMs);
+    heartbeatAckTimeout.unref?.();
   };
 
   const connect = async () => {
@@ -4734,8 +4777,13 @@ ${ttsHint}${sttHint}`;
               // 启动心跳
               const interval = (d as { heartbeat_interval: number }).heartbeat_interval;
               if (heartbeatInterval) clearInterval(heartbeatInterval);
+              clearHeartbeatAckWatchdog();
               heartbeatInterval = setInterval(() => {
                 if (ws.readyState === WebSocket.OPEN) {
+                  if (awaitingHeartbeatAckSince === null) {
+                    awaitingHeartbeatAckSince = Date.now();
+                    armHeartbeatAckWatchdog(interval);
+                  }
                   ws.send(JSON.stringify({ op: 1, d: lastSeq }));
                   log?.debug?.(`[qqbot:${account.accountId}] Heartbeat sent`);
                 }
@@ -4881,7 +4929,15 @@ ${ttsHint}${sttHint}`;
               break;
 
             case 11: // Heartbeat ACK
+              lastHeartbeatAckAt = Date.now();
+              clearHeartbeatAckWatchdog();
               log?.debug?.(`[qqbot:${account.accountId}] Heartbeat ACK`);
+              publishRuntimeStatus({
+                connected: true,
+                connectionState: "heartbeat_ack",
+                lastHeartbeatAckAt,
+                lastError: null,
+              });
               break;
 
             case 7: // Reconnect
@@ -4925,6 +4981,8 @@ ${ttsHint}${sttHint}`;
       ws.on("close", (code, reason) => {
         log?.info(`[qqbot:${account.accountId}] WebSocket closed: ${code} ${reason.toString()}`);
         isConnecting = false; // 释放锁
+        const closeReconnectAlreadyScheduled = suppressNextCloseReconnect;
+        suppressNextCloseReconnect = false;
         
         // 根据错误码处理（参考 QQ 官方文档）
         // 4004: CODE_INVALID_TOKEN - Token 无效，需刷新 token 重新连接
@@ -5012,7 +5070,7 @@ ${ttsHint}${sttHint}`;
         cleanup();
         
         // 非正常关闭则重连
-        if (!isAborted && code !== 1000) {
+        if (!isAborted && code !== 1000 && !closeReconnectAlreadyScheduled) {
           scheduleReconnect();
         }
       });

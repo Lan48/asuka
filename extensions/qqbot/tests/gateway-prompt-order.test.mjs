@@ -80,6 +80,26 @@ assert.match(
   /No response within timeout[\s\S]{0,2000}sendErrorMessage/,
   "QQBot response timeout should send a user-facing fallback"
 );
+assert.match(
+  source,
+  /function resolveHeartbeatAckTimeoutMs\(intervalMs: number\)[\s\S]{0,500}Math\.max/,
+  "gateway should compute a bounded heartbeat ACK timeout"
+);
+assert.match(
+  source,
+  /Heartbeat ACK timeout after[\s\S]{0,500}reconnecting WebSocket/,
+  "gateway should reconnect when heartbeat ACKs stop arriving"
+);
+assert.match(
+  source,
+  /case 11:[\s\S]{0,250}clearHeartbeatAckWatchdog/,
+  "heartbeat ACK should clear the pending heartbeat watchdog"
+);
+assert.match(
+  source,
+  /suppressNextCloseReconnect = true;[\s\S]{0,200}cleanup\(4000, "heartbeat ack timeout"\);[\s\S]{0,120}scheduleReconnect/,
+  "heartbeat timeout reconnect should avoid duplicate close-triggered reconnect scheduling"
+);
 assert.equal(
   source.includes("消息没有稳稳发出去"),
   false,
