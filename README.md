@@ -9,6 +9,7 @@ The repository focuses on:
 - stable Asuka identity and relationship behavior in `workspace/`
 - QQ bot integration in `extensions/qqbot/`
 - selfie generation prompts and scripts in `skills/asuka-selfie/`
+- image prompt quality guidance in `skills/imagegen/`
 - local browser/canvas experiments in `canvas/`
 
 ## Character Direction
@@ -32,6 +33,7 @@ posture without stage exaggeration.
 - `workspace/SOUL.md` - runtime behavior, relationship tone, and selfie rules
 - `workspace/AGENTS.md` - workspace startup and operating instructions
 - `skills/asuka-selfie/` - local Studio OpenAI-compatible media selfie skill
+- `skills/imagegen/` - prompt-quality guidance layered on top of `asuka-selfie`
 - `extensions/qqbot/` - QQ bot extension source and runtime integration
 
 ## Local Configuration
@@ -55,6 +57,7 @@ Useful checks from this workspace:
 ```bash
 node -e "JSON.parse(require('fs').readFileSync('openclaw.json','utf8'))"
 node --check skills/asuka-selfie/bin/cli.js
+test -f skills/imagegen/SKILL.md
 bash -n skills/asuka-selfie/scripts/asuka-selfie.sh
 bash -n skills/asuka-selfie/skill/scripts/asuka-selfie.sh
 cd extensions/qqbot && ./node_modules/.bin/tsc --pretty false
@@ -155,6 +158,7 @@ Relevant config paths:
 
 - `models.providers.minimax` - shared MiniMax `baseUrl`, `apiKey`, and text model.
 - `skills.entries.asuka-selfie.env` - `image-01` generation for Asuka images.
+- `skills.entries.imagegen` - prompt-quality guidance for image requests.
 - `channels.qqbot.tts` - MiniMax `speech-2.8-hd`; default voice is `Chinese (Mandarin)_Laid_BackGirl`.
 - `channels.qqbot.minimax.vision` - inbound image understanding limits and supported types.
 - `channels.qqbot.minimax.search` - freshness-gated web search limits.
