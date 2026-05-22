@@ -1453,6 +1453,41 @@ export interface GatewayContext {
   };
 }
 
+let gatewayProcessDiagnosticsInstalled = false;
+
+function formatGatewayDiagnosticValue(value: unknown): string {
+  if (value instanceof Error) {
+    return value.stack || `${value.name}: ${value.message}`;
+  }
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function installGatewayProcessDiagnostics(log: GatewayContext["log"] | undefined, accountId: string): void {
+  if (gatewayProcessDiagnosticsInstalled) return;
+  gatewayProcessDiagnosticsInstalled = true;
+
+  process.on("uncaughtExceptionMonitor", (err, origin) => {
+    log?.error(`[qqbot:${accountId}] process uncaughtExceptionMonitor origin=${origin}: ${formatGatewayDiagnosticValue(err)}`);
+  });
+  process.on("unhandledRejection", (reason) => {
+    log?.error(`[qqbot:${accountId}] process unhandledRejection: ${formatGatewayDiagnosticValue(reason)}`);
+  });
+  process.on("warning", (warning) => {
+    log?.info(`[qqbot:${accountId}] process warning: ${formatGatewayDiagnosticValue(warning)}`);
+  });
+  process.on("beforeExit", (code) => {
+    log?.info(`[qqbot:${accountId}] process beforeExit code=${code}`);
+  });
+  process.on("exit", (code) => {
+    log?.info(`[qqbot:${accountId}] process exit code=${code}`);
+  });
+}
+
 /**
  * 消息队列项类型（用于异步处理消息，防止阻塞心跳）
  */
@@ -1617,6 +1652,7 @@ async function ensureImageServer(log?: GatewayContext["log"], publicBaseUrl?: st
  */
 export async function startGateway(ctx: GatewayContext): Promise<void> {
   const { account, abortSignal, cfg, onReady, onError, onStatus, log } = ctx;
+  installGatewayProcessDiagnostics(log, account.accountId);
 
   if (!account.appId || !account.clientSecret) {
     throw new Error("QQBot not configured (missing appId or clientSecret)");
@@ -3171,6 +3207,9 @@ ${ttsHint}${sttHint}`;
             userFacingDeliverClaimed = true;
             return true;
           };
+          log?.info(
+            `[qqbot:${account.accountId}] Dispatch starting: sessionKey=${route.sessionKey}, agentId=${route.agentId ?? "default"}, bodyLength=${agentBody.length}, images=${imageUrls.length}, localMedia=${localMediaPaths.length}`
+          );
           const dispatchPromise = pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg: cfgForCompanionThinking,
@@ -4483,6 +4522,9 @@ ${ttsHint}${sttHint}`;
             },
           }).finally(() => {
             dispatchCompleted = true;
+            log?.info(
+              `[qqbot:${account.accountId}] Dispatch settled after ${Date.now() - dispatchStartedAt}ms, hasResponse=${hasResponse}, hasBlockResponse=${hasBlockResponse}, toolDeliverCount=${toolDeliverCount}`
+            );
           });
 
           // 等待分发完成或超时
