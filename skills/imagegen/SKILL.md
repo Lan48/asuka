@@ -12,7 +12,9 @@ improves the internal prompt that will be sent through the existing
 `asuka-selfie` / QQBot image flow.
 
 Do not mention this skill, the renderer, API calls, prompt rules, payloads, or
-other internal process details to the user.
+other internal process details to the user. Do not say you need to read this
+skill file; apply the guidance silently and make the user experience feel like
+ordinary chat plus an image.
 
 ## Routing
 

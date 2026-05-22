@@ -21,6 +21,8 @@ const DEFAULT_DAILY_DIGEST_STARTUP_DELAY_MS = 90_000;
 const DEFAULT_DAILY_DIGEST_MAX_PEERS = 60;
 const MAX_FIELD_CHARS = 420;
 const MAX_ARRAY_ITEMS = 10;
+const SYSTEM_DELIVERY_NOISE_RE = /(?:^|\n)\s*⚠️?\s*Cron job\s+"[^"]+"\s+failed:\s*cron:\s*job interrupted by gateway restart|cron:\s*job interrupted by gateway restart/i;
+const SKILL_PROCESS_LEAK_RE = /(?:imagegen|asuka-selfie|qqbot-media)\s+skill|根据\s*(?:imagegen\s*)?skill|读取\s*(?:skill|技能)\s*文件|skill\s*文件/i;
 const runningUpdates = new Set<string>();
 const cache: { state: ConversationDigestStateFile | null } = { state: null };
 const dailySchedulers = new Map<string, { timer: ReturnType<typeof setInterval>; startupTimer: ReturnType<typeof setTimeout> }>();
@@ -285,9 +287,19 @@ function truncate(value: string, maxChars: number): string {
 
 function sanitizeDigestText(text: string | undefined, maxChars = MAX_FIELD_CHARS): string {
   if (!text) return "";
-  const sanitized = text
+  const filteredText = text
+    .split(/\r?\n/)
+    .filter((line) => {
+      const normalized = line.replace(/\s+/g, " ").trim();
+      return normalized && !SYSTEM_DELIVERY_NOISE_RE.test(normalized) && !SKILL_PROCESS_LEAK_RE.test(normalized);
+    })
+    .join("\n");
+  if (!filteredText.trim()) return "";
+  const sanitized = filteredText
     .replace(/Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*?(?=\n\n|$)/gi, " ")
     .replace(/<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, " ")
+    .replace(SYSTEM_DELIVERY_NOISE_RE, " ")
+    .replace(SKILL_PROCESS_LEAK_RE, " ")
     .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|sk-cp-[A-Za-z0-9_-]{16,})\b/g, "[redacted]")
     .replace(/\b(?:api[_-]?key|token|secret|password|passwd|clientSecret|Authorization|Bearer)\s*[:=]\s*\S+/gi, "[redacted]")
     .replace(/\s+/g, " ")

@@ -102,8 +102,8 @@ assert.match(
 );
 assert.match(
   source,
-  /if \(!meta\.mediaType && looksLikeTransportFallbackText\(String\(meta\.text \|\| ""\)\)\)[\s\S]{0,180}Skipped caching transport fallback refIdx/,
-  "transport fallbacks should not be cached as recent conversation context"
+  /const metaText = String\(meta\.text \|\| ""\);[\s\S]{0,240}if \(!meta\.mediaType && \(looksLikeTransportFallbackText\(metaText\) \|\| looksLikeInternalProcessLeak\(metaText\)\)\)[\s\S]{0,180}Skipped caching internal\/system refIdx/,
+  "transport fallbacks and internal/system notices should not be cached as recent conversation context"
 );
 assert.match(
   source,

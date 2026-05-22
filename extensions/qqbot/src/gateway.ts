@@ -39,7 +39,9 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取技能文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
+const INTERNAL_PROCESS_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|已成功处理\s*QQBot\s*定时提醒任务|提醒已发送到指定\s*QQ\s*会话|让我看看这个定时提醒的内容|根据任务描述|这是一个\s*QQBot\s*定时提醒任务|让我检查一下进程状态|现在让我调用|让我尝试运行脚本|根据技能说明|读取\s*(?:skill|技能)\s*文件|skill\s*文件|执行脚本|运行脚本|API 调用|进程状态|脚本位于|工具调用|调试信息|通道规则|写入\s*memory\/\d{4}-\d{2}-\d{2}\.md|memory\/\d{4}-\d{2}-\d{2}\.md|##\s*(?:记忆整理|待办)\b|Pre-compaction memory flush)/i;
+const SYSTEM_DELIVERY_NOISE_RE = /(?:^|\n)\s*⚠️?\s*Cron job\s+"[^"]+"\s+failed:\s*cron:\s*job interrupted by gateway restart|cron:\s*job interrupted by gateway restart/i;
+const SKILL_PROCESS_LEAK_RE = /(?:imagegen|asuka-selfie|qqbot-media)\s+skill|根据\s*(?:imagegen\s*)?skill/i;
 const INTERNAL_SILENT_STATUS_RE = /(?:正在|开始|准备|已经|已|后台|悄悄).{0,18}(?:写入|整理|压缩|更新|保存|同步).{0,18}(?:记忆|memory)|(?:记忆|memory).{0,18}(?:写入|整理|压缩|更新|保存|同步|compaction|compression)/i;
 const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode must be passed back to the API|reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model).*(?:400|401|403|429|500|502|503|504)|(?:400|401|403|429|500|502|503|504).*(?:reasoning_content|thinking mode|DeepSeek|OpenAI|OpenRouter|provider|model|API)/i;
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
@@ -430,6 +432,8 @@ function sanitizeSelfieContextText(text: string): string {
   const cleaned = text
     .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
     .replace(STRUCTURED_ARTIFACT_RE, "")
+    .replace(SYSTEM_DELIVERY_NOISE_RE, "")
+    .replace(SKILL_PROCESS_LEAK_RE, "")
     .replace(INTERNAL_PROCESS_LEAK_RE, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -640,6 +644,8 @@ function extractVisibleTextForLeakInspection(text: string): string {
 export function looksLikeInternalProcessLeak(text: string): boolean {
   const cleaned = extractVisibleTextForLeakInspection(text).replace(/\s+/g, " ").trim();
   if (!cleaned) return false;
+  if (SYSTEM_DELIVERY_NOISE_RE.test(cleaned)) return true;
+  if (SKILL_PROCESS_LEAK_RE.test(cleaned)) return true;
   if (INTERNAL_PROCESS_LEAK_RE.test(cleaned)) return true;
   if (looksLikeMemoryMaintenanceLeak(cleaned)) return true;
   if (cleaned.includes("/Users/") || cleaned.includes("openclaw-asuka/skills/")) return true;
@@ -691,6 +697,8 @@ function normalizeLeakRewriteText(text: string): string {
     .replace(/https?:\/\/\S+/g, "")
     .replace(/\/Users\/\S+/g, "")
     .replace(/\b(?:asuka-selfie|payload|cron_reminder|runtime|getConfig)\b/gi, "")
+    .replace(SYSTEM_DELIVERY_NOISE_RE, "")
+    .replace(SKILL_PROCESS_LEAK_RE, "")
     .replace(/(?:^|\n)\s*(?:任务完成总结[:：].*|已成功处理\s*QQBot\s*定时提醒任务.*|提醒已发送到指定\s*QQ\s*会话.*|让我看看这个定时提醒的内容.*|根据任务描述.*|这是一个\s*QQBot\s*定时提醒任务.*)\s*(?=\n|$)/gi, "\n")
     .replace(/(?:^|\n)\s*(?:不要解释.*|不要总结.*|不要改写.*|不要加引号.*|不要加代码块.*|不要调用任何工具.*)\s*(?=\n|$)/gi, "\n")
     .replace(/(?:^|\n)\s*(?:现在让我(?:检查|调用|尝试|运行).*)\s*(?=\n|$)/gi, "\n")
@@ -1656,8 +1664,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   onMessageSent((refIdx, meta) => {
     const visibleTtsText = meta.ttsText ? cleanOutgoingTextSegment(meta.ttsText) : "";
     log?.info(`[qqbot:${account.accountId}] onMessageSent called: refIdx=${refIdx}, mediaType=${meta.mediaType}, ttsText=${visibleTtsText.slice(0, 30)}`);
-    if (!meta.mediaType && looksLikeTransportFallbackText(String(meta.text || ""))) {
-      log?.info(`[qqbot:${account.accountId}] Skipped caching transport fallback refIdx: ${refIdx}`);
+    const metaText = String(meta.text || "");
+    if (!meta.mediaType && (looksLikeTransportFallbackText(metaText) || looksLikeInternalProcessLeak(metaText))) {
+      log?.info(`[qqbot:${account.accountId}] Skipped caching internal/system refIdx: ${refIdx}`);
       return;
     }
     const attachments: RefAttachmentSummary[] = [];

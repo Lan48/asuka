@@ -174,6 +174,18 @@ assert.equal(
 );
 
 assert.equal(
+  looksLikeInternalProcessLeak('⚠️ Cron job "asuka-repair-5114309A-1779216107087" failed: cron: job interrupted by gateway restart'),
+  true,
+  "gateway restart cron failures should be suppressed as internal process leaks",
+);
+
+assert.equal(
+  looksLikeInternalProcessLeak("根据 imagegen skill 的指导，我需要先读取 skill 文件来确保优化 prompt 质量。"),
+  true,
+  "skill process chatter should be suppressed as an internal process leak",
+);
+
+assert.equal(
   looksLikeInternalDeliveryLeak('QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。","tts":{"emotion":"soft"}}'),
   false,
   "valid structured payloads should be routed as media instead of suppressed as delivery leaks",
@@ -201,6 +213,8 @@ for (const leakedOutboundText of [
   'Reasoning:\n_The user is reacting with "?" to my previous silent acknowledgement._',
   "⏳ 已收到，正在处理中…",
   "I need to exec to write a file",
+  '⚠️ Cron job "asuka-repair-5114309A-1779216107087" failed: cron: job interrupted by gateway restart',
+  "根据 imagegen skill 的指导，我需要先读取 skill 文件来确保优化 prompt 质量。",
 ]) {
   assert.equal(
     looksLikeInternalDeliveryLeak(leakedOutboundText),

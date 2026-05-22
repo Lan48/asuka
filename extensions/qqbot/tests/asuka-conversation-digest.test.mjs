@@ -99,6 +99,22 @@ setRefIndex("REFIDX_DIGEST_TTS", {
     transcriptSource: "tts",
   }],
 });
+setRefIndex("REFIDX_DIGEST_CRON_NOISE", {
+  content: '⚠️ Cron job "asuka-repair-5114309A-1779216107087" failed: cron: job interrupted by gateway restart',
+  senderId: "bot",
+  peerId: "user-digest",
+  senderName: "Asuka",
+  timestamp: now - 4_000,
+  isBot: true,
+});
+setRefIndex("REFIDX_DIGEST_SKILL_NOISE", {
+  content: "根据 imagegen skill 的指导，我需要先读取 skill 文件来确保优化 prompt 质量。",
+  senderId: "bot",
+  peerId: "user-digest",
+  senderName: "Asuka",
+  timestamp: now - 3_000,
+  isBot: true,
+});
 
 const recentTranscript = buildRecentConversationTranscript("user-digest", "当前消息", now);
 assert.ok(recentTranscript.length <= 18_080, "main reply recent transcript should be capped near 18k chars");
@@ -139,7 +155,7 @@ try {
   const digest = await updateConversationDigest(context, {
     rootConfig,
     userText: "就按照这个方案实现。",
-    assistantText: 'QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","path":"内部载荷"}\n\n我会改。',
+    assistantText: 'QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","path":"内部载荷"}\n\n我会改。\n\n⚠️ Cron job "asuka-repair-5114309A-1779216107087" failed: cron: job interrupted by gateway restart',
     now,
   });
   assert.ok(digest, "digest update should write normalized digest");
@@ -154,6 +170,10 @@ try {
   assert.equal(String(capturedBody.messages[0].content).includes("### 2026-05-15"), true, "digest prompt should group history by local day");
   assert.equal(String(capturedBody.messages[0].content).includes("长期记忆/关系记忆节选"), false, "digest prompt should only use raw dialogue and previous weekly digest");
   assert.equal(String(capturedBody.messages[0].content).includes("QQBOT_PAYLOAD"), false, "digest prompt should remove structured payload artifacts");
+  assert.equal(String(capturedBody.messages[0].content).includes("Cron job"), false, "digest prompt should remove cron failure notices");
+  assert.equal(String(capturedBody.messages[0].content).includes("gateway restart"), false, "digest prompt should remove gateway restart notices");
+  assert.equal(String(capturedBody.messages[0].content).includes("imagegen skill"), false, "digest prompt should remove skill process chatter");
+  assert.equal(String(capturedBody.messages[0].content).includes("读取 skill 文件"), false, "digest prompt should remove skill-file process chatter");
   assert.equal(String(capturedBody.messages[0].content).includes("用户:"), false, "digest prompt should avoid third-person user labels");
   assert.equal(String(capturedBody.messages[0].content).includes("Asuka:"), false, "digest prompt should avoid third-person bot labels");
   assert.equal(String(capturedBody.messages[0].content).includes("完整替换版 digest"), true, "digest prompt should require full replacement updates");
