@@ -1274,6 +1274,168 @@ const DEFAULT_MESSAGE_BUFFER_MS = 4_000; // 普通消息防抖合并窗口
 const DEFAULT_MESSAGE_BUFFER_MAX_MS = 15_000; // 连续输入时最长等待时间
 const MESSAGE_BUFFER_MAX_MESSAGES = 20; // 单次合并最多消息数
 const MESSAGE_BUFFER_MAX_CONTENT_CHARS = 12_000; // 单次合并最多原始文本长度
+const PENDING_DISPATCH_TTL_MS = 2 * 60 * 60 * 1000;
+const PENDING_DISPATCH_RECOVERY_DELAY_MS = 8_000;
+const PENDING_DISPATCH_MAX_ATTEMPTS = 3;
+
+interface PendingDispatchRecord {
+  id: string;
+  accountId: string;
+  peerId: string;
+  message: QueuedMessage;
+  createdAt: number;
+  updatedAt: number;
+  attempts: number;
+  state: "pending" | "processing" | "recovering";
+  lastError?: string;
+}
+
+function getPendingDispatchStorePath(): string {
+  return path.join(getQQBotDataDir("data"), "pending-dispatches.json");
+}
+
+function readPendingDispatchStore(): Record<string, PendingDispatchRecord> {
+  const storePath = getPendingDispatchStorePath();
+  if (!fs.existsSync(storePath)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, PendingDispatchRecord> : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePendingDispatchStore(store: Record<string, PendingDispatchRecord>): void {
+  const storePath = getPendingDispatchStorePath();
+  const tmpPath = `${storePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(store, null, 2)}\n`, "utf-8");
+  fs.renameSync(tmpPath, storePath);
+}
+
+function updatePendingDispatchStore(mutator: (store: Record<string, PendingDispatchRecord>) => void): boolean {
+  try {
+    const store = readPendingDispatchStore();
+    mutator(store);
+    writePendingDispatchStore(store);
+    return true;
+  } catch {
+    // Pending recovery is a safety net; it must never break live delivery.
+    return false;
+  }
+}
+
+function makePendingDispatchId(accountId: string, messageId: string): string {
+  const source = `${accountId}:${messageId}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  return Buffer.from(source).toString("base64url");
+}
+
+function recordPendingDispatch(accountId: string, peerId: string, message: QueuedMessage, log?: GatewayContext["log"]): string | null {
+  const id = makePendingDispatchId(accountId, message.messageId);
+  const now = Date.now();
+  const record: PendingDispatchRecord = {
+    id,
+    accountId,
+    peerId,
+    message: {
+      ...message,
+      pendingDispatchIds: [id],
+    },
+    createdAt: now,
+    updatedAt: now,
+    attempts: 0,
+    state: "pending",
+  };
+  const stored = updatePendingDispatchStore((store) => {
+    store[id] = record;
+  });
+  if (!stored) {
+    log?.error?.(`[qqbot:${accountId}] Failed to record pending dispatch for ${message.messageId}`);
+    return null;
+  }
+  return id;
+}
+
+function findPendingDispatchIdsForMessage(accountId: string, messageId: string): string[] {
+  try {
+    const store = readPendingDispatchStore();
+    return Object.values(store)
+      .filter((record) => record?.accountId === accountId && record.message?.messageId === messageId)
+      .map((record) => record.id)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function markPendingDispatchesStarted(accountId: string, pendingIds: string[] | undefined, log?: GatewayContext["log"]): void {
+  if (!pendingIds?.length) return;
+  const now = Date.now();
+  updatePendingDispatchStore((store) => {
+    for (const id of pendingIds) {
+      const record = store[id];
+      if (!record || record.accountId !== accountId) continue;
+      record.state = "processing";
+      record.updatedAt = now;
+      store[id] = record;
+    }
+  });
+  log?.debug?.(`[qqbot:${accountId}] Marked pending dispatch(es) processing: ${pendingIds.join(",")}`);
+}
+
+function touchPendingDispatches(accountId: string, pendingIds: string[] | undefined): void {
+  if (!pendingIds?.length) return;
+  const now = Date.now();
+  updatePendingDispatchStore((store) => {
+    for (const id of pendingIds) {
+      const record = store[id];
+      if (!record || record.accountId !== accountId) continue;
+      record.updatedAt = now;
+      store[id] = record;
+    }
+  });
+}
+
+function clearPendingDispatches(accountId: string, pendingIds: string[] | undefined, reason: string, log?: GatewayContext["log"]): void {
+  if (!pendingIds?.length) return;
+  updatePendingDispatchStore((store) => {
+    for (const id of pendingIds) {
+      const record = store[id];
+      if (!record || record.accountId !== accountId) continue;
+      delete store[id];
+    }
+  });
+  log?.debug?.(`[qqbot:${accountId}] Cleared pending dispatch(es) (${reason}): ${pendingIds.join(",")}`);
+}
+
+function recoverPendingDispatches(accountId: string, createdBeforeMs: number, log?: GatewayContext["log"]): QueuedMessage[] {
+  const now = Date.now();
+  const recovered: QueuedMessage[] = [];
+  updatePendingDispatchStore((store) => {
+    for (const [id, record] of Object.entries(store)) {
+      if (!record || record.accountId !== accountId) continue;
+      if (record.createdAt >= createdBeforeMs) continue;
+      if (record.updatedAt >= createdBeforeMs) continue;
+      const ageMs = now - record.createdAt;
+      if (ageMs > PENDING_DISPATCH_TTL_MS || record.attempts >= PENDING_DISPATCH_MAX_ATTEMPTS) {
+        delete store[id];
+        log?.error?.(`[qqbot:${accountId}] Dropped stale pending dispatch ${id}, ageMs=${ageMs}, attempts=${record.attempts}`);
+        continue;
+      }
+      record.attempts += 1;
+      record.updatedAt = now;
+      record.state = "recovering";
+      store[id] = record;
+      recovered.push({
+        ...record.message,
+        pendingDispatchIds: [id],
+      });
+    }
+  });
+  if (recovered.length > 0) {
+    log?.error?.(`[qqbot:${accountId}] Recovering ${recovered.length} pending dispatch(es) after gateway restart`);
+  }
+  return recovered;
+}
 
 // ============ 消息回复限流器 ============
 // 同一 message_id 1小时内最多回复 4 次，超过1小时需降级为主动消息
@@ -1547,6 +1709,8 @@ export interface QueuedMessage {
   msgIdx?: string;
   /** 缓冲合并前的原始消息列表，供引用索引和日志保留每条消息的信息 */
   bufferedMessages?: BufferedSourceMessage[];
+  /** 持久化 pending 派发记录，用于 gateway 重启后恢复未完成回复 */
+  pendingDispatchIds?: string[];
 }
 
 /**
@@ -1612,6 +1776,7 @@ export function mergeBufferedQueuedMessages(messages: QueuedMessage[]): QueuedMe
   const attachments = sourceMessages.flatMap((msg) => msg.attachments ?? []);
   const latestQuoted = [...sourceMessages].reverse().find((msg) => msg.refMsgIdx);
   const latestIndexed = [...sourceMessages].reverse().find((msg) => msg.msgIdx);
+  const pendingDispatchIds = [...new Set(messages.flatMap((msg) => msg.pendingDispatchIds ?? []))];
 
   return {
     ...latest,
@@ -1622,6 +1787,7 @@ export function mergeBufferedQueuedMessages(messages: QueuedMessage[]): QueuedMe
     ...(latestQuoted?.refMsgIdx ? { refMsgIdx: latestQuoted.refMsgIdx } : { refMsgIdx: undefined }),
     ...(latestIndexed?.msgIdx ? { msgIdx: latestIndexed.msgIdx } : { msgIdx: undefined }),
     bufferedMessages: sourceMessages,
+    ...(pendingDispatchIds.length > 0 ? { pendingDispatchIds } : { pendingDispatchIds: undefined }),
   };
 }
 
@@ -1680,6 +1846,7 @@ async function ensureImageServer(log?: GatewayContext["log"], publicBaseUrl?: st
  */
 export async function startGateway(ctx: GatewayContext): Promise<void> {
   const { account, abortSignal, cfg, onReady, onError, onStatus, log } = ctx;
+  const gatewayStartTimeMs = Date.now();
   installGatewayProcessDiagnostics(log, account.accountId);
 
   if (!account.appId || !account.clientSecret) {
@@ -1817,6 +1984,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   let messagesProcessed = 0;
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
+  let pendingRecoveryScheduled = false;
 
   const countBufferedMessages = (): number => {
     let count = 0;
@@ -1869,6 +2037,30 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     return `dm:${msg.senderId}`;
   };
 
+  const ensurePendingDispatch = (msg: QueuedMessage): QueuedMessage => {
+    if (msg.pendingDispatchIds?.length) return msg;
+    const existingPendingIds = findPendingDispatchIdsForMessage(account.accountId, msg.messageId);
+    if (existingPendingIds.length > 0) {
+      touchPendingDispatches(account.accountId, existingPendingIds);
+      return { ...msg, pendingDispatchIds: existingPendingIds };
+    }
+    const pendingId = recordPendingDispatch(account.accountId, getMessagePeerId(msg), msg, log);
+    return pendingId ? { ...msg, pendingDispatchIds: [pendingId] } : msg;
+  };
+
+  const schedulePendingDispatchRecovery = (reason: string): void => {
+    if (pendingRecoveryScheduled) return;
+    pendingRecoveryScheduled = true;
+    const timer = setTimeout(() => {
+      const recoveredMessages = recoverPendingDispatches(account.accountId, gatewayStartTimeMs, log);
+      for (const recoveredMessage of recoveredMessages) {
+        log?.error(`[qqbot:${account.accountId}] Re-enqueueing pending dispatch through normal queue after ${reason}: ${recoveredMessage.messageId}`);
+        enqueueMessage(recoveredMessage);
+      }
+    }, PENDING_DISPATCH_RECOVERY_DELAY_MS);
+    timer.unref?.();
+  };
+
   const clearBufferedBatchTimers = (batch: { idleTimer: ReturnType<typeof setTimeout> | null; maxTimer: ReturnType<typeof setTimeout> | null }): void => {
     if (batch.idleTimer) {
       clearTimeout(batch.idleTimer);
@@ -1892,6 +2084,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     // 单用户队列溢出保护
     if (queue.length >= PER_USER_QUEUE_SIZE) {
       const dropped = queue.shift();
+      clearPendingDispatches(account.accountId, dropped?.pendingDispatchIds, "per-user queue overflow", log);
       log?.error(`[qqbot:${account.accountId}] Per-user queue full for ${peerId}, dropping oldest message ${dropped?.messageId}`);
     }
 
@@ -1929,6 +2122,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       clearBufferedBatchTimers(batch);
       messageBuffers.delete(bufferKey);
       dropped += batch.messages.length;
+      for (const droppedMessage of batch.messages) {
+        clearPendingDispatches(account.accountId, droppedMessage.pendingDispatchIds, `buffer dropped: ${reason}`, log);
+      }
       log?.info(`[qqbot:${account.accountId}] Dropped ${batch.messages.length} buffered messages for ${bufferKey} (${reason})`);
     }
     return dropped;
@@ -1942,7 +2138,8 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     return bufferKeys.length;
   };
 
-  const enqueueMessage = (msg: QueuedMessage): void => {
+  const enqueueMessage = (rawMsg: QueuedMessage): void => {
+    const msg = ensurePendingDispatch(rawMsg);
     const peerId = getMessagePeerId(msg);
     const bufferKey = getMessageBufferKey(msg);
     const trimmedContent = (msg.content ?? "").trim();
@@ -1961,6 +2158,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       const queue = userQueues.get(peerId);
       if (queue) {
         const droppedCount = queue.length;
+        for (const droppedMessage of queue) {
+          clearPendingDispatches(account.accountId, droppedMessage.pendingDispatchIds, "urgent command dropped queued message", log);
+        }
         queue.length = 0; // 清空队列
         totalEnqueued = Math.max(0, totalEnqueued - droppedCount);
         log?.info(`[qqbot:${account.accountId}] Dropped ${droppedCount} queued messages for ${peerId} due to urgent command`);
@@ -2190,6 +2390,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
       // 处理收到的消息
       const handleMessage = async (event: QueuedMessage) => {
+        const pendingIdsForEvent = event.pendingDispatchIds ?? [];
+        markPendingDispatchesStarted(account.accountId, pendingIdsForEvent, log);
+        try {
 
         log?.debug?.(`[qqbot:${account.accountId}] Received message: ${JSON.stringify(event)}`);
         const sourceMessages = event.bufferedMessages?.length ? event.bufferedMessages : [toBufferedSourceMessage(event)];
@@ -4698,6 +4901,9 @@ ${ttsHint}${sttHint}`;
           log?.error(`[qqbot:${account.accountId}] Message processing failed: ${err}`);
           await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
         }
+        } finally {
+          clearPendingDispatches(account.accountId, pendingIdsForEvent, "message processing completed", log);
+        }
       };
 
       ws.on("open", () => {
@@ -4809,6 +5015,7 @@ ${ttsHint}${sttHint}`;
                   appId: account.appId,
                 });
                 onReady?.(d);
+                schedulePendingDispatchRecovery("READY");
               } else if (t === "RESUMED") {
                 log?.info(`[qqbot:${account.accountId}] Session resumed`);
                 publishRuntimeStatus({
@@ -4829,6 +5036,7 @@ ${ttsHint}${sttHint}`;
                     appId: account.appId,
                   });
                 }
+                schedulePendingDispatchRecovery("RESUMED");
               } else if (t === "C2C_MESSAGE_CREATE") {
                 const event = d as C2CMessageEvent;
                 publishQueueStatus({ lastInboundAt: Date.now(), queueState: "received" });

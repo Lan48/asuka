@@ -482,6 +482,22 @@ assert.match(
 );
 assert.match(
   source,
+  /const pendingDispatchIds = \[\.\.\.new Set\(messages\.flatMap\(\(msg\) => msg\.pendingDispatchIds \?\? \[\]\)\)\]/,
+  "buffered message merges should preserve pending dispatch ids"
+);
+assert.match(
+  source,
+  /recoverPendingDispatches\(account\.accountId, gatewayStartTimeMs, log\)[\s\S]{0,260}Re-enqueueing pending dispatch through normal queue[\s\S]{0,120}enqueueMessage\(recoveredMessage\)/,
+  "gateway restart recovery should re-enter the normal message queue"
+);
+const handleMessageForPendingIndex = source.indexOf("const handleMessage = async (event: QueuedMessage)");
+const pendingStartedIndex = source.indexOf("markPendingDispatchesStarted(account.accountId, pendingIdsForEvent, log)", handleMessageForPendingIndex);
+const pendingClearedIndex = source.indexOf("clearPendingDispatches(account.accountId, pendingIdsForEvent, \"message processing completed\", log)", pendingStartedIndex);
+assert.ok(handleMessageForPendingIndex >= 0, "gateway should define the normal handleMessage path");
+assert.ok(pendingStartedIndex > handleMessageForPendingIndex, "pending dispatch records should be marked when normal handleMessage starts");
+assert.ok(pendingClearedIndex > pendingStartedIndex, "pending dispatch records should clear after normal handleMessage completes");
+assert.match(
+  source,
   /onStatus\?: \(status: Record<string, unknown>\) => void/,
   "gateway should expose runtime status patches to the channel host"
 );
@@ -499,6 +515,51 @@ assert.match(
   source,
   /t === "RESUMED"[\s\S]{0,500}publishRuntimeStatus/,
   "resumed gateway sessions should refresh connected runtime status"
+);
+assert.match(
+  source,
+  /pending-dispatches\.json/,
+  "gateway should persist inbound messages until their reply path completes"
+);
+assert.match(
+  source,
+  /function recoverPendingDispatches[\s\S]{0,900}createdBeforeMs/,
+  "pending dispatch recovery should only recover work from a previous gateway process"
+);
+assert.match(
+  source,
+  /function findPendingDispatchIdsForMessage[\s\S]{0,500}messageId/,
+  "QQ replayed messages should reuse existing pending dispatch ids instead of duplicating recovery work"
+);
+assert.match(
+  source,
+  /export function mergeBufferedQueuedMessages[\s\S]{0,1200}pendingDispatchIds/,
+  "buffered message merging should preserve pending dispatch ids"
+);
+assert.match(
+  source,
+  /const ensurePendingDispatch[\s\S]{0,700}recordPendingDispatch/,
+  "new inbound messages should be recorded as pending before buffering or dispatch"
+);
+assert.match(
+  source,
+  /schedulePendingDispatchRecovery\("READY"\)/,
+  "gateway should schedule pending dispatch recovery after a ready QQ session"
+);
+assert.match(
+  source,
+  /schedulePendingDispatchRecovery\("RESUMED"\)/,
+  "gateway should schedule pending dispatch recovery after a resumed QQ session"
+);
+assert.match(
+  source,
+  /const pendingIdsForEvent = event\.pendingDispatchIds[\s\S]{0,200}markPendingDispatchesStarted/,
+  "message processing should mark pending dispatch ids as started"
+);
+assert.match(
+  source,
+  /finally \{[\s\S]{0,220}clearPendingDispatches\(account\.accountId, pendingIdsForEvent, "message processing completed", log\)/,
+  "message processing should clear pending dispatch ids in its final cleanup"
 );
 
 console.log("[qqbot:test] gateway prompt order fixtures passed");

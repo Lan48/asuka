@@ -18,6 +18,7 @@ const first = {
   messageId: "msg-1",
   timestamp: "2026-05-06T14:00:00+08:00",
   msgIdx: "REFIDX_1",
+  pendingDispatchIds: ["pending-1"],
 };
 
 const second = {
@@ -29,6 +30,7 @@ const second = {
   attachments: [{ content_type: "image/png", url: "https://example.test/a.png", filename: "a.png" }],
   refMsgIdx: "REFIDX_QUOTED",
   msgIdx: "REFIDX_2",
+  pendingDispatchIds: ["pending-2", "pending-1"],
 };
 
 const merged = mergeBufferedQueuedMessages([first, second]);
@@ -42,6 +44,7 @@ assert.equal(merged.attachments.length, 1, "merged event should carry attachment
 assert.equal(merged.bufferedMessages.length, 2, "merged event should keep source messages for ref-index caching");
 assert.equal(merged.bufferedMessages[0].msgIdx, "REFIDX_1");
 assert.equal(merged.bufferedMessages[1].msgIdx, "REFIDX_2");
+assert.deepEqual(merged.pendingDispatchIds, ["pending-1", "pending-2"], "merged event should preserve unique pending dispatch ids");
 
 assert.deepEqual(
   parseVoiceReplySuffix("想听你说晚安~"),
