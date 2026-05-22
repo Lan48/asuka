@@ -123,6 +123,57 @@ try {
   assert.equal(allInvocations.length, 5, "cron promise should add one more cron invocation");
   assert.ok(allInvocations[4].includes("--cron"), "cron scheduling args should include --cron");
 
+  const directCliLog = path.join(tmpHome, "direct-cli-should-not-run.log");
+  const failingOpenClawScript = path.join(tmpBin, "openclaw-fail.cjs");
+  fs.writeFileSync(failingOpenClawScript, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(directCliLog)}, process.argv.slice(2).join(" ") + "\\n");
+process.exit(42);
+`);
+  fs.chmodSync(failingOpenClawScript, 0o755);
+
+  const originalArgv = process.argv.slice();
+  const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+  const originalCwd = process.cwd();
+  try {
+    delete process.env.OPENCLAW_WRAPPER;
+    process.env.OPENCLAW_SCRIPT = failingOpenClawScript;
+    process.argv.push("openclaw.mjs", "gateway");
+    const shadowCwd = path.join(tmpHome, "shadow-cwd");
+    fs.mkdirSync(path.join(shadowCwd, "cron"), { recursive: true });
+    fs.writeFileSync(path.join(shadowCwd, "cron", "jobs.json"), JSON.stringify({ version: 1, jobs: [] }));
+    process.chdir(shadowCwd);
+    const directStorePromise = createPromise("约定，明天早上十点我来找你说早安。", 15_000);
+    const directStoreJobs = await schedulePromiseJobs(directStorePromise);
+    assert.ok("primaryJobId" in directStoreJobs, "gateway scheduling should write directly to cron store");
+    assert.equal(readCronInvocations().length, 5, "direct cron store scheduling should not invoke openclaw CLI");
+    assert.equal(fs.existsSync(directCliLog), false, "direct cron store scheduling should not run OPENCLAW_SCRIPT");
+    const directStore = JSON.parse(fs.readFileSync(path.join(tmpHome, "cron", "jobs.json"), "utf-8"));
+    assert.ok(
+      directStore.jobs.some((job) => job.id === directStoreJobs.primaryJobId),
+      "direct cron store should contain the primary job",
+    );
+    const shadowStore = JSON.parse(fs.readFileSync(path.join(shadowCwd, "cron", "jobs.json"), "utf-8"));
+    assert.equal(shadowStore.jobs.length, 0, "direct cron store should not also write a cwd shadow store when state dir is set");
+
+    process.env.OPENCLAW_STATE_DIR = path.join(tmpHome, "not-a-directory");
+    fs.writeFileSync(process.env.OPENCLAW_STATE_DIR, "block mkdir");
+    const directFailure = await schedulePromiseJobs(directStorePromise);
+    assert.ok("error" in directFailure, "gateway scheduling should report direct-store failures");
+    assert.match(
+      directFailure.error,
+      /skipped openclaw CLI fallback/,
+      "gateway scheduling should skip recursive openclaw CLI fallback after direct-store failure",
+    );
+    assert.equal(fs.existsSync(directCliLog), false, "failed direct-store scheduling inside gateway should not run OPENCLAW_SCRIPT");
+  } finally {
+    process.chdir(originalCwd);
+    process.argv.splice(0, process.argv.length, ...originalArgv);
+    process.env.OPENCLAW_WRAPPER = openclawStub;
+    delete process.env.OPENCLAW_SCRIPT;
+    process.env.OPENCLAW_STATE_DIR = originalStateDir;
+  }
+
   markPromiseDelivered(atPromise.id, { at: base + 20_000, content: "早安" });
   assert.equal(shouldSendPromiseDelivery(atPromise.id), false, "delivered promise should not allow repeated primary delivery");
   assert.equal(

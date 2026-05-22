@@ -1,5 +1,5 @@
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
-import { addCronJobDirectFromArgs, execOpenClaw } from "./utils/openclaw-command.js";
+import { addCronJobDirectFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { markAmbientScheduled, prepareAmbientLifePayload, shouldScheduleAmbientForPeer } from "./asuka-state.js";
@@ -18,6 +18,19 @@ function plusHours(source: Date, hours: number): Date {
 
 async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string | null> {
   const env = getQQBotLocalOpenClawEnv();
+  if (!env.OPENCLAW_WRAPPER?.trim()) {
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) {
+      log?.info?.(`[asuka-ambient] Added ambient job through direct cron store: ${direct.jobId}`);
+      return direct.jobId;
+    }
+    log?.warn?.(`[asuka-ambient] Direct cron store add failed before CLI fallback: ${direct.error}`);
+    if (shouldAvoidOpenClawCliRecursion(env)) {
+      log?.warn?.(`[asuka-ambient] Skipped openclaw CLI fallback inside gateway to avoid recursive gateway lifecycle changes: ${direct.error}`);
+      return null;
+    }
+  }
+
   try {
     const { stdout, stderr } = await execOpenClaw(args, {
       env,

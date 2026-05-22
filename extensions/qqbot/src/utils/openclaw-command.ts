@@ -41,6 +41,18 @@ function isWindows(): boolean {
   return process.platform === "win32";
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function shouldAvoidOpenClawCliRecursion(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.QQBOT_ALLOW_OPENCLAW_CLI_REENTRY === "1") return false;
+  if (env.OPENCLAW_WRAPPER?.trim()) return false;
+  const argv = process.argv.map((item) => item.toLowerCase());
+  return argv.some((item) => item === "gateway")
+    && argv.some((item) => item.includes("openclaw"));
+}
+
 function pathEntries(env: NodeJS.ProcessEnv): string[] {
   const rawPath = env.PATH || env.Path || env.path || "";
   return rawPath.split(path.delimiter).filter(Boolean);
@@ -160,6 +172,7 @@ function resolveCronStoreCandidates(env: NodeJS.ProcessEnv): string[] {
   const candidates: string[] = [];
   const configPath = env.OPENCLAW_CONFIG_PATH?.trim();
   const stateDir = env.OPENCLAW_STATE_DIR?.trim() || (configPath ? path.dirname(configPath) : undefined);
+  let hasConfiguredStore = false;
 
   if (configPath && fs.existsSync(configPath)) {
     try {
@@ -170,14 +183,20 @@ function resolveCronStoreCandidates(env: NodeJS.ProcessEnv): string[] {
           ? configuredStore
           : path.resolve(resolveHomeRelative(configuredStore, env));
         candidates.push(resolved);
+        hasConfiguredStore = true;
       }
     } catch {
       // Ignore optional config parsing here; the normal CLI path already reports config errors.
     }
   }
 
+  if (hasConfiguredStore) {
+    return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
+  }
+
   if (stateDir) {
     candidates.push(path.resolve(resolveHomeRelative(stateDir, env), "cron", "jobs.json"));
+    return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
   }
 
   const cwdStore = path.resolve(process.cwd(), "cron", "jobs.json");
@@ -216,50 +235,98 @@ async function saveCronStore(storePath: string, store: DirectCronStore): Promise
   await fs.promises.chmod(storePath, 0o600).catch(() => undefined);
 }
 
+async function acquireCronStoreLock(storePath: string): Promise<() => Promise<void>> {
+  const lockPath = `${storePath}.lock`;
+  const startedAt = Date.now();
+  const timeoutMs = 5_000;
+  const staleAfterMs = 30_000;
+
+  await fs.promises.mkdir(path.dirname(storePath), { recursive: true, mode: 0o700 });
+  while (true) {
+    try {
+      const handle = await fs.promises.open(lockPath, "wx", 0o600);
+      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, "utf-8");
+      await handle.close();
+      return async () => {
+        await fs.promises.unlink(lockPath).catch(() => undefined);
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+
+      try {
+        const stat = await fs.promises.stat(lockPath);
+        if (Date.now() - stat.mtimeMs > staleAfterMs) {
+          await fs.promises.unlink(lockPath).catch(() => undefined);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error(`timed out waiting for cron store lock: ${lockPath}`);
+      }
+      await sleep(50 + Math.floor(Math.random() * 50));
+    }
+  }
+}
+
 export async function addCronJobDirectFromArgs(
   args: string[],
   options: { env?: NodeJS.ProcessEnv; log?: LoggerLike } = {}
 ): Promise<{ jobId: string; storePaths: string[] } | { error: string }> {
-  const parsed = parseCronAddArgs(args);
-  if (!parsed) return { error: "unsupported cron add args" };
-  const storePaths = resolveCronStoreCandidates(options.env ?? process.env);
-  if (storePaths.length === 0) return { error: "no cron store path resolved" };
+  try {
+    const parsed = parseCronAddArgs(args);
+    if (!parsed) return { error: "unsupported cron add args" };
+    const storePaths = resolveCronStoreCandidates(options.env ?? process.env);
+    if (storePaths.length === 0) return { error: "no cron store path resolved" };
 
-  const jobId = randomUUID();
-  const createdAtMs = Date.now();
-  const job = {
-    id: jobId,
-    name: parsed.name,
-    enabled: true,
-    deleteAfterRun: parsed.deleteAfterRun || Boolean(parsed.at),
-    createdAtMs,
-    schedule: parsed.at
-      ? { kind: "at", at: parsed.at }
-      : { kind: "cron", expr: parsed.cron, ...(parsed.tz ? { tz: parsed.tz } : {}) },
-    sessionTarget: "isolated",
-    wakeMode: "now",
-    payload: {
-      kind: "agentTurn",
-      message: parsed.message,
-      ...(parsed.model ? { model: parsed.model } : {}),
-    },
-    delivery: {
-      mode: "announce",
-      ...(parsed.channel ? { channel: parsed.channel } : {}),
-      ...(parsed.to ? { to: parsed.to } : {}),
-      ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
-    },
-    state: {},
-  };
+    const jobId = randomUUID();
+    const createdAtMs = Date.now();
+    const job = {
+      id: jobId,
+      name: parsed.name,
+      enabled: true,
+      deleteAfterRun: parsed.deleteAfterRun || Boolean(parsed.at),
+      createdAtMs,
+      schedule: parsed.at
+        ? { kind: "at", at: parsed.at }
+        : { kind: "cron", expr: parsed.cron, ...(parsed.tz ? { tz: parsed.tz } : {}) },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      payload: {
+        kind: "agentTurn",
+        message: parsed.message,
+        ...(parsed.model ? { model: parsed.model } : {}),
+      },
+      delivery: {
+        mode: "announce",
+        ...(parsed.channel ? { channel: parsed.channel } : {}),
+        ...(parsed.to ? { to: parsed.to } : {}),
+        ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
+      },
+      state: {},
+    };
 
-  const written: string[] = [];
-  for (const storePath of storePaths) {
-    const store = await loadCronStore(storePath);
-    store.jobs = store.jobs.filter((existing) => existing?.id !== jobId);
-    store.jobs.push(job);
-    await saveCronStore(storePath, store);
-    written.push(storePath);
+    const written: string[] = [];
+    for (const storePath of storePaths) {
+      const release = await acquireCronStoreLock(storePath);
+      try {
+        const store = await loadCronStore(storePath);
+        store.jobs = store.jobs.filter((existing) => existing?.id !== jobId);
+        store.jobs.push(job);
+        await saveCronStore(storePath, store);
+        written.push(storePath);
+      } finally {
+        await release();
+      }
+    }
+    options.log?.info?.(`[openclaw-command] cron add wrote directly to store: ${written.join(", ")}`);
+    return { jobId, storePaths: written };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { error: message };
   }
-  options.log?.warn?.(`[openclaw-command] cron add wrote directly to store after CLI failure: ${written.join(", ")}`);
-  return { jobId, storePaths: written };
 }

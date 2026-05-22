@@ -1467,23 +1467,44 @@ function formatGatewayDiagnosticValue(value: unknown): string {
   }
 }
 
+function appendGatewayDiagnosticLine(accountId: string, message: string): void {
+  try {
+    const stateDir = resolveOpenClawStateDir();
+    const dir = path.join(stateDir, "qqbot", "diagnostics");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      path.join(dir, "gateway-deliver-trace.log"),
+      `${new Date().toISOString()} pid=${process.pid} account=${accountId} ${message}\n`,
+      "utf-8",
+    );
+  } catch {
+    // Diagnostic logging must never affect message delivery.
+  }
+}
+
 function installGatewayProcessDiagnostics(log: GatewayContext["log"] | undefined, accountId: string): void {
   if (gatewayProcessDiagnosticsInstalled) return;
   gatewayProcessDiagnosticsInstalled = true;
 
   process.on("uncaughtExceptionMonitor", (err, origin) => {
-    log?.error(`[qqbot:${accountId}] process uncaughtExceptionMonitor origin=${origin}: ${formatGatewayDiagnosticValue(err)}`);
+    const formatted = formatGatewayDiagnosticValue(err);
+    appendGatewayDiagnosticLine(accountId, `process uncaughtExceptionMonitor origin=${origin}: ${formatted}`);
+    log?.error(`[qqbot:${accountId}] process uncaughtExceptionMonitor origin=${origin}: ${formatted}`);
   });
   process.on("unhandledRejection", (reason) => {
-    log?.error(`[qqbot:${accountId}] process unhandledRejection: ${formatGatewayDiagnosticValue(reason)}`);
+    const formatted = formatGatewayDiagnosticValue(reason);
+    appendGatewayDiagnosticLine(accountId, `process unhandledRejection: ${formatted}`);
+    log?.error(`[qqbot:${accountId}] process unhandledRejection: ${formatted}`);
   });
   process.on("warning", (warning) => {
     log?.info(`[qqbot:${accountId}] process warning: ${formatGatewayDiagnosticValue(warning)}`);
   });
   process.on("beforeExit", (code) => {
+    appendGatewayDiagnosticLine(accountId, `process beforeExit code=${code}`);
     log?.info(`[qqbot:${accountId}] process beforeExit code=${code}`);
   });
   process.on("exit", (code) => {
+    appendGatewayDiagnosticLine(accountId, `process exit code=${code}`);
     log?.info(`[qqbot:${accountId}] process exit code=${code}`);
   });
 }
@@ -3217,21 +3238,27 @@ ${ttsHint}${sttHint}`;
               responsePrefix: messagesConfig.responsePrefix,
               deliver: async (payload: ReplyDeliverPayload, info: { kind: string }) => {
                 log?.info(`[qqbot:${account.accountId}] deliver called, kind: ${info.kind}, payload keys: ${Object.keys(payload).join(", ")}`);
+                appendGatewayDiagnosticLine(
+                  account.accountId,
+                  `deliver enter kind=${info.kind} keys=${Object.keys(payload).join(",")} textLength=${payload.text?.length ?? 0}`,
+                );
 
-                if (looksLikeInternalOnlyDeliver(payload)) {
-                  if ("audioAsVoice" in payload || "mediaUrl" in payload || "mediaUrls" in payload) {
-                    hasResponse = true;
-                    hasBlockResponse = true;
-                    log?.info(`[qqbot:${account.accountId}] Counted internal media deliver as an already-sent response`);
+                try {
+                  if (looksLikeInternalOnlyDeliver(payload)) {
+                    if ("audioAsVoice" in payload || "mediaUrl" in payload || "mediaUrls" in payload) {
+                      hasResponse = true;
+                      hasBlockResponse = true;
+                      log?.info(`[qqbot:${account.accountId}] Counted internal media deliver as an already-sent response`);
+                    }
+                    log?.info(`[qqbot:${account.accountId}] Suppressed internal-only deliver: ${Object.keys(payload).join(", ")}`);
+                    appendGatewayDiagnosticLine(account.accountId, `deliver internal-only suppressed kind=${info.kind}`);
+                    return;
                   }
-                  log?.info(`[qqbot:${account.accountId}] Suppressed internal-only deliver: ${Object.keys(payload).join(", ")}`);
-                  return;
-                }
 
-                hasResponse = true;
+                  hasResponse = true;
 
-                // ============ 跳过工具调用的中间结果（带兜底保护） ============
-                if (info.kind === "tool") {
+                  // ============ 跳过工具调用的中间结果（带兜底保护） ============
+                  if (info.kind === "tool") {
                   toolDeliverCount++;
                   const toolText = (payload.text ?? "").trim();
                   if (toolText) {
@@ -3296,6 +3323,7 @@ ${ttsHint}${sttHint}`;
 
                 let replyText = payload.text ?? "";
                 let payloadSourceText: string | null = null;
+                appendGatewayDiagnosticLine(account.accountId, `deliver payload accepted kind=${info.kind} textLength=${replyText.length}`);
 
                 if (payload.isError || looksLikeModelProviderError(replyText)) {
                   log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
@@ -3349,21 +3377,31 @@ ${ttsHint}${sttHint}`;
                 // 预处理：纠正小模型常见的标签拼写错误和格式问题
                 replyText = normalizeMediaTags(replyText);
 
+                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${replyText.length}`);
                 const parsedPromises = parseAssistantPromises(replyText, {
                   userText: userContent,
                 });
+                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises done count=${parsedPromises.length}`);
+                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess record-assistant start");
                 const loggedPromises = recordAssistantReply(asukaPeerContext, replyText, parsedPromises);
+                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess record-assistant done logged=${loggedPromises.length}`);
+                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory start");
                 recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, replyText);
+                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory done");
+                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene start");
                 await refreshSceneState(asukaPeerContext, {
                   trigger: "assistant",
                   text: replyText,
                 });
+                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene done");
                 let scheduledPromiseCount = 0;
                 for (const promise of loggedPromises) {
                   if (!promise.schedule) {
                     continue;
                   }
+                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise start id=${promise.id}`);
                   const scheduled = await schedulePromiseJobs(promise, log);
+                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise done id=${promise.id} ok=${"primaryJobId" in scheduled}`);
                   if ("primaryJobId" in scheduled) {
                     scheduledPromiseCount++;
                     markPromiseScheduled(promise.id, scheduled.primaryJobId);
@@ -3379,12 +3417,15 @@ ${ttsHint}${sttHint}`;
                   }
                 }
                 if (scheduledPromiseCount === 0 && asukaPeerContext.peerKind === "direct") {
+                  appendGatewayDiagnosticLine(account.accountId, "deliver postprocess ambient start");
                   const ambientJobs = await scheduleAmbientLifeJobs(asukaPeerContext, Date.now(), log);
+                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess ambient done count=${ambientJobs.length}`);
                   if (ambientJobs.length > 0) {
                     log?.info(`[qqbot:${account.accountId}] Scheduled ambient Asuka life-line jobs: ${ambientJobs.join(",")}`);
                   }
                 }
                 
+                appendGatewayDiagnosticLine(account.accountId, "deliver send-path start");
                 const mediaTagRegex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
                 const mediaTagMatches = [...replyText.matchAll(mediaTagRegex)];
                 
@@ -4497,6 +4538,22 @@ ${ttsHint}${sttHint}`;
                   accountId: account.accountId,
                   direction: "outbound",
                 });
+                appendGatewayDiagnosticLine(account.accountId, `deliver complete kind=${info.kind}`);
+                } catch (err) {
+                  hasResponse = true;
+                  if (timeoutId) {
+                    clearTimeout(timeoutId);
+                    timeoutId = null;
+                  }
+                  if (toolOnlyTimeoutId) {
+                    clearTimeout(toolOnlyTimeoutId);
+                    toolOnlyTimeoutId = null;
+                  }
+                  const formatted = formatGatewayDiagnosticValue(err);
+                  appendGatewayDiagnosticLine(account.accountId, `deliver caught kind=${info.kind}: ${formatted}`);
+                  log?.error(`[qqbot:${account.accountId}] Deliver handler failed: ${formatted}`);
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                }
               },
               onError: async (err: unknown) => {
                 log?.error(`[qqbot:${account.accountId}] Dispatch error: ${err}`);

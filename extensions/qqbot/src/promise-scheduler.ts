@@ -1,7 +1,7 @@
 import type { AsukaPromise } from "./asuka-state.js";
 import { getSceneSnapshotByPeerKey } from "./asuka-state.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
-import { addCronJobDirectFromArgs, execOpenClaw } from "./utils/openclaw-command.js";
+import { addCronJobDirectFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, type CronReminderPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 
 interface LoggerLike {
@@ -159,6 +159,17 @@ function nextDayLateMorning(source: Date): Date {
 
 async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: string } | { error: string }> {
   const env = getQQBotLocalOpenClawEnv();
+  if (!env.OPENCLAW_WRAPPER?.trim()) {
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) {
+      return { jobId: direct.jobId };
+    }
+    log?.warn?.(`[asuka-scheduler] direct cron store add failed before CLI fallback: ${direct.error}`);
+    if (shouldAvoidOpenClawCliRecursion(env)) {
+      return { error: `direct cron store add failed inside gateway; skipped openclaw CLI fallback to avoid recursive gateway lifecycle changes: ${direct.error}` };
+    }
+  }
+
   try {
     const { stdout, stderr } = await execOpenClaw(args, {
       env,
