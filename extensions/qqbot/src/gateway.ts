@@ -1276,7 +1276,6 @@ const MESSAGE_BUFFER_MAX_MESSAGES = 20; // 单次合并最多消息数
 const MESSAGE_BUFFER_MAX_CONTENT_CHARS = 12_000; // 单次合并最多原始文本长度
 const PENDING_DISPATCH_TTL_MS = 2 * 60 * 60 * 1000;
 const PENDING_DISPATCH_RECOVERY_DELAY_MS = 8_000;
-const PENDING_DISPATCH_MAX_ATTEMPTS = 3;
 
 interface PendingDispatchRecord {
   id: string;
@@ -1416,7 +1415,7 @@ function recoverPendingDispatches(accountId: string, createdBeforeMs: number, lo
       if (record.createdAt >= createdBeforeMs) continue;
       if (record.updatedAt >= createdBeforeMs) continue;
       const ageMs = now - record.createdAt;
-      if (ageMs > PENDING_DISPATCH_TTL_MS || record.attempts >= PENDING_DISPATCH_MAX_ATTEMPTS) {
+      if (ageMs > PENDING_DISPATCH_TTL_MS) {
         delete store[id];
         log?.error?.(`[qqbot:${accountId}] Dropped stale pending dispatch ${id}, ageMs=${ageMs}, attempts=${record.attempts}`);
         continue;

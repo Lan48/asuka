@@ -526,6 +526,11 @@ assert.match(
   /function recoverPendingDispatches[\s\S]{0,900}createdBeforeMs/,
   "pending dispatch recovery should only recover work from a previous gateway process"
 );
+assert.doesNotMatch(
+  source,
+  /PENDING_DISPATCH_MAX_ATTEMPTS|attempts\s*>=/,
+  "pending dispatch recovery should not drop user messages just because repeated gateway restarts consumed retry attempts"
+);
 assert.match(
   source,
   /function findPendingDispatchIdsForMessage[\s\S]{0,500}messageId/,
