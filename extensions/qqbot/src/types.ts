@@ -40,6 +40,12 @@ export interface SceneInferenceConfig {
   enabledOnProactive?: boolean;
 }
 
+export interface PromiseInferenceConfig {
+  enabled?: boolean;
+  primaryModel?: string;
+  fallbackModel?: string;
+}
+
 /**
  * QQ Bot 账户配置
  */
@@ -61,6 +67,8 @@ export interface QQBotAccountConfig {
   proactiveQuietHours?: QQBotProactiveQuietHours;
   /** Asuka 场景推断配置 */
   sceneInference?: SceneInferenceConfig;
+  /** Asuka 承诺识别配置；未配置时复用 sceneInference 的模型选择 */
+  promiseInference?: PromiseInferenceConfig;
   /** 入站普通消息缓冲窗口，单位毫秒；窗口内同一用户的新消息会合并为一次 agent 输入 */
   messageBufferMs?: number;
   /** 入站普通消息最长缓冲时间，单位毫秒；防止连续输入导致 agent 永不处理 */

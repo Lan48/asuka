@@ -25,7 +25,7 @@ import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSin
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
 import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
-import { parseAssistantPromises } from "./promise-parser.js";
+import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
@@ -3623,8 +3623,10 @@ ${ttsHint}${sttHint}`;
                 replyText = normalizeMediaTags(replyText);
 
                 appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${replyText.length}`);
-                const parsedPromises = parseAssistantPromises(replyText, {
+                const parsedPromises = await parseAssistantPromisesWithLlm(replyText, {
                   userText: userContent,
+                  accountId: account.accountId,
+                  log,
                 });
                 appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises done count=${parsedPromises.length}`);
                 appendGatewayDiagnosticLine(account.accountId, "deliver postprocess record-assistant start");

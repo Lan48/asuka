@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ResolvedQQBotAccount, QQBotAccountConfig, SceneInferenceConfig } from "./types.js";
+import type { ResolvedQQBotAccount, QQBotAccountConfig, PromiseInferenceConfig, SceneInferenceConfig } from "./types.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -12,7 +12,7 @@ let localOpenClawConfigCache: any | undefined;
 
 export type QQBotDeepSeekThinkingLevel = "off" | "high";
 
-interface OpenAICompletionsModelConfig {
+export interface OpenAICompletionsModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -24,6 +24,13 @@ export interface ResolvedSceneInferenceConfig {
   primary: OpenAICompletionsModelConfig | null;
   fallback: OpenAICompletionsModelConfig | null;
   raw: SceneInferenceConfig;
+}
+
+export interface ResolvedPromiseInferenceConfig {
+  enabled: boolean;
+  primary: OpenAICompletionsModelConfig | null;
+  fallback: OpenAICompletionsModelConfig | null;
+  raw: PromiseInferenceConfig;
 }
 
 interface QQBotChannelConfig extends QQBotAccountConfig {
@@ -145,6 +152,17 @@ function getInheritedSceneInferenceConfig(qqbot: QQBotChannelConfig | undefined,
   return {
     ...(qqbot.sceneInference ?? {}),
     ...(qqbot.accounts?.[accountId]?.sceneInference ?? {}),
+  };
+}
+
+function getInheritedPromiseInferenceConfig(qqbot: QQBotChannelConfig | undefined, accountId?: string | null): PromiseInferenceConfig {
+  if (!qqbot) return {};
+  const account = accountId && accountId !== DEFAULT_ACCOUNT_ID ? qqbot.accounts?.[accountId] : undefined;
+  return {
+    ...(qqbot.sceneInference ?? {}),
+    ...(account?.sceneInference ?? {}),
+    ...(qqbot.promiseInference ?? {}),
+    ...(account?.promiseInference ?? {}),
   };
 }
 
@@ -273,6 +291,31 @@ export function resolveQQBotSceneInferenceConfig(accountId?: string | null): Res
   return {
     enabledOnInbound: raw.enabledOnInbound !== false,
     enabledOnProactive: raw.enabledOnProactive !== false,
+    primary: resolveOpenAICompletionsModel(root, primaryRef, fallbackProviderId),
+    fallback: resolveOpenAICompletionsModel(root, fallbackRef, fallbackProviderId),
+    raw,
+  };
+}
+
+export function resolveQQBotPromiseInferenceConfig(accountId?: string | null): ResolvedPromiseInferenceConfig {
+  const root = loadLocalOpenClawConfig();
+  if (!root) {
+    return {
+      enabled: true,
+      primary: null,
+      fallback: null,
+      raw: {},
+    };
+  }
+
+  const qqbot = getQQBotChannelConfigFromRoot(root);
+  const raw = getInheritedPromiseInferenceConfig(qqbot, accountId);
+  const fallbackRef = String(raw.fallbackModel || getQQBotLocalPrimaryModel()).trim();
+  const primaryRef = String(raw.primaryModel || pickScenePrimaryModelRef(root, fallbackRef)).trim();
+  const [fallbackProviderId] = fallbackRef.split("/");
+
+  return {
+    enabled: raw.enabled !== false,
     primary: resolveOpenAICompletionsModel(root, primaryRef, fallbackProviderId),
     fallback: resolveOpenAICompletionsModel(root, fallbackRef, fallbackProviderId),
     raw,
