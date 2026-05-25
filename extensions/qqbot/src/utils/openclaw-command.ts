@@ -158,6 +158,24 @@ export async function addCronJobLiveFromArgs(
   }
 }
 
+export async function removeCronJobLive(
+  jobId: string,
+  options: { log?: LoggerLike } = {}
+): Promise<{ removed: true } | { error: string }> {
+  const id = jobId.trim();
+  if (!id) return { error: "missing cron job id" };
+  try {
+    const cron = getQQBotCronService();
+    if (!cron?.remove) return { error: "live cron service remove unavailable" };
+    await cron.remove(id);
+    options.log?.info?.(`[openclaw-command] cron remove used live CronService: ${id}`);
+    return { removed: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { error: message };
+  }
+}
+
 function readFlagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   if (index < 0) return undefined;
@@ -383,6 +401,41 @@ export async function addCronJobDirectFromArgs(
     }
     options.log?.info?.(`[openclaw-command] cron add wrote directly to store: ${written.join(", ")}`);
     return { jobId, storePaths: written };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { error: message };
+  }
+}
+
+export async function removeCronJobDirect(
+  jobId: string,
+  options: { env?: NodeJS.ProcessEnv; log?: LoggerLike } = {}
+): Promise<{ removedCount: number; storePaths: string[] } | { error: string }> {
+  const id = jobId.trim();
+  if (!id) return { error: "missing cron job id" };
+  try {
+    const storePaths = resolveCronStoreCandidates(options.env ?? process.env);
+    if (storePaths.length === 0) return { error: "no cron store path resolved" };
+
+    let removedCount = 0;
+    const touched: string[] = [];
+    for (const storePath of storePaths) {
+      const release = await acquireCronStoreLock(storePath);
+      try {
+        const store = await loadCronStore(storePath);
+        const before = store.jobs.length;
+        store.jobs = store.jobs.filter((existing) => existing?.id !== id);
+        if (store.jobs.length !== before) {
+          removedCount += before - store.jobs.length;
+          await saveCronStore(storePath, store);
+          touched.push(storePath);
+        }
+      } finally {
+        await release();
+      }
+    }
+    options.log?.info?.(`[openclaw-command] cron remove checked direct store for ${id}: removed=${removedCount}`);
+    return { removedCount, storePaths: touched };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { error: message };

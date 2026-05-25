@@ -7,7 +7,7 @@ import {
 } from "openclaw/plugin-sdk";
 
 import type { ResolvedQQBotAccount } from "./types.js";
-import { DEFAULT_ACCOUNT_ID, listQQBotAccountIds, resolveQQBotAccount, applyQQBotAccountConfig, resolveDefaultQQBotAccountId } from "./config.js";
+import { DEFAULT_ACCOUNT_ID, formatQQBotProductionSendGuardError, listQQBotAccountIds, resolveQQBotAccount, applyQQBotAccountConfig, resolveDefaultQQBotAccountId, resolveQQBotProductionSendGuard } from "./config.js";
 import { sendText, sendMedia } from "./outbound.js";
 import { startGateway } from "./gateway.js";
 import { qqbotOnboardingAdapter } from "./onboarding.js";
@@ -272,6 +272,19 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
           ...patch,
         });
       };
+
+      const productionGuard = resolveQQBotProductionSendGuard(account);
+      if (!productionGuard.allowed) {
+        const message = formatQQBotProductionSendGuardError(productionGuard);
+        log?.warn?.(`[qqbot:${account.accountId}] Gateway start blocked by production send guard: ${message}`);
+        updateRuntimeStatus({
+          running: false,
+          connected: false,
+          blockedByProductionSendGuard: true,
+          lastError: message,
+        });
+        return;
+      }
 
       await startGateway({
         account,

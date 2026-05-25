@@ -51,6 +51,10 @@ export interface PromiseInferenceConfig {
  */
 export interface QQBotAccountConfig {
   enabled?: boolean;
+  /** Must be true, or enabled by env, before this process may connect/send to the production QQ account. */
+  allowProductionSend?: boolean;
+  /** Backward-compatible alias for allowProductionSend. */
+  productionGateway?: boolean;
   name?: string;
   appId?: string;
   clientSecret?: string;

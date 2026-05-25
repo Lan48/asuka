@@ -2637,6 +2637,7 @@ export function shouldSendAmbient(peerKey: string, guardNoReplySince?: number, n
   const peer = state.peers[peerKey];
   if (!peer) return false;
   if (guardNoReplySince === undefined) return true;
+  if (hasUserRepliedAfterGuard(peer.relationship.lastUserMessageAt, guardNoReplySince)) return false;
   return !shouldSkipForRecentUserReply(peer.relationship.lastUserMessageAt, guardNoReplySince, now);
 }
 

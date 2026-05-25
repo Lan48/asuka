@@ -34,6 +34,7 @@ try {
     prepareRepairDelivery,
     recordAssistantReply,
     recordInboundInteraction,
+    shouldSendAmbient,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
   const { resolveCronDeliveryFallbackText } = await import("../dist/src/outbound.js");
@@ -110,6 +111,12 @@ try {
   recordInboundInteraction(ambientContext, "早安，醒了吗", base + 40_000);
   const firstAmbient = prepareAmbientLifePayload(ambientContext, base + 41_000);
   assert.equal(firstAmbient.stage, 0, "new ambient thread should start at stage zero");
+  recordInboundInteraction(ambientContext, "我刚刚回你了", base + 41_500);
+  assert.equal(
+    shouldSendAmbient("acct-test:direct:user-ambient-advance", base + 41_000, base + 80_000),
+    false,
+    "stale ambient jobs should stop after any user reply newer than their guard",
+  );
   assert.equal(
     resolveCronDeliveryFallbackText({
       type: "cron_reminder",

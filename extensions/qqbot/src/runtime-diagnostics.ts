@@ -110,6 +110,7 @@ interface PatchSnippet {
 const REQUIRED_CRON_PATCH_SNIPPETS: PatchSnippet[] = [
   { id: "cron-payload-prefix", pattern: /QQBOT_CRON:/ },
   { id: "exact-forward-header", pattern: /这是一次纯转发任务。/ },
+  { id: "cron-prefix-tolerant", pattern: /CRON_EXACT_FORWARD_PROMPT_PREFIX_RE|stripCronPromptPrefix/ },
   { id: "payload-validator", pattern: /validateCronPayloadText/ },
   { id: "exact-forward-extractor", pattern: /extractExactForwardMessage/ },
   { id: "direct-forward-branch", pattern: /exactForward\.matched/ },

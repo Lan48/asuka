@@ -56,6 +56,7 @@ try {
   const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
   const { schedulePromiseJobs } = await import("../dist/src/promise-scheduler.js");
   const { setQQBotCronService } = await import("../dist/src/runtime.js");
+  const { removeCronJobDirect, removeCronJobLive } = await import("../dist/src/utils/openclaw-command.js");
   const {
     appendPromiseFollowUpJob,
     buildAsukaStatePrompt,
@@ -151,6 +152,10 @@ process.exit(42);
         liveCronAdds.push(input);
         return { id, ...input, state: { nextRunAtMs: base + 99_000 } };
       },
+      remove: async (jobId) => {
+        liveCronAdds.push({ removed: jobId });
+        return { id: jobId };
+      },
     });
     const liveCronPromise = createPromise("约定，明天早上十点我来找你说早安。", 15_000);
     const liveCronJobs = await schedulePromiseJobs(liveCronPromise);
@@ -164,6 +169,13 @@ process.exit(42);
     assert.equal(liveCronAdds[0].delivery.channel, "qqbot", "live CronService input should preserve QQBot delivery");
     assert.equal(readCronInvocations().length, 5, "live CronService scheduling should not invoke openclaw CLI");
     assert.equal(fs.existsSync(directCliLog), false, "live CronService scheduling should not run OPENCLAW_SCRIPT");
+    const liveRemove = await removeCronJobLive("live-job-1");
+    assert.ok("removed" in liveRemove, "live CronService removal should succeed");
+    assert.deepEqual(
+      liveCronAdds[liveCronAdds.length - 1],
+      { removed: "live-job-1" },
+      "live CronService removal should use the captured in-process service",
+    );
     const cronStorePath = path.join(tmpHome, "cron", "jobs.json");
     let directStore = fs.existsSync(cronStorePath)
       ? JSON.parse(fs.readFileSync(cronStorePath, "utf-8"))
@@ -185,6 +197,15 @@ process.exit(42);
       typeof directStore.jobs.find((job) => job.id === directStoreJobs.primaryJobId)?.state?.nextRunAtMs,
       "number",
       "direct cron store fallback should persist nextRunAtMs for one-shot jobs",
+    );
+    const directRemove = await removeCronJobDirect(directStoreJobs.primaryJobId, { env: process.env });
+    assert.ok("removedCount" in directRemove, "direct cron store removal should return a removal count");
+    assert.equal(directRemove.removedCount, 1, "direct cron store removal should remove the matching job");
+    directStore = JSON.parse(fs.readFileSync(cronStorePath, "utf-8"));
+    assert.equal(
+      directStore.jobs.some((job) => job.id === directStoreJobs.primaryJobId),
+      false,
+      "direct cron store removal should persist the deleted job",
     );
     const shadowStore = JSON.parse(fs.readFileSync(path.join(shadowCwd, "cron", "jobs.json"), "utf-8"));
     assert.equal(shadowStore.jobs.length, 0, "direct cron store fallback should not also write a cwd shadow store when state dir is set");

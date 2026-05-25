@@ -8,6 +8,11 @@ export const DEFAULT_ACCOUNT_ID = "default";
 const FALLBACK_CRON_MODEL = "deepseek/deepseek-v4-flash";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LIGHTWEIGHT_MODEL_HINT_RE = /(mini|small|lite|flash|nano|tiny)/i;
+const PRODUCTION_SEND_ENV_KEYS = [
+  "QQBOT_ALLOW_PRODUCTION_SEND",
+  "QQBOT_ALLOW_SEND",
+  "ASUKA_PRODUCTION_GATEWAY",
+];
 let localOpenClawConfigCache: any | undefined;
 
 export type QQBotDeepSeekThinkingLevel = "off" | "high";
@@ -35,6 +40,46 @@ export interface ResolvedPromiseInferenceConfig {
 
 interface QQBotChannelConfig extends QQBotAccountConfig {
   accounts?: Record<string, QQBotAccountConfig>;
+}
+
+export interface QQBotProductionSendGuard {
+  allowed: boolean;
+  source?: string;
+  reason?: string;
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== "string") return false;
+  return /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+export function resolveQQBotProductionSendGuard(
+  account?: Pick<ResolvedQQBotAccount, "accountId" | "config"> | null,
+  env: Record<string, string | undefined> = process.env
+): QQBotProductionSendGuard {
+  if (isTruthyFlag(account?.config?.allowProductionSend)) {
+    return { allowed: true, source: "config:allowProductionSend" };
+  }
+  if (isTruthyFlag(account?.config?.productionGateway)) {
+    return { allowed: true, source: "config:productionGateway" };
+  }
+
+  for (const key of PRODUCTION_SEND_ENV_KEYS) {
+    if (isTruthyFlag(env[key])) {
+      return { allowed: true, source: `env:${key}` };
+    }
+  }
+
+  return {
+    allowed: false,
+    reason:
+      "QQBot production delivery is disabled for this process. Set QQBOT_ALLOW_PRODUCTION_SEND=1 only on the single production gateway host, or set channels.qqbot.allowProductionSend=true for that host.",
+  };
+}
+
+export function formatQQBotProductionSendGuardError(guard: QQBotProductionSendGuard): string {
+  return guard.allowed ? "" : guard.reason ?? "QQBot production delivery is disabled for this process.";
 }
 
 function resolveLocalOpenClawConfigPath(): string {
@@ -388,6 +433,8 @@ export function resolveQQBotAccount(
     // 默认账户从顶层读取
     accountConfig = {
       enabled: qqbot?.enabled,
+      allowProductionSend: qqbot?.allowProductionSend,
+      productionGateway: qqbot?.productionGateway,
       name: qqbot?.name,
       appId: qqbot?.appId,
       clientSecret: qqbot?.clientSecret,
@@ -424,6 +471,8 @@ export function resolveQQBotAccount(
     const inheritedMessageBufferMaxMs = account?.messageBufferMaxMs ?? qqbot?.messageBufferMaxMs;
     accountConfig = {
       ...(account ?? {}),
+      allowProductionSend: account?.allowProductionSend ?? qqbot?.allowProductionSend,
+      productionGateway: account?.productionGateway ?? qqbot?.productionGateway,
       ...(inheritedQuietHours ? { proactiveQuietHours: inheritedQuietHours } : {}),
       ...(inheritedSceneInference ? { sceneInference: inheritedSceneInference } : {}),
       ...(inheritedMessageBufferMs !== undefined ? { messageBufferMs: inheritedMessageBufferMs } : {}),

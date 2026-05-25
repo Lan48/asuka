@@ -15,7 +15,7 @@ import { parseQQBotPayload, recoverIncompleteSelfiePayload, isCronReminderPayloa
 import { convertSilkToWav, isVoiceAttachment, formatDuration, resolveTTSConfig, applyTTSRuntimeOverrides, textToSilk, audioFileToSilkBase64, waitForFile, isAudioFile } from "./utils/audio-convert.js";
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
-import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, type QQBotDeepSeekThinkingLevel } from "./config.js";
+import { formatQQBotProductionSendGuardError, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, resolveQQBotProductionSendGuard, type QQBotDeepSeekThinkingLevel } from "./config.js";
 import { getQQBotDataDir, isLocalPath as isLocalFilePath, looksLikeLocalPath, normalizePath, sanitizeFileName, runDiagnostics } from "./utils/platform.js";
 import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments, stripAsukaNarrationForSpeech } from "./utils/narration-segments.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
@@ -28,7 +28,7 @@ import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } 
 import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
-import { execOpenClaw } from "./utils/openclaw-command.js";
+import { execOpenClaw, removeCronJobDirect, removeCronJobLive, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 import { buildTimeAwareDeliveryFallback, isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
@@ -401,10 +401,33 @@ function hasStructuredPayloadPrefix(text: string): boolean {
 
 async function removeCronJobs(jobIds: string[], accountId: string, log?: { info?: (msg: string) => void; warn?: (msg: string) => void }): Promise<void> {
   const uniqueJobIds = [...new Set(jobIds.filter(Boolean))];
+  const env = getQQBotLocalOpenClawEnv();
   for (const jobId of uniqueJobIds) {
+    const live = await removeCronJobLive(jobId, { log });
+    if ("removed" in live) {
+      log?.info?.(`[qqbot:${accountId}] Removed promise cron job ${jobId} through live CronService`);
+      continue;
+    }
+
+    const direct = await removeCronJobDirect(jobId, { env, log });
+    if ("removedCount" in direct && direct.removedCount > 0) {
+      log?.info?.(`[qqbot:${accountId}] Removed promise cron job ${jobId} from cron store`);
+      continue;
+    }
+    if ("error" in direct) {
+      log?.warn?.(`[qqbot:${accountId}] Direct cron store remove failed for ${jobId}: ${direct.error}`);
+    }
+
+    if (shouldAvoidOpenClawCliRecursion(env)) {
+      log?.warn?.(
+        `[qqbot:${accountId}] Skipped openclaw cron rm fallback for ${jobId} inside gateway; live remove failed: ${live.error}`
+      );
+      continue;
+    }
+
     try {
       const { stdout, stderr } = await execOpenClaw(["cron", "rm", jobId], {
-        env: getQQBotLocalOpenClawEnv(),
+        env,
         maxBuffer: 1024 * 1024,
       });
       if (stderr?.trim()) {
@@ -1850,6 +1873,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
 
   if (!account.appId || !account.clientSecret) {
     throw new Error("QQBot not configured (missing appId or clientSecret)");
+  }
+
+  const productionGuard = resolveQQBotProductionSendGuard(account);
+  if (!productionGuard.allowed) {
+    throw new Error(formatQQBotProductionSendGuardError(productionGuard));
   }
 
   // 启动环境诊断（首次连接时执行）

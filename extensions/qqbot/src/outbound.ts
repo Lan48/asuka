@@ -33,7 +33,7 @@ import { buildConversationDigestPrompt } from "./asuka-conversation-digest.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
-import { getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { formatQQBotProductionSendGuardError, getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, resolveQQBotProductionSendGuard } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
 import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments } from "./utils/narration-segments.js";
 import { execOpenClaw } from "./utils/openclaw-command.js";
@@ -288,6 +288,14 @@ function normalizeSkippedResult(skipReason: string): OutboundResult {
     skipped: true,
     skipReason,
   };
+}
+
+function checkProductionSendAllowed(account: ResolvedQQBotAccount, label: string): OutboundResult | null {
+  const guard = resolveQQBotProductionSendGuard(account);
+  if (guard.allowed) return null;
+  const error = formatQQBotProductionSendGuardError(guard);
+  console.warn(`[qqbot] ${label}: blocked by production send guard: ${error}`);
+  return { channel: "qqbot", error };
 }
 
 async function acquireProactiveSendGuard(
@@ -2281,6 +2289,9 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
 
   console.log("[qqbot] sendText ctx:", JSON.stringify({ to, text: text?.slice(0, 50), replyToId, accountId: account.accountId }, null, 2));
 
+  const productionGuardError = checkProductionSendAllowed(account, "sendText");
+  if (productionGuardError) return productionGuardError;
+
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
 
   if (typeof text === "string" && !cronProbe.isCronPayload) {
@@ -2815,6 +2826,9 @@ export async function sendProactiveMessage(
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
 
+  const productionGuardError = checkProductionSendAllowed(account, "sendProactiveMessage");
+  if (productionGuardError) return productionGuardError;
+
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
   if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
@@ -3010,6 +3024,9 @@ export async function sendMedia(ctx: MediaOutboundContext): Promise<OutboundResu
   const { to, text, replyToId, account } = ctx;
   // 展开波浪线路径：~/Desktop/file.png → /Users/xxx/Desktop/file.png
   const mediaUrl = normalizePath(ctx.mediaUrl);
+
+  const productionGuardError = checkProductionSendAllowed(account, "sendMedia");
+  if (productionGuardError) return productionGuardError;
 
   if (!account.appId || !account.clientSecret) {
     return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
@@ -3485,6 +3502,9 @@ export async function sendCronMessage(
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] [qqbot] sendCronMessage: to=${to}, message length=${message.length}`);
+
+  const productionGuardError = checkProductionSendAllowed(account, "sendCronMessage");
+  if (productionGuardError) return productionGuardError;
   
   // 检测是否是 QQBOT_CRON: 格式的结构化载荷
   const cronResult = decodeCronPayload(message);

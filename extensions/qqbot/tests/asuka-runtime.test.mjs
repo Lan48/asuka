@@ -13,10 +13,16 @@ const {
   validateCronPatchText,
   validateRuntimeCronPatch,
 } = await import("../dist/src/runtime-diagnostics.js");
+const {
+  formatQQBotProductionSendGuardError,
+  resolveQQBotAccount,
+  resolveQQBotProductionSendGuard,
+} = await import("../dist/src/config.js");
 
 const goodPatch = `
 const EXACT_FORWARD_HEADER_LINES = ["这是一次纯转发任务。"];
 const CRON_PAYLOAD_PREFIX = "QQBOT_CRON:";
+const CRON_EXACT_FORWARD_PROMPT_PREFIX_RE = /^\\[cron:[^\\]]+\\]\\s*/;
 function validateCronPayloadText(text) { return text.includes(CRON_PAYLOAD_PREFIX) ? null : "bad"; }
 function extractExactForwardMessage(message) { return { matched: true, text: message }; }
 async function runCronIsolatedAgentTurn(params) {
@@ -93,6 +99,43 @@ assert.ok(
 
 const realVendored = validateRuntimeCronPatch({ includeInstalled: false });
 assert.equal(realVendored.status, "pass", "current vendored clawdbot cron runner should preserve QQBOT_CRON patch");
+
+const guardedAccount = resolveQQBotAccount({
+  channels: {
+    qqbot: {
+      appId: "app-id",
+      clientSecret: "super-secret-client-secret",
+      enabled: true,
+    },
+  },
+});
+const blockedGuard = resolveQQBotProductionSendGuard(guardedAccount, {});
+assert.equal(blockedGuard.allowed, false, "QQBot production delivery should be blocked unless explicitly allowed");
+assert.match(
+  formatQQBotProductionSendGuardError(blockedGuard),
+  /QQBot production delivery is disabled/,
+  "blocked production guard should explain the missing explicit allow flag",
+);
+assert.equal(
+  resolveQQBotProductionSendGuard(guardedAccount, { QQBOT_ALLOW_PRODUCTION_SEND: "1" }).allowed,
+  true,
+  "QQBot production delivery should allow the explicit production env flag",
+);
+const configAllowedAccount = resolveQQBotAccount({
+  channels: {
+    qqbot: {
+      appId: "app-id",
+      clientSecret: "super-secret-client-secret",
+      enabled: true,
+      allowProductionSend: true,
+    },
+  },
+});
+assert.equal(
+  resolveQQBotProductionSendGuard(configAllowedAccount, {}).allowed,
+  true,
+  "QQBot production delivery should allow an explicit host-local config flag",
+);
 
 const configPath = path.join(fixtureDir, "openclaw.json");
 const qqbotDataDir = path.join(fixtureDir, "qqbot");
