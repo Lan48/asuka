@@ -1,7 +1,7 @@
 import type { AsukaPromise } from "./asuka-state.js";
 import { getSceneSnapshotByPeerKey } from "./asuka-state.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
-import { addCronJobDirectFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
+import { addCronJobDirectFromArgs, addCronJobLiveFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, type CronReminderPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 
 interface LoggerLike {
@@ -159,6 +159,13 @@ function nextDayLateMorning(source: Date): Date {
 
 async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: string } | { error: string }> {
   const env = getQQBotLocalOpenClawEnv();
+  const live = await addCronJobLiveFromArgs(args, { log });
+  if ("jobId" in live) {
+    return { jobId: live.jobId };
+  }
+  if (shouldAvoidOpenClawCliRecursion(env)) {
+    log?.warn?.(`[asuka-scheduler] live CronService add unavailable inside gateway, falling back to direct cron store: ${live.error}`);
+  }
   if (!env.OPENCLAW_WRAPPER?.trim()) {
     const direct = await addCronJobDirectFromArgs(args, { env, log });
     if ("jobId" in direct) {

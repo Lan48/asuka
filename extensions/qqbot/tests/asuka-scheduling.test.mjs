@@ -55,6 +55,7 @@ function readCronInvocations() {
 try {
   const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
   const { schedulePromiseJobs } = await import("../dist/src/promise-scheduler.js");
+  const { setQQBotCronService } = await import("../dist/src/runtime.js");
   const {
     appendPromiseFollowUpJob,
     buildAsukaStatePrompt,
@@ -143,18 +144,50 @@ process.exit(42);
     fs.mkdirSync(path.join(shadowCwd, "cron"), { recursive: true });
     fs.writeFileSync(path.join(shadowCwd, "cron", "jobs.json"), JSON.stringify({ version: 1, jobs: [] }));
     process.chdir(shadowCwd);
-    const directStorePromise = createPromise("约定，明天早上十点我来找你说早安。", 15_000);
+    const liveCronAdds = [];
+    setQQBotCronService({
+      add: async (input) => {
+        const id = `live-job-${liveCronAdds.length + 1}`;
+        liveCronAdds.push(input);
+        return { id, ...input, state: { nextRunAtMs: base + 99_000 } };
+      },
+    });
+    const liveCronPromise = createPromise("约定，明天早上十点我来找你说早安。", 15_000);
+    const liveCronJobs = await schedulePromiseJobs(liveCronPromise);
+    assert.ok("primaryJobId" in liveCronJobs, "gateway scheduling should use the live CronService");
+    assert.equal(liveCronJobs.primaryJobId, "live-job-1", "live CronService should return the primary job id");
+    assert.equal(liveCronJobs.followUpJobIds.length, 3, "live CronService should schedule follow-up jobs too");
+    assert.equal(liveCronAdds.length, 4, "at promise should create one primary and three follow-up jobs through live CronService");
+    assert.equal(liveCronAdds[0].sessionTarget, "isolated", "live CronService input should preserve isolated agent-turn routing");
+    assert.equal(liveCronAdds[0].payload.kind, "agentTurn", "live CronService input should use agentTurn payloads");
+    assert.equal(typeof liveCronAdds[0].payload.message, "string", "live CronService input should preserve the encoded cron message");
+    assert.equal(liveCronAdds[0].delivery.channel, "qqbot", "live CronService input should preserve QQBot delivery");
+    assert.equal(readCronInvocations().length, 5, "live CronService scheduling should not invoke openclaw CLI");
+    assert.equal(fs.existsSync(directCliLog), false, "live CronService scheduling should not run OPENCLAW_SCRIPT");
+    const cronStorePath = path.join(tmpHome, "cron", "jobs.json");
+    let directStore = fs.existsSync(cronStorePath)
+      ? JSON.parse(fs.readFileSync(cronStorePath, "utf-8"))
+      : { jobs: [] };
+    assert.equal(directStore.jobs.length, 0, "live CronService scheduling should not write directly to the cron store");
+
+    setQQBotCronService(null);
+    const directStorePromise = createPromise("约定，明天上午十一点我来找你说早安。", 16_000);
     const directStoreJobs = await schedulePromiseJobs(directStorePromise);
-    assert.ok("primaryJobId" in directStoreJobs, "gateway scheduling should write directly to cron store");
-    assert.equal(readCronInvocations().length, 5, "direct cron store scheduling should not invoke openclaw CLI");
-    assert.equal(fs.existsSync(directCliLog), false, "direct cron store scheduling should not run OPENCLAW_SCRIPT");
-    const directStore = JSON.parse(fs.readFileSync(path.join(tmpHome, "cron", "jobs.json"), "utf-8"));
+    assert.ok("primaryJobId" in directStoreJobs, "gateway scheduling should keep direct cron store as a fallback");
+    assert.equal(readCronInvocations().length, 5, "direct cron store fallback should not invoke openclaw CLI");
+    assert.equal(fs.existsSync(directCliLog), false, "direct cron store fallback should not run OPENCLAW_SCRIPT");
+    directStore = JSON.parse(fs.readFileSync(cronStorePath, "utf-8"));
     assert.ok(
       directStore.jobs.some((job) => job.id === directStoreJobs.primaryJobId),
-      "direct cron store should contain the primary job",
+      "direct cron store fallback should contain the primary job",
+    );
+    assert.equal(
+      typeof directStore.jobs.find((job) => job.id === directStoreJobs.primaryJobId)?.state?.nextRunAtMs,
+      "number",
+      "direct cron store fallback should persist nextRunAtMs for one-shot jobs",
     );
     const shadowStore = JSON.parse(fs.readFileSync(path.join(shadowCwd, "cron", "jobs.json"), "utf-8"));
-    assert.equal(shadowStore.jobs.length, 0, "direct cron store should not also write a cwd shadow store when state dir is set");
+    assert.equal(shadowStore.jobs.length, 0, "direct cron store fallback should not also write a cwd shadow store when state dir is set");
 
     process.env.OPENCLAW_STATE_DIR = path.join(tmpHome, "not-a-directory");
     fs.writeFileSync(process.env.OPENCLAW_STATE_DIR, "block mkdir");

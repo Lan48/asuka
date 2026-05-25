@@ -2,7 +2,27 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 
 import { qqbotPlugin } from "./src/channel.js";
-import { setQQBotRuntime } from "./src/runtime.js";
+import { setQQBotCronService, setQQBotRuntime } from "./src/runtime.js";
+
+type GatewayHookContext = {
+  getCron?: () => unknown;
+};
+
+type HookRegistrar = {
+  on?: (hookName: string, handler: (event: unknown, ctx: GatewayHookContext) => void | Promise<void>) => void;
+};
+
+function installCronServiceCapture(api: HookRegistrar) {
+  if (typeof api.on !== "function") return;
+  const capture = (_event: unknown, ctx: GatewayHookContext) => {
+    setQQBotCronService(ctx?.getCron?.());
+  };
+  api.on("gateway_start", capture);
+  api.on("cron_changed", capture);
+  api.on("gateway_stop", (_event: unknown, _ctx: GatewayHookContext) => {
+    setQQBotCronService(null);
+  });
+}
 
 const plugin = {
   id: "qqbot",
@@ -11,6 +31,7 @@ const plugin = {
   configSchema: emptyPluginConfigSchema(),
   register(api: OpenClawPluginApi) {
     setQQBotRuntime(api.runtime);
+    installCronServiceCapture(api);
     api.registerChannel({ plugin: qqbotPlugin });
   },
 };

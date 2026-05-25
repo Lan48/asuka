@@ -106,6 +106,8 @@ declare module "openclaw/plugin-sdk" {
     runtime: PluginRuntime;
     /** 注册频道 */
     registerChannel<TAccount = unknown>(options: { plugin: ChannelPlugin<TAccount> }): void;
+    /** 注册运行时 hook */
+    on?: (hookName: string, handler: (event: unknown, ctx: { getCron?: () => unknown; [key: string]: unknown }) => void | Promise<void>) => void;
     /** 其他 API 方法 */
     [key: string]: unknown;
   }

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { getQQBotCronService } from "../runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +37,12 @@ interface DirectCronStore {
 }
 
 type DirectCronJob = Record<string, unknown> & { id?: unknown };
+
+function extractJobId(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "string" && id.trim() ? id : null;
+}
 
 function isWindows(): boolean {
   return process.platform === "win32";
@@ -131,6 +138,26 @@ export async function execOpenClaw(args: string[], options: ExecFileOptions = {}
   };
 }
 
+export async function addCronJobLiveFromArgs(
+  args: string[],
+  options: { log?: LoggerLike } = {}
+): Promise<{ jobId: string; job: unknown } | { error: string }> {
+  try {
+    const parsed = parseCronAddArgs(args);
+    if (!parsed) return { error: "unsupported cron add args" };
+    const cron = getQQBotCronService();
+    if (!cron) return { error: "live cron service unavailable" };
+    const job = await cron.add(buildCronJobCreateInput(parsed));
+    const jobId = extractJobId(job);
+    if (!jobId) return { error: "live cron add returned no job id" };
+    options.log?.info?.(`[openclaw-command] cron add used live CronService: ${jobId}`);
+    return { jobId, job };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { error: message };
+  }
+}
+
 function readFlagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   if (index < 0) return undefined;
@@ -158,6 +185,36 @@ function parseCronAddArgs(args: string[]): ParsedCronAddArgs | null {
     to: readFlagValue(args, "--to")?.trim() || undefined,
     message,
   };
+}
+
+function buildCronJobCreateInput(parsed: ParsedCronAddArgs): Record<string, unknown> {
+  return {
+    name: parsed.name,
+    enabled: true,
+    deleteAfterRun: parsed.deleteAfterRun || Boolean(parsed.at),
+    schedule: parsed.at
+      ? { kind: "at", at: parsed.at }
+      : { kind: "cron", expr: parsed.cron, ...(parsed.tz ? { tz: parsed.tz } : {}) },
+    sessionTarget: "isolated",
+    wakeMode: "now",
+    payload: {
+      kind: "agentTurn",
+      message: parsed.message,
+      ...(parsed.model ? { model: parsed.model } : {}),
+    },
+    delivery: {
+      mode: "announce",
+      ...(parsed.channel ? { channel: parsed.channel } : {}),
+      ...(parsed.to ? { to: parsed.to } : {}),
+      ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
+    },
+  };
+}
+
+function computeDirectNextRunAtMs(parsed: ParsedCronAddArgs): number | undefined {
+  if (!parsed.at) return undefined;
+  const atMs = new Date(parsed.at).getTime();
+  return Number.isFinite(atMs) && atMs >= 0 ? atMs : undefined;
 }
 
 function resolveHomeRelative(input: string, env: NodeJS.ProcessEnv): string {
@@ -285,6 +342,7 @@ export async function addCronJobDirectFromArgs(
 
     const jobId = randomUUID();
     const createdAtMs = Date.now();
+    const nextRunAtMs = computeDirectNextRunAtMs(parsed);
     const job = {
       id: jobId,
       name: parsed.name,
@@ -307,7 +365,7 @@ export async function addCronJobDirectFromArgs(
         ...(parsed.to ? { to: parsed.to } : {}),
         ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
       },
-      state: {},
+      state: nextRunAtMs === undefined ? {} : { nextRunAtMs },
     };
 
     const written: string[] = [];
