@@ -8,7 +8,7 @@ process.env.HOME = tmpHome;
 process.env.USERPROFILE = tmpHome;
 
 const { looksLikeInternalProcessLeak, mergeBufferedQueuedMessages, parseProactiveNudge, parseVoiceReplySuffix, stripWrappingDialogueQuotes } = await import("../dist/src/gateway.js");
-const { looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
+const { looksLikeIncompleteDeliveryText, looksLikeInternalDeliveryLeak } = await import("../dist/src/outbound.js");
 const { parseQQBotPayload } = await import("../dist/src/utils/payload.js");
 
 const first = {
@@ -211,6 +211,32 @@ assert.equal(
   true,
   "invalid single-Q payload typo should still be suppressed in outbound delivery",
 );
+
+for (const incompleteText of [
+  "现在补…",
+  "我…",
+  "今天下雨，哪儿也不…",
+  "（说完自己先笑了，低头在你手背上轻轻贴了一…",
+  'QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"现在补…","tts":{"emotion":"soft"}}',
+]) {
+  assert.equal(
+    looksLikeIncompleteDeliveryText(incompleteText),
+    true,
+    `outbound should suppress incomplete delivery text: ${incompleteText.slice(0, 40)}`,
+  );
+}
+
+for (const completeText of [
+  "我在呢。",
+  "（说完自己先笑了，低头轻轻贴了一下你的手背。）",
+  'QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"我在呢。","tts":{"emotion":"soft"}}',
+]) {
+  assert.equal(
+    looksLikeIncompleteDeliveryText(completeText),
+    false,
+    `outbound should allow complete delivery text: ${completeText.slice(0, 40)}`,
+  );
+}
 
 for (const leakedOutboundText of [
   'Reasoning:\n_The user is reacting with "?" to my previous silent acknowledgement._',

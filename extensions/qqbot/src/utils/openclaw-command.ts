@@ -5,6 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getQQBotCronService } from "../runtime.js";
+import {
+  addScheduledDeliveryJob,
+  extractRawQQBotCronMessage,
+  removeScheduledDeliveryJob,
+  type ScheduledDeliverySchedule,
+} from "../scheduled-delivery-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -145,6 +151,12 @@ export async function addCronJobLiveFromArgs(
   try {
     const parsed = parseCronAddArgs(args);
     if (!parsed) return { error: "unsupported cron add args" };
+    const scheduledDelivery = await tryAddQQBotScheduledDelivery(parsed, { log: options.log });
+    if ("jobId" in scheduledDelivery) {
+      options.log?.info?.(`[openclaw-command] cron add used QQBot scheduled delivery: ${scheduledDelivery.jobId}`);
+      return { jobId: scheduledDelivery.jobId, job: scheduledDelivery.job };
+    }
+    if (scheduledDelivery.error) return { error: scheduledDelivery.error };
     const cron = getQQBotCronService();
     if (!cron) return { error: "live cron service unavailable" };
     const job = await cron.add(buildCronJobCreateInput(parsed));
@@ -165,6 +177,11 @@ export async function removeCronJobLive(
   const id = jobId.trim();
   if (!id) return { error: "missing cron job id" };
   try {
+    const scheduledDelivery = await removeScheduledDeliveryJob(id);
+    if ("removedCount" in scheduledDelivery && scheduledDelivery.removedCount > 0) {
+      options.log?.info?.(`[openclaw-command] cron remove used QQBot scheduled delivery store: ${id}`);
+      return { removed: true };
+    }
     const cron = getQQBotCronService();
     if (!cron?.remove) return { error: "live cron service remove unavailable" };
     await cron.remove(id);
@@ -227,6 +244,34 @@ function buildCronJobCreateInput(parsed: ParsedCronAddArgs): Record<string, unkn
       ...(parsed.accountId ? { accountId: parsed.accountId } : {}),
     },
   };
+}
+
+function buildScheduledDeliverySchedule(parsed: ParsedCronAddArgs): ScheduledDeliverySchedule {
+  return parsed.at
+    ? { kind: "at", at: parsed.at }
+    : { kind: "cron", expr: parsed.cron ?? "", ...(parsed.tz ? { tz: parsed.tz } : {}) };
+}
+
+async function tryAddQQBotScheduledDelivery(
+  parsed: ParsedCronAddArgs,
+  options: { env?: NodeJS.ProcessEnv; log?: LoggerLike } = {},
+): Promise<{ jobId: string; job: unknown; storePath: string } | { skipped: true; error?: string } | { error: string }> {
+  if (parsed.channel !== "qqbot") return { skipped: true };
+  const rawMessage = extractRawQQBotCronMessage(parsed.message);
+  if (!rawMessage) return { skipped: true };
+  const target = parsed.to?.trim();
+  if (!target) return { error: "QQBot scheduled delivery requires --to" };
+  return await addScheduledDeliveryJob({
+    name: parsed.name,
+    accountId: parsed.accountId,
+    to: target,
+    message: rawMessage,
+    schedule: buildScheduledDeliverySchedule(parsed),
+    deleteAfterRun: parsed.deleteAfterRun || Boolean(parsed.at),
+  }, {
+    env: options.env,
+    log: options.log,
+  });
 }
 
 function computeDirectNextRunAtMs(parsed: ParsedCronAddArgs): number | undefined {
@@ -355,6 +400,12 @@ export async function addCronJobDirectFromArgs(
   try {
     const parsed = parseCronAddArgs(args);
     if (!parsed) return { error: "unsupported cron add args" };
+    const scheduledDelivery = await tryAddQQBotScheduledDelivery(parsed, { env: options.env, log: options.log });
+    if ("jobId" in scheduledDelivery) {
+      options.log?.info?.(`[openclaw-command] cron add wrote QQBot scheduled delivery: ${scheduledDelivery.storePath}`);
+      return { jobId: scheduledDelivery.jobId, storePaths: [scheduledDelivery.storePath] };
+    }
+    if (scheduledDelivery.error) return { error: scheduledDelivery.error };
     const storePaths = resolveCronStoreCandidates(options.env ?? process.env);
     if (storePaths.length === 0) return { error: "no cron store path resolved" };
 
@@ -414,6 +465,11 @@ export async function removeCronJobDirect(
   const id = jobId.trim();
   if (!id) return { error: "missing cron job id" };
   try {
+    const scheduledDelivery = await removeScheduledDeliveryJob(id, { env: options.env, log: options.log });
+    if ("removedCount" in scheduledDelivery && scheduledDelivery.removedCount > 0) {
+      options.log?.info?.(`[openclaw-command] cron remove deleted QQBot scheduled delivery: ${id}`);
+      return { removedCount: scheduledDelivery.removedCount, storePaths: [scheduledDelivery.storePath] };
+    }
     const storePaths = resolveCronStoreCandidates(options.env ?? process.env);
     if (storePaths.length === 0) return { error: "no cron store path resolved" };
 

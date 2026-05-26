@@ -63,6 +63,7 @@ const INTERNAL_DELIVERY_LEAK_RE = /(^|\n)\s*Reasoning\s*:|⏳\s*已收到，正�
 const SYSTEM_DELIVERY_NOISE_RE = /(?:^|\n)\s*⚠️?\s*Cron job\s+"[^"]+"\s+failed:\s*cron:\s*job interrupted by gateway restart|cron:\s*job interrupted by gateway restart/i;
 const SKILL_PROCESS_LEAK_RE = /(?:imagegen|asuka-selfie|qqbot-media)\s+skill|根据\s*(?:imagegen\s*)?skill|读取\s*(?:skill|技能)\s*文件|skill\s*文件/i;
 const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+const STRUCTURED_PAYLOAD_PREFIX_RE = /(?:QQBOT|QBOT)_PAYLOAD\s*:/i;
 const BASE64ISH_TEXT_RE = /^[A-Za-z0-9+/=]{48,}$/;
 const DEBUG_PROBE_TEXT_RE = /^(?:test(?:\s+again|\d*)?|\.)$/i;
 let openClawConfigCache: any | undefined;
@@ -714,6 +715,41 @@ export function looksLikeInternalDeliveryLeak(text: string): boolean {
   return INTERNAL_DELIVERY_LEAK_RE.test(cleaned);
 }
 
+function containsStructuredPayloadPrefix(text: string): boolean {
+  return STRUCTURED_PAYLOAD_PREFIX_RE.test(text);
+}
+
+function countChar(text: string, char: string): number {
+  return [...text].filter((item) => item === char).length;
+}
+
+export function looksLikeIncompleteDeliveryText(text: string): boolean {
+  const payloadResult = parseQQBotPayload(text);
+  if (payloadResult.isPayload && payloadResult.payload && isMediaPayload(payloadResult.payload) && payloadResult.payload.mediaType === "audio") {
+    const spokenText = stripTTSControlMarkers(payloadResult.payload.path);
+    if (spokenText && looksLikeIncompletePlainDeliveryText(spokenText)) return true;
+  }
+  const cleaned = extractOutboundVisibleTextForLeakInspection(text)
+    .replace(/\s+/g, " ")
+    .trim();
+  return looksLikeIncompletePlainDeliveryText(cleaned);
+}
+
+function looksLikeIncompletePlainDeliveryText(cleaned: string): boolean {
+  if (!cleaned) return false;
+  const ellipsis = "(?:…|⋯|\\.\\.\\.|。。)+";
+  if (new RegExp(`^(?:我|你|她|他|它|这|那|嗯|啊|呃|现在补|现在|今天下雨，哪儿也不)\\s*${ellipsis}$`).test(cleaned)) {
+    return true;
+  }
+  if (/^现在补\s*$/.test(cleaned)) return true;
+  if (new RegExp(`(?:了一|不|补)\\s*${ellipsis}$`).test(cleaned)) return true;
+  if (/[,，、:：;；]\s*(?:[…⋯.。]+)?$/.test(cleaned)) return true;
+  if (countChar(cleaned, "（") > countChar(cleaned, "）")) return true;
+  if (countChar(cleaned, "(") > countChar(cleaned, ")") && /(^|\s)\([^)]*$/.test(cleaned)) return true;
+  if (cleaned.length <= 6 && new RegExp(`${ellipsis}$`).test(cleaned)) return true;
+  return false;
+}
+
 function extractOutboundVisibleTextForLeakInspection(text: string): string {
   const payloadResult = parseQQBotPayload(text);
   if (!payloadResult.isPayload || payloadResult.error || !payloadResult.payload) return text;
@@ -762,6 +798,41 @@ function stripTTSControlMarkers(text: string): string {
     .replace(ASUKA_TTS_INTERJECTION_RE, "")
     .replace(MINIMAX_TTS_INTERJECTION_RE, "")
     .trim();
+}
+
+function normalizeSafeOutboundFallbackText(parts: Array<string | undefined>): string {
+  const text = parts
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .replace(STRUCTURED_ARTIFACT_RE, "")
+    .trim();
+  if (!text) return "";
+  if (containsStructuredPayloadPrefix(text)) return "";
+  if (looksLikeInternalDeliveryLeak(text) || looksLikeIncompleteDeliveryText(text)) return "";
+  return text;
+}
+
+function extractSafeStructuredPayloadFallbackText(text: string): string {
+  const payloadResult = parseQQBotPayload(text);
+  if (!payloadResult.isPayload) return "";
+  const visibleText = [payloadResult.leadingText, payloadResult.trailingText]
+    .filter((part): part is string => Boolean(part && part.trim()))
+    .join("\n\n")
+    .trim();
+  if (payloadResult.error || !payloadResult.payload) {
+    return normalizeSafeOutboundFallbackText([visibleText]);
+  }
+  const payload = payloadResult.payload;
+  if (isMediaPayload(payload)) {
+    const safeMediaText = payload.mediaType === "audio" && !isLocalFilePath(normalizePath(payload.path)) && !isAudioFile(payload.path)
+      ? stripTTSControlMarkers(payload.path)
+      : undefined;
+    return normalizeSafeOutboundFallbackText([visibleText, payload.caption, safeMediaText]);
+  }
+  if (isSelfiePayload(payload)) {
+    return normalizeSafeOutboundFallbackText([visibleText, payload.caption]);
+  }
+  return normalizeSafeOutboundFallbackText([visibleText]);
 }
 
 async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<OutboundResult | null> {
@@ -859,7 +930,12 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[qqbot] sendText: structured audio payload failed, falling back to text: ${message}`);
-      return await sendText({ ...ctx, text: visibleTtsText || ttsText });
+      const fallbackText = extractSafeStructuredPayloadFallbackText(ctx.text);
+      if (!fallbackText) {
+        console.warn("[qqbot] sendText: structured audio fallback suppressed because no safe visible text remained");
+        return { channel: "qqbot" };
+      }
+      return await sendText({ ...ctx, text: fallbackText });
     }
   }
 
@@ -1043,8 +1119,13 @@ function normalizeGeneratedDeliveryText(text: string): string {
 }
 
 function isFilteredGeneratedDeliveryText(text: string, promptTimeZone: string): boolean {
-  if (isAllowedProactiveAudioPayload(text)) return false;
-  return looksLikeInternalDeliveryLeak(text) || containsUnsupportedCronMarkup(text) || isTimeContradictoryDeliveryText(text, promptTimeZone);
+  if (isAllowedProactiveAudioPayload(text)) {
+    return looksLikeIncompleteDeliveryText(text);
+  }
+  return looksLikeInternalDeliveryLeak(text)
+    || looksLikeIncompleteDeliveryText(text)
+    || containsUnsupportedCronMarkup(text)
+    || isTimeContradictoryDeliveryText(text, promptTimeZone);
 }
 
 function buildProactiveVoiceDeliveryRules(): string[] {
@@ -1995,6 +2076,24 @@ export function resolveCronDeliveryFallbackText(
   return trimDeliveryText(fallback || "");
 }
 
+function selectSafeCronDeliveryText(
+  account: ResolvedQQBotAccount,
+  payload: DecodedCronPayload,
+  renderedText: string,
+): string | null {
+  const promptTimeZone = getPromptTimeZone(account);
+  const fallbackText = resolveCronDeliveryFallbackText(payload);
+  const candidates = [renderedText, fallbackText, payload.content]
+    .map((item) => (item ?? "").trim())
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    if (!isFilteredGeneratedDeliveryText(candidate, promptTimeZone)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 async function renderDeliveryTextFromSharedSession(
   account: ResolvedQQBotAccount,
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
@@ -2299,10 +2398,24 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
     if (structuredResult) {
       return structuredResult;
     }
+    if (containsStructuredPayloadPrefix(text)) {
+      const fallbackText = extractSafeStructuredPayloadFallbackText(text);
+      if (fallbackText) {
+        console.warn("[qqbot] sendText: structured payload was not handled; sending safe visible fallback text");
+        return await sendText({ ...ctx, text: fallbackText });
+      }
+      console.warn(`[qqbot] sendText: suppressed unhandled structured payload: ${text.slice(0, 160)}`);
+      return { channel: "qqbot" };
+    }
   }
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed internal delivery leak: ${text.slice(0, 160)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(text)) {
+    console.warn(`[qqbot] sendText: suppressed incomplete delivery text: ${text.slice(0, 160)}`);
     return { channel: "qqbot" };
   }
 
@@ -2830,8 +2943,17 @@ export async function sendProactiveMessage(
   if (productionGuardError) return productionGuardError;
 
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
+  if (!cronProbe.isCronPayload && containsStructuredPayloadPrefix(text)) {
+    return await sendText({ account, accountId: account.accountId, to, text, replyToId: null, skipContextRender: true });
+  }
+
   if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
+    return { channel: "qqbot" };
+  }
+
+  if (!cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(text)) {
+    console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed incomplete delivery text: ${text.slice(0, 160)}`);
     return { channel: "qqbot" };
   }
 
@@ -2875,6 +2997,10 @@ export async function sendProactiveMessage(
       if (rendered) {
         deliveryText = rendered;
       }
+    }
+    if (!cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(deliveryText)) {
+      console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed incomplete rendered text: ${deliveryText.slice(0, 160)}`);
+      return { channel: "qqbot" };
     }
 
     const textSegments = splitAsukaNarrationSegments(deliveryText);
@@ -3565,18 +3691,27 @@ export async function sendCronMessage(
         : payload.targetAddress;
       console.log("[qqbot] sendCronMessage: entering shared-context render stage");
       const deliveryText = await renderPromiseDeliveryText(account, payload);
+      const safeDeliveryText = selectSafeCronDeliveryText(account, payload, deliveryText);
+      if (!safeDeliveryText) {
+        const reason = "incomplete_or_internal_delivery_text";
+        console.warn(`[${timestamp}] [qqbot] sendCronMessage: suppressed unsafe cron delivery text: ${deliveryText.slice(0, 160)}`);
+        if (payload.promiseId) {
+          markPromiseDeliveryFailed(payload.promiseId, reason);
+        }
+        return { channel: "qqbot", skipped: true, skipReason: reason };
+      }
       await maybeSendRepairBeforeProactive(account, payload, targetTo, timestamp);
       
       if (payload.selfiePrompt && payload.targetType === "c2c") {
         console.log(`[${timestamp}] [qqbot] sendCronMessage: fulfilling selfie promise directly for target=${payload.targetAddress}`);
-        const result = await runDirectSelfieFlowForCron(account, payload, deliveryText);
+        const result = await runDirectSelfieFlowForCron(account, payload, safeDeliveryText);
         if (result.error || result.skipped) {
           const failureReason = result.error || result.skipReason || "generated selfie send skipped";
           console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${failureReason}`);
           if (payload.promiseId) {
             markPromiseDeliveryFailed(payload.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
           }
-          const fallbackResult = await sendCronSelfieFallbackImage(account, payload, deliveryText, failureReason);
+          const fallbackResult = await sendCronSelfieFallbackImage(account, payload, safeDeliveryText, failureReason);
           if (fallbackResult.skipped) {
             if (payload.promiseId) {
               markPromiseDeliveryFallback(payload.promiseId, {
@@ -3604,12 +3739,12 @@ export async function sendCronMessage(
         if (payload.promiseId) {
           markPromiseDelivered(payload.promiseId, {
             isFollowUp: payload.mode === "followup" || payload.mode === "repair",
-            content: deliveryText,
+            content: safeDeliveryText,
           });
         }
         if ((payload.mode === "ambient" || payload.mode === "repair") && payload.peerKey) {
           markProactiveDelivered(payload.peerKey, {
-            content: deliveryText,
+            content: safeDeliveryText,
             threadId: payload.ambientThreadId,
             stage: payload.ambientStage,
             advancePolicy,
@@ -3619,7 +3754,7 @@ export async function sendCronMessage(
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
-          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText, timestamp);
+          await refreshProactiveSceneAfterDelivery(account, payload, safeDeliveryText, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {
@@ -3637,7 +3772,7 @@ export async function sendCronMessage(
         account,
         accountId: account.accountId,
         to: targetTo,
-        text: deliveryText || payload.content,
+        text: safeDeliveryText,
         replyToId: null,
         skipContextRender: true,
       });
@@ -3658,12 +3793,12 @@ export async function sendCronMessage(
         if (payload.promiseId) {
           markPromiseDelivered(payload.promiseId, {
             isFollowUp: payload.mode === "followup" || payload.mode === "repair",
-            content: deliveryText || payload.content,
+            content: safeDeliveryText,
           });
         }
         if ((payload.mode === "ambient" || payload.mode === "repair") && payload.peerKey) {
           markProactiveDelivered(payload.peerKey, {
-            content: deliveryText || payload.content,
+            content: safeDeliveryText,
             threadId: payload.ambientThreadId,
             stage: payload.ambientStage,
             advancePolicy,
@@ -3673,7 +3808,7 @@ export async function sendCronMessage(
             sceneVersion: payload.sceneVersion,
             sceneSnapshotLabel: payload.sceneSnapshotLabel,
           });
-          await refreshProactiveSceneAfterDelivery(account, payload, deliveryText || payload.content, timestamp);
+          await refreshProactiveSceneAfterDelivery(account, payload, safeDeliveryText, timestamp);
           if (peerContext) {
             const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
             if (nextJobs.length > 0) {
@@ -3689,6 +3824,10 @@ export async function sendCronMessage(
   
   // 非结构化载荷，作为普通文本处理
   console.log(`[${timestamp}] [qqbot] sendCronMessage: plain text message, sending to ${to}`);
+  if (looksLikeIncompleteDeliveryText(message)) {
+    console.warn(`[${timestamp}] [qqbot] sendCronMessage: suppressed incomplete plain cron text: ${message.slice(0, 160)}`);
+    return { channel: "qqbot", skipped: true, skipReason: "incomplete_delivery_text" };
+  }
   if (await deferCronMessageUntilQuietEnds(account, to, message, timestamp)) {
     return { channel: "qqbot" };
   }

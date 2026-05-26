@@ -34,6 +34,7 @@ process.env.QQBOT_TEST_CRON_SEQ = cronSeq;
 
 const base = Date.UTC(2026, 3, 26, 0, 0, 0);
 const stateFile = path.join(tmpHome, ".openclaw", "qqbot", "data", "asuka-state", "state.json");
+const scheduledDeliveryFile = path.join(tmpHome, ".openclaw", "qqbot", "data", "scheduled-deliveries.json");
 
 const direct = {
   accountId: "acct-test",
@@ -49,7 +50,13 @@ function readState() {
 }
 
 function readCronInvocations() {
+  if (!fs.existsSync(cronLog)) return [];
   return fs.readFileSync(cronLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function readScheduledDeliveries() {
+  if (!fs.existsSync(scheduledDeliveryFile)) return { version: 1, jobs: [] };
+  return JSON.parse(fs.readFileSync(scheduledDeliveryFile, "utf-8"));
 }
 
 try {
@@ -94,9 +101,9 @@ try {
   const atPromise = createPromise("拉钩，明天早上九点我来找你说早安。", 1_000);
   assert.equal(atPromise.schedule?.kind, "at", "hard promise should have an at schedule");
   const atJobs = await schedulePromiseJobs(atPromise);
-  assert.ok("primaryJobId" in atJobs, "at scheduling should succeed through stubbed openclaw");
-  assert.equal(atJobs.primaryJobId, "job-1", "at scheduling should return primary job id");
-  assert.deepEqual(atJobs.followUpJobIds, ["job-2", "job-3", "job-4"], "at scheduling should return three follow-up job ids");
+  assert.ok("primaryJobId" in atJobs, "at scheduling should succeed through QQBot scheduled delivery");
+  assert.match(atJobs.primaryJobId, /^[0-9a-f-]{36}$/i, "at scheduling should return an internal scheduled delivery id");
+  assert.equal(atJobs.followUpJobIds.length, 3, "at scheduling should return three follow-up job ids");
 
   markPromiseScheduled(atPromise.id, atJobs.primaryJobId, base + 2_000);
   for (const jobId of atJobs.followUpJobIds) {
@@ -104,26 +111,36 @@ try {
   }
   const stateAfterSchedule = readState();
   const persistedAt = stateAfterSchedule.promises[atPromise.id];
-  assert.equal(persistedAt.cronJobId, "job-1", "primary job id should persist separately");
+  assert.equal(persistedAt.cronJobId, atJobs.primaryJobId, "primary job id should persist separately");
   assert.equal(persistedAt.followUpJobIds.length, 3, "follow-up job ids should persist separately");
   assert.equal(persistedAt.state, "scheduled", "scheduled promise should have scheduled state");
   assert.equal(typeof persistedAt.scheduledAt, "number", "scheduled promise should expose scheduledAt");
 
   const atInvocations = readCronInvocations();
-  assert.equal(atInvocations.length, 4, "at promise should create one primary and three follow-up cron jobs");
-  assert.ok(atInvocations.some((args) => args.some((arg) => arg.includes("asuka-hard-followup-1"))), "cron args should include followup-1 job name");
-  assert.ok(atInvocations.some((args) => args.some((arg) => arg.includes("asuka-hard-followup-2"))), "cron args should include followup-2 job name");
-  assert.ok(atInvocations.some((args) => args.some((arg) => arg.includes("asuka-hard-followup-3"))), "cron args should include followup-3 job name");
+  assert.equal(atInvocations.length, 0, "QQBot cron payloads should not invoke OpenClaw cron");
+  let scheduledDeliveries = readScheduledDeliveries();
+  assert.equal(scheduledDeliveries.jobs.length, 4, "at promise should create one primary and three follow-up scheduled deliveries");
+  assert.ok(scheduledDeliveries.jobs.every((job) => job.message.startsWith("QQBOT_CRON:")), "scheduled deliveries should store raw QQBOT_CRON payloads");
+  assert.ok(scheduledDeliveries.jobs.every((job) => !job.message.includes("纯转发任务")), "scheduled deliveries should not store agent-turn wrapper prompts");
+  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-1")), "scheduled jobs should include followup-1 job name");
+  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-2")), "scheduled jobs should include followup-2 job name");
+  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-3")), "scheduled jobs should include followup-3 job name");
 
   const cronPromise = createPromise("我会每天早上九点给你发早安。", 10_000);
   assert.equal(cronPromise.schedule?.kind, "cron", "daily promise should have a cron schedule");
   const cronJobs = await schedulePromiseJobs(cronPromise);
-  assert.ok("primaryJobId" in cronJobs, "cron scheduling should succeed through stubbed openclaw");
-  assert.equal(cronJobs.primaryJobId, "job-5", "cron scheduling should return primary job id");
+  assert.ok("primaryJobId" in cronJobs, "cron scheduling should succeed through QQBot scheduled delivery");
+  assert.match(cronJobs.primaryJobId, /^[0-9a-f-]{36}$/i, "cron scheduling should return an internal scheduled delivery id");
   assert.equal(cronJobs.followUpJobIds.length, 0, "cron scheduling should not create follow-up jobs");
   const allInvocations = readCronInvocations();
-  assert.equal(allInvocations.length, 5, "cron promise should add one more cron invocation");
-  assert.ok(allInvocations[4].includes("--cron"), "cron scheduling args should include --cron");
+  assert.equal(allInvocations.length, 0, "cron promise should not invoke OpenClaw cron");
+  scheduledDeliveries = readScheduledDeliveries();
+  assert.equal(scheduledDeliveries.jobs.length, 5, "cron promise should add one more scheduled delivery");
+  assert.equal(
+    scheduledDeliveries.jobs.find((job) => job.id === cronJobs.primaryJobId)?.schedule?.kind,
+    "cron",
+    "cron scheduling should persist a recurring scheduled delivery",
+  );
 
   const directCliLog = path.join(tmpHome, "direct-cli-should-not-run.log");
   const failingOpenClawScript = path.join(tmpBin, "openclaw-fail.cjs");
@@ -159,67 +176,37 @@ process.exit(42);
     });
     const liveCronPromise = createPromise("约定，明天早上十点我来找你说早安。", 15_000);
     const liveCronJobs = await schedulePromiseJobs(liveCronPromise);
-    assert.ok("primaryJobId" in liveCronJobs, "gateway scheduling should use the live CronService");
-    assert.equal(liveCronJobs.primaryJobId, "live-job-1", "live CronService should return the primary job id");
-    assert.equal(liveCronJobs.followUpJobIds.length, 3, "live CronService should schedule follow-up jobs too");
-    assert.equal(liveCronAdds.length, 4, "at promise should create one primary and three follow-up jobs through live CronService");
-    assert.equal(liveCronAdds[0].sessionTarget, "isolated", "live CronService input should preserve isolated agent-turn routing");
-    assert.equal(liveCronAdds[0].payload.kind, "agentTurn", "live CronService input should use agentTurn payloads");
-    assert.equal(typeof liveCronAdds[0].payload.message, "string", "live CronService input should preserve the encoded cron message");
-    assert.equal(liveCronAdds[0].delivery.channel, "qqbot", "live CronService input should preserve QQBot delivery");
-    assert.equal(readCronInvocations().length, 5, "live CronService scheduling should not invoke openclaw CLI");
+    assert.ok("primaryJobId" in liveCronJobs, "gateway scheduling should use QQBot scheduled delivery before live CronService");
+    assert.match(liveCronJobs.primaryJobId, /^[0-9a-f-]{36}$/i, "gateway scheduling should return an internal scheduled delivery id");
+    assert.equal(liveCronJobs.followUpJobIds.length, 3, "gateway scheduling should schedule follow-up jobs too");
+    assert.equal(liveCronAdds.length, 0, "QQBot internal cron payloads should not enter live CronService agentTurn routing");
+    assert.equal(readCronInvocations().length, 0, "live gateway scheduling should not invoke openclaw CLI");
     assert.equal(fs.existsSync(directCliLog), false, "live CronService scheduling should not run OPENCLAW_SCRIPT");
-    const liveRemove = await removeCronJobLive("live-job-1");
-    assert.ok("removed" in liveRemove, "live CronService removal should succeed");
-    assert.deepEqual(
-      liveCronAdds[liveCronAdds.length - 1],
-      { removed: "live-job-1" },
-      "live CronService removal should use the captured in-process service",
-    );
+    const beforeLiveRemove = readScheduledDeliveries().jobs.length;
+    const liveRemove = await removeCronJobLive(liveCronJobs.primaryJobId);
+    assert.ok("removed" in liveRemove, "live removal should remove internal scheduled delivery jobs");
+    assert.equal(readScheduledDeliveries().jobs.length, beforeLiveRemove - 1, "live removal should delete the internal scheduled delivery");
     const cronStorePath = path.join(tmpHome, "cron", "jobs.json");
     let directStore = fs.existsSync(cronStorePath)
       ? JSON.parse(fs.readFileSync(cronStorePath, "utf-8"))
       : { jobs: [] };
-    assert.equal(directStore.jobs.length, 0, "live CronService scheduling should not write directly to the cron store");
+    assert.equal(directStore.jobs.length, 0, "QQBot scheduled delivery should not write directly to the OpenClaw cron store");
 
     setQQBotCronService(null);
     const directStorePromise = createPromise("约定，明天上午十一点我来找你说早安。", 16_000);
     const directStoreJobs = await schedulePromiseJobs(directStorePromise);
-    assert.ok("primaryJobId" in directStoreJobs, "gateway scheduling should keep direct cron store as a fallback");
-    assert.equal(readCronInvocations().length, 5, "direct cron store fallback should not invoke openclaw CLI");
-    assert.equal(fs.existsSync(directCliLog), false, "direct cron store fallback should not run OPENCLAW_SCRIPT");
-    directStore = JSON.parse(fs.readFileSync(cronStorePath, "utf-8"));
-    assert.ok(
-      directStore.jobs.some((job) => job.id === directStoreJobs.primaryJobId),
-      "direct cron store fallback should contain the primary job",
-    );
-    assert.equal(
-      typeof directStore.jobs.find((job) => job.id === directStoreJobs.primaryJobId)?.state?.nextRunAtMs,
-      "number",
-      "direct cron store fallback should persist nextRunAtMs for one-shot jobs",
-    );
+    assert.ok("primaryJobId" in directStoreJobs, "gateway scheduling should still use QQBot scheduled delivery without live CronService");
+    assert.equal(readCronInvocations().length, 0, "internal scheduled delivery should not invoke openclaw CLI");
+    assert.equal(fs.existsSync(directCliLog), false, "internal scheduled delivery should not run OPENCLAW_SCRIPT");
+    directStore = fs.existsSync(cronStorePath)
+      ? JSON.parse(fs.readFileSync(cronStorePath, "utf-8"))
+      : { jobs: [] };
+    assert.equal(directStore.jobs.length, 0, "internal scheduled delivery should not write OpenClaw cron jobs");
     const directRemove = await removeCronJobDirect(directStoreJobs.primaryJobId, { env: process.env });
     assert.ok("removedCount" in directRemove, "direct cron store removal should return a removal count");
-    assert.equal(directRemove.removedCount, 1, "direct cron store removal should remove the matching job");
-    directStore = JSON.parse(fs.readFileSync(cronStorePath, "utf-8"));
-    assert.equal(
-      directStore.jobs.some((job) => job.id === directStoreJobs.primaryJobId),
-      false,
-      "direct cron store removal should persist the deleted job",
-    );
+    assert.equal(directRemove.removedCount, 1, "direct removal should remove the matching scheduled delivery");
     const shadowStore = JSON.parse(fs.readFileSync(path.join(shadowCwd, "cron", "jobs.json"), "utf-8"));
-    assert.equal(shadowStore.jobs.length, 0, "direct cron store fallback should not also write a cwd shadow store when state dir is set");
-
-    process.env.OPENCLAW_STATE_DIR = path.join(tmpHome, "not-a-directory");
-    fs.writeFileSync(process.env.OPENCLAW_STATE_DIR, "block mkdir");
-    const directFailure = await schedulePromiseJobs(directStorePromise);
-    assert.ok("error" in directFailure, "gateway scheduling should report direct-store failures");
-    assert.match(
-      directFailure.error,
-      /skipped openclaw CLI fallback/,
-      "gateway scheduling should skip recursive openclaw CLI fallback after direct-store failure",
-    );
-    assert.equal(fs.existsSync(directCliLog), false, "failed direct-store scheduling inside gateway should not run OPENCLAW_SCRIPT");
+    assert.equal(shadowStore.jobs.length, 0, "internal scheduled delivery should not write a cwd shadow store when state dir is set");
   } finally {
     process.chdir(originalCwd);
     process.argv.splice(0, process.argv.length, ...originalArgv);

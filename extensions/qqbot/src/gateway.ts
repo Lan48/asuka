@@ -28,6 +28,7 @@ import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } 
 import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
+import { startScheduledDeliveryRunner } from "./scheduled-delivery-runner.js";
 import { execOpenClaw, removeCronJobDirect, removeCronJobLive, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 import { buildTimeAwareDeliveryFallback, isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
@@ -1962,6 +1963,8 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     log,
   });
   abortSignal?.addEventListener("abort", stopDailyDigestScheduler, { once: true });
+  const stopScheduledDeliveryRunner = startScheduledDeliveryRunner(account, { log, abortSignal });
+  abortSignal?.addEventListener("abort", stopScheduledDeliveryRunner, { once: true });
 
   let reconnectAttempts = 0;
   let isAborted = false;
