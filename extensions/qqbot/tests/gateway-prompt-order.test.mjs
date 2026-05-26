@@ -320,6 +320,11 @@ assert.match(
   /不要说“我去拍一张，等我一下”[\s\S]{0,900}只输出一段自然[\s\S]{0,900}文本发送后[\s\S]{0,900}刚刚生成的可见回复生成图片 prompt/,
   "trailing dash selfie trigger should make the model generate normal text before the post-reply image prompt stage"
 );
+assert.match(
+  trailingDashInstruction,
+  /不要输出任何 QQBOT_PAYLOAD[\s\S]{0,120}<qqimg> 标签[\s\S]{0,120}本地图片路径/,
+  "trailing dash selfie trigger should forbid model-authored media tags and local image paths"
+);
 assert.doesNotMatch(
   trailingDashInstruction,
   /QQBOT_PAYLOAD selfie/,
@@ -420,6 +425,20 @@ assert.match(
   source,
   /No response within timeout[\s\S]{0,900}forceSelfieFromTrailingDash[\s\S]{0,900}resolveSelfieVisiblePayloadText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
   "trailing dash selfie requests should fall back to visible text plus selfie generation when the model turn times out"
+);
+const mediaTagGuardIndex = source.indexOf("Ignored model media tags in forced trailing-dash image turn");
+const parsePromisesIndex = source.indexOf("deliver postprocess parse-promises start");
+assert.ok(mediaTagGuardIndex >= 0, "forced trailing-dash image turns should ignore model-authored media tags");
+assert.ok(parsePromisesIndex >= 0, "gateway should still parse assistant promises after normalizing send text");
+assert.ok(
+  mediaTagGuardIndex < parsePromisesIndex,
+  "forced trailing-dash media tag guard should run before assistant reply postprocessing and send queue construction"
+);
+const mediaTagGuardSnippet = source.slice(mediaTagGuardIndex - 900, mediaTagGuardIndex + 500);
+assert.match(
+  mediaTagGuardSnippet,
+  /forceSelfieFromTrailingDash[\s\S]{0,220}hasQQBotMediaTag\(replyText\)[\s\S]{0,520}stripMediaTagsForVisibleText[\s\S]{0,520}resolveTimeSafeVisibleReplyText\(selfieVisibleText,\s*\{\s*forceImage:\s*true\s*\}\)/,
+  "forced trailing-dash media tag guard should strip fake paths and keep deterministic image flow"
 );
 assert.match(
   source,

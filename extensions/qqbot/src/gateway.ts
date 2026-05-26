@@ -454,7 +454,7 @@ function truncateForSelfiePrompt(text: string, maxChars: number): string {
 
 function sanitizeSelfieContextText(text: string): string {
   const cleaned = text
-    .replace(/<qqimg>[\s\S]*?<\/(?:qqimg|img)>/gi, "")
+    .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
     .replace(STRUCTURED_ARTIFACT_RE, "")
     .replace(SYSTEM_DELIVERY_NOISE_RE, "")
     .replace(SKILL_PROCESS_LEAK_RE, "")
@@ -462,6 +462,17 @@ function sanitizeSelfieContextText(text: string): string {
     .replace(/\s+/g, " ")
     .trim();
   return looksLikeTransportFallbackText(cleaned) ? "" : cleaned;
+}
+
+function hasQQBotMediaTag(text: string): boolean {
+  return /<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/i.test(text);
+}
+
+function stripMediaTagsForVisibleText(text: string): string {
+  return text
+    .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function looksLikeTransportFallbackText(text: string): boolean {
@@ -2990,7 +3001,7 @@ ${ttsHint}${sttHint}`;
           forceSelfieFromTrailingDash
             ? [
                 "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求按当前语境生成并发送 Asuka 主角图片；图片内容以用户正文和最近上下文为准，不一定是手持自拍。",
-                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。本阶段只输出一段自然、承接上下文的用户可见回复，不要输出任何图片载荷、内部 prompt 或执行过程。",
+                "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。本阶段只输出一段自然、承接上下文的用户可见回复，不要输出任何 QQBOT_PAYLOAD、<qqimg> 标签、本地图片路径、内部 prompt 或执行过程。",
                 "- 后续内部流程会在这段文本发送后，再用用户正文、最近上下文和刚刚生成的可见回复生成图片 prompt，然后单独发送图片。",
                 "- 内容要求: 后续图片必须以 Asuka 为画面主角，并结合用户要求的元素、地点、动作、构图和情绪；如果用户要食物、房间、物体、风景或道具，就生成 Asuka 与这些元素同框的当前情景图片，不要把所有请求都写成固定自拍。",
               ].join("\n")
@@ -3652,6 +3663,20 @@ ${ttsHint}${sttHint}`;
                 
                 // 预处理：纠正小模型常见的标签拼写错误和格式问题
                 replyText = normalizeMediaTags(replyText);
+
+                if (forceSelfieFromTrailingDash && event.type === "c2c" && hasQQBotMediaTag(replyText)) {
+                  const visibleTextWithoutMediaTags = stripMediaTagsForVisibleText(stripStructuredPayloadForVisibleText(replyText));
+                  const selfieVisibleText = resolveSelfieVisiblePayloadText(
+                    replyText,
+                    visibleTextWithoutMediaTags,
+                    undefined,
+                    userContent,
+                  );
+                  replyText = resolveTimeSafeVisibleReplyText(selfieVisibleText, { forceImage: true });
+                  log?.info(
+                    `[qqbot:${account.accountId}] Ignored model media tags in forced trailing-dash image turn; deterministic image flow will run after visible reply`
+                  );
+                }
 
                 appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${replyText.length}`);
                 const parsedPromises = await parseAssistantPromisesWithLlm(replyText, {
