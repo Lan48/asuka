@@ -2350,29 +2350,18 @@ export function shouldScheduleAmbientForPeer(context: AsukaPeerContext, now = Da
   const state = loadState();
   const repairCandidates = getRepairCandidates(state, peer.peerKey, now);
   if (force) return true;
-  if (repairCandidates.length > 0) return true;
-  if (!peer.relationship.lastAssistantMessageAt) return false;
   const disposition = deriveAmbientDisposition(peer, state, now);
   const lastScheduledAt = peer.ambient.lastScheduledAt ?? 0;
-  if (isAmbientScheduleInvalidatedByUserReply(peer, lastScheduledAt)) {
-    return true;
-  }
+  const lastSentAt = peer.ambient.lastSentAt ?? 0;
+  const pendingWindowMs = (disposition.firstDelayHours + 2) * 60 * 60 * 1000;
+  const hasRecentPendingJob =
+    peer.ambient.jobIds.some((id) => id.trim()) &&
+    lastScheduledAt > lastSentAt &&
+    now - lastScheduledAt < pendingWindowMs;
+  if (hasRecentPendingJob) return false;
+  if (repairCandidates.length > 0) return true;
+  if (!peer.relationship.lastAssistantMessageAt) return false;
   return now - lastScheduledAt >= disposition.firstDelayHours * 60 * 60 * 1000;
-}
-
-function isAmbientScheduleInvalidatedByUserReply(peer: AsukaPeerState, lastScheduledAt = peer.ambient.lastScheduledAt ?? 0): boolean {
-  if (!lastScheduledAt) return false;
-  const lastUserAt = peer.relationship.lastUserMessageAt ?? 0;
-  const lastAssistantAt = peer.relationship.lastAssistantMessageAt ?? 0;
-  return lastUserAt > lastScheduledAt && lastAssistantAt >= lastUserAt;
-}
-
-export function getInvalidatedAmbientJobIdsForPeer(context: AsukaPeerContext): string[] {
-  const state = loadState();
-  const peer = state.peers[makePeerKey(context)];
-  if (!peer) return [];
-  if (!isAmbientScheduleInvalidatedByUserReply(peer)) return [];
-  return [...new Set(peer.ambient.jobIds.map((id) => id.trim()).filter(Boolean))];
 }
 
 export function prepareAmbientLifePayload(context: AsukaPeerContext, guardNoReplySince: number): {
@@ -2516,6 +2505,7 @@ export function markAmbientDelivered(peerKey: string, options: {
   peer.relationship.lastAssistantMessageAt = at;
   peer.relationship.lastAssistantText = summarizeText(options.content);
   peer.ambient.lastSentAt = at;
+  peer.ambient.jobIds = [];
   peer.ambient.styleVersion = AMBIENT_STYLE_VERSION;
   peer.ambient.lastTopicPreview = summarizeText(options.content, 80);
   peer.ambient.currentMood = disposition.mood;

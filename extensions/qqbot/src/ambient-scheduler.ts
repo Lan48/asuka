@@ -1,8 +1,8 @@
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
-import { addCronJobDirectFromArgs, addCronJobLiveFromArgs, execOpenClaw, removeCronJobDirect, removeCronJobLive, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
+import { addCronJobDirectFromArgs, addCronJobLiveFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import type { AsukaPeerContext } from "./asuka-state.js";
-import { getInvalidatedAmbientJobIdsForPeer, markAmbientScheduled, prepareAmbientLifePayload, shouldScheduleAmbientForPeer } from "./asuka-state.js";
+import { markAmbientScheduled, prepareAmbientLifePayload, shouldScheduleAmbientForPeer } from "./asuka-state.js";
 
 interface LoggerLike {
   info?: (msg: string) => void;
@@ -62,25 +62,6 @@ async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string |
   }
 }
 
-async function removeInvalidatedAmbientJobs(jobIds: string[], log?: LoggerLike): Promise<void> {
-  if (jobIds.length === 0) return;
-  const env = getQQBotLocalOpenClawEnv();
-  for (const jobId of jobIds) {
-    const live = await removeCronJobLive(jobId, { log });
-    if ("removed" in live) {
-      log?.info?.(`[asuka-ambient] Removed invalidated ambient job: ${jobId}`);
-      continue;
-    }
-    const direct = await removeCronJobDirect(jobId, { env, log });
-    if ("removedCount" in direct && direct.removedCount > 0) {
-      log?.info?.(`[asuka-ambient] Removed invalidated ambient job through direct store: ${jobId}`);
-      continue;
-    }
-    const error = "error" in direct ? direct.error : live.error;
-    log?.warn?.(`[asuka-ambient] Failed to remove invalidated ambient job ${jobId}: ${error}`);
-  }
-}
-
 export async function scheduleAmbientLifeJobs(
   context: AsukaPeerContext,
   guardNoReplySince: number,
@@ -91,7 +72,6 @@ export async function scheduleAmbientLifeJobs(
     return [];
   }
 
-  const invalidatedJobIds = getInvalidatedAmbientJobIdsForPeer(context);
   const nextMessage = prepareAmbientLifePayload(context, guardNoReplySince);
   const baseTime = new Date(guardNoReplySince);
   const runAt = plusHours(baseTime, nextMessage.firstDelayHours);
@@ -148,10 +128,6 @@ export async function scheduleAmbientLifeJobs(
       attention: nextMessage.attention,
       presence: nextMessage.presence,
     });
-    await removeInvalidatedAmbientJobs(
-      invalidatedJobIds.filter((jobId) => !jobIds.includes(jobId)),
-      log
-    );
   }
   return jobIds;
 }

@@ -254,26 +254,22 @@ process.exit(42);
   let ambientDeliveries = readScheduledDeliveries();
   assert.ok(
     ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
-    "first ambient job should be present before it is invalidated",
+    "first ambient job should be present before newer chat arrives",
   );
 
   recordInboundInteraction(ambientDirect, "我又回你一句", base + 92_000);
   recordAssistantReply(ambientDirect, "嗯，我接住了。", [], base + 93_000);
   assert.equal(
     shouldScheduleAmbientForPeer(ambientDirect, base + 93_000),
-    true,
-    "a user reply newer than the previous ambient guard should allow immediate rebasing",
+    false,
+    "a user reply newer than the previous ambient guard should not duplicate an already scheduled ambient job",
   );
-  const rebasedAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 93_000);
-  assert.equal(rebasedAmbientJobs.length, 1, "rebased ambient schedule should create a replacement delivery");
+  const duplicateAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 93_000);
+  assert.equal(duplicateAmbientJobs.length, 0, "new chat should not create a replacement delivery while the original job is still pending");
   ambientDeliveries = readScheduledDeliveries();
   assert.ok(
-    !ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
-    "invalidated ambient job should be removed after a replacement is scheduled",
-  );
-  assert.ok(
-    ambientDeliveries.jobs.some((job) => job.id === rebasedAmbientJobs[0]),
-    "replacement ambient job should remain scheduled",
+    ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
+    "the pending ambient job should remain scheduled so delivery can render against latest context",
   );
 
   const failedSchedulePromise = createPromise("约定，明天晚上我给你发消息。", 40_000);

@@ -152,6 +152,16 @@ assert.match(
 );
 assert.match(
   outboundSource,
+  /continuing proactive[\s\S]{0,220}latest normal conversation context/,
+  "stale proactive cron jobs should continue instead of being skipped"
+);
+assert.match(
+  outboundSource,
+  /最新普通对话上下文/,
+  "proactive cron rendering should include latest normal conversation context"
+);
+assert.match(
+  outboundSource,
   /sendCronMessage[\s\S]{0,4500}sendText\(\{[\s\S]{0,600}replyToId: null/,
   "cron proactive delivery should route through sendText so structured audio payloads use the same sender as replies"
 );

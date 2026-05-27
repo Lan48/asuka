@@ -115,7 +115,7 @@ try {
   assert.equal(
     shouldSendAmbient("acct-test:direct:user-ambient-advance", base + 41_000, base + 80_000),
     false,
-    "stale ambient jobs should stop after any user reply newer than their guard",
+    "stale ambient guard helper should still report that newer user chat exists",
   );
   assert.equal(
     resolveCronDeliveryFallbackText({

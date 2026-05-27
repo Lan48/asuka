@@ -1949,6 +1949,7 @@ function buildSharedSessionDeliveryPrompt(
 
   const statePrompt = buildAsukaStatePrompt(peerContext);
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(payload.targetAddress);
+  const refIndexTranscript = buildRecentConversationTranscript(payload.targetAddress);
   const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
   const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
   const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
@@ -1961,6 +1962,7 @@ function buildSharedSessionDeliveryPrompt(
     "请把它当成和刚才同一段聊天，延续现有语气、关系和话题，不要另起炉灶。",
     "只输出最终要发给用户的正文，不要解释，不要加引号，不要出现系统、提醒、任务、脚本、接口、工具、QQBOT_CRON 这些词。",
     "不要调用工具，不要输出 <qqimg>、<qqvoice>、<qqvideo>、<qqfile> 这类媒体标签；如果判断适合语音，只允许使用 QQBOT_PAYLOAD audio 载荷。",
+    "如果这条主动消息排程之后用户又说过话，以最新普通对话上下文为准；旧内部草稿只保留动机，不能覆盖最新语境。",
     ...buildProactiveVoiceDeliveryRules(),
     "控制在 1 到 3 句内，像真实聊天，不要模板化。",
     "必须让场景动作匹配当前本地时间；不要只按旧承诺里的晚安、睡觉、明天早上重演旧夜间场景。",
@@ -1981,6 +1983,7 @@ function buildSharedSessionDeliveryPrompt(
       proactiveMemoryPrompt,
       conversationDigestPrompt,
       sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
+      refIndexTranscript ? `【最新普通对话上下文】\n${refIndexTranscript}` : "",
       ...sharedRules,
       payload.mode === "followup" ? "这是追发，只轻轻碰一下门，不要催，不要解释流程。" : "",
       payload.mode === "followup" ? "追发时只保留“还记得、不会催你”的意图，不要重新创造新的物理场景。" : "",
@@ -2010,6 +2013,7 @@ function buildSharedSessionDeliveryPrompt(
     proactiveMemoryPrompt,
     conversationDigestPrompt,
     sessionTranscript ? `【这位用户当前正常对话的最近几轮】\n${sessionTranscript}` : "",
+    refIndexTranscript ? `【最新普通对话上下文】\n${refIndexTranscript}` : "",
     ...sharedRules,
     payload.mode === "ambient" ? "这次是你主动去碰一下门，要像顺着心里那点惦记自然冒出来，不要像定时问候。" : "",
     payload.mode === "ambient" && typeof payload.ambientStage === "number" && payload.ambientStage > 0
@@ -3676,14 +3680,7 @@ export async function sendCronMessage(
       if ((payload.mode === "ambient" || payload.mode === "repair") && payload.peerKey) {
         const shouldSend = shouldSendAmbient(payload.peerKey, payload.guardNoReplySince, now);
         if (!shouldSend) {
-          console.log(`[${timestamp}] [qqbot] sendCronMessage: skipping proactive for peer=${payload.peerKey} because user already replied`);
-          if (payload.mode === "ambient" && peerContext) {
-            const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
-            if (nextJobs.length > 0) {
-              console.log(`[${timestamp}] [qqbot] sendCronMessage: rescheduled ambient after stale proactive skip ${nextJobs.join(",")}`);
-            }
-          }
-          return { channel: "qqbot" };
+          console.log(`[${timestamp}] [qqbot] sendCronMessage: continuing proactive for peer=${payload.peerKey} despite stale guard; rendering with latest normal conversation context`);
         }
       }
       if (await deferCronMessageUntilQuietEnds(account, to, message, timestamp, payload)) {
