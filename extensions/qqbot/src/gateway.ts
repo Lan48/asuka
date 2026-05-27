@@ -125,6 +125,13 @@ const SELFIE_IDENTITY_LOCK_PROMPT = [
   "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
   "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
 ].join(" ");
+const SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT = [
+  "穿着策略：除非用户明确指定服装，否则不要照抄参考图衣服；根据当前时间、地点、天气、动作和情绪选择可信的夏季日常穿搭。",
+  "Asuka 的默认衣橱是夏季日系校园极简风：低饱和颜色、短袖衬衫、薄棉 T 恤、浅色背心外搭薄衬衫、轻薄针织短开衫、半身裙、百褶裙、牛仔短裙、浅色牛仔裤、帆布包、小耳饰、发圈、细发夹、自然散发或半扎发。",
+  "学校/图书馆偏短袖衬衫、薄开衫和百褶裙；家里/夏夜偏宽松短袖、薄睡衣或棉质家居裙；厨房做饭要有清爽居家短袖、浅色围裙和扎起的头发；梅雨季外出可有薄衬衫、透明伞、微湿发丝；约会可以是浅色连衣裙或短袖衬衫配半身裙，稍精致但不过度；便利店/散步要轻便自然。",
+  "可以加入阳光、树影、冰咖啡、风扇、湿热空气、薄布料褶皱等夏天生活感。",
+  "服装服务于当前生活场景，不要随机变成 cosplay、舞台装、网红写真、礼服、泳装、内衣感或过度暴露造型。",
+].join(" ");
 const MAX_SELFIE_USER_TEXT_CHARS = 240;
 const MAX_SELFIE_ASSISTANT_TEXT_CHARS = 360;
 const MAX_SELFIE_RECENT_ENTRY_CHARS = 160;
@@ -615,6 +622,7 @@ function buildDirectSelfiePromptFromContext(
   const recentContext = buildRecentConversationContext(peerId, normalizedUser);
   const contextParts = [
     loadAsukaVisualIdentityAnchor(),
+    SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT,
     formatSelfiePromptContextSection("当前本地时间", context.currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}` : "",
     formatSelfiePromptContextSection("最近一周对话", context.recentChatTranscript, 1300),

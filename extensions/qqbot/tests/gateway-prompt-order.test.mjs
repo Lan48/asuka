@@ -382,6 +382,16 @@ assert.match(
   /SELFIE_IDENTITY_LOCK_PROMPT[\s\S]{0,260}Asuka 主角图片[\s\S]{0,120}不要固定成手持自拍/,
   "direct image prompts should always retain Asuka identity while allowing non-selfie compositions"
 );
+assert.match(
+  source,
+  /SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT[\s\S]{0,1200}夏季日系校园极简风[\s\S]{0,1200}泳装、内衣感或过度暴露造型/,
+  "gateway should define a summer wardrobe strategy for image generation"
+);
+assert.match(
+  directSelfiePromptBuilder,
+  /loadAsukaVisualIdentityAnchor\(\)[\s\S]{0,160}SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT/,
+  "direct image prompts should include the summer wardrobe strategy after the visual identity anchor"
+);
 const visualAnchorIndex = source.indexOf("function loadAsukaVisualIdentityAnchor");
 assert.ok(visualAnchorIndex >= 0, "gateway should define a visual identity anchor loader");
 const visualAnchorSnippet = source.slice(visualAnchorIndex, visualAnchorIndex + 2800);
@@ -464,6 +474,16 @@ assert.match(
   outboundSource,
   /function buildCronSelfiePrompt\(\s*account: ResolvedQQBotAccount[\s\S]{0,1300}buildAsukaStatePrompt\(peerContext\)[\s\S]{0,1300}buildConversationDigestPrompt\(peerContext\)[\s\S]{0,1300}resolveRecentTranscriptFromNormalSession\(peerId\)/,
   "cron selfie prompt should include proactive state, digest, and normal-session transcript context"
+);
+assert.match(
+  outboundSource,
+  /SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT[\s\S]{0,1200}夏季日系校园极简风[\s\S]{0,1200}泳装、内衣感或过度暴露造型/,
+  "cron image delivery should define the same summer wardrobe strategy"
+);
+assert.match(
+  outboundSource,
+  /function buildCronSelfiePrompt[\s\S]{0,1600}loadAsukaVisualIdentityAnchor\(\)[\s\S]{0,160}SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT/,
+  "cron image prompts should include the summer wardrobe strategy after the visual identity anchor"
 );
 assert.ok(
   !source.includes("shouldForceFreshSession"),
