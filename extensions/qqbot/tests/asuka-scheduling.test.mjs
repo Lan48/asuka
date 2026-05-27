@@ -61,6 +61,7 @@ function readScheduledDeliveries() {
 
 try {
   const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
+  const { scheduleAmbientLifeJobs } = await import("../dist/src/ambient-scheduler.js");
   const { schedulePromiseJobs } = await import("../dist/src/promise-scheduler.js");
   const { setQQBotCronService } = await import("../dist/src/runtime.js");
   const { removeCronJobDirect, removeCronJobLive } = await import("../dist/src/utils/openclaw-command.js");
@@ -76,6 +77,7 @@ try {
     prepareRepairDelivery,
     recordAssistantReply,
     recordInboundInteraction,
+    shouldScheduleAmbientForPeer,
     shouldSendPromiseDelivery,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
@@ -237,6 +239,42 @@ process.exit(42);
   assert.equal(cancelled.cancelledPromises.length, 1, "selfie promise should be cancelled");
   assert.equal(shouldSendPromiseDelivery(selfiePromise.id), false, "cancelled promise should not allow primary delivery");
   assert.equal(shouldSendPromiseFollowUp(selfiePromise.id, base, base + 33_000), false, "cancelled promise should not allow follow-up");
+
+  const ambientDirect = {
+    ...direct,
+    peerId: "user-ambient-rebase",
+    senderId: "user-ambient-rebase",
+    target: "c2c:user-ambient-rebase",
+    messageId: "schedule-ambient-rebase",
+  };
+  recordInboundInteraction(ambientDirect, "你醒了吗", base + 90_000);
+  recordAssistantReply(ambientDirect, "醒了，我在。", [], base + 91_000);
+  const firstAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 91_000);
+  assert.equal(firstAmbientJobs.length, 1, "first ambient schedule should create one internal scheduled delivery");
+  let ambientDeliveries = readScheduledDeliveries();
+  assert.ok(
+    ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
+    "first ambient job should be present before it is invalidated",
+  );
+
+  recordInboundInteraction(ambientDirect, "我又回你一句", base + 92_000);
+  recordAssistantReply(ambientDirect, "嗯，我接住了。", [], base + 93_000);
+  assert.equal(
+    shouldScheduleAmbientForPeer(ambientDirect, base + 93_000),
+    true,
+    "a user reply newer than the previous ambient guard should allow immediate rebasing",
+  );
+  const rebasedAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 93_000);
+  assert.equal(rebasedAmbientJobs.length, 1, "rebased ambient schedule should create a replacement delivery");
+  ambientDeliveries = readScheduledDeliveries();
+  assert.ok(
+    !ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
+    "invalidated ambient job should be removed after a replacement is scheduled",
+  );
+  assert.ok(
+    ambientDeliveries.jobs.some((job) => job.id === rebasedAmbientJobs[0]),
+    "replacement ambient job should remain scheduled",
+  );
 
   const failedSchedulePromise = createPromise("约定，明天晚上我给你发消息。", 40_000);
   markPromiseScheduleFailed(failedSchedulePromise.id, "cron add failed", base + 41_000);

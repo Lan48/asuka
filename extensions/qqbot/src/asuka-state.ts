@@ -2354,7 +2354,25 @@ export function shouldScheduleAmbientForPeer(context: AsukaPeerContext, now = Da
   if (!peer.relationship.lastAssistantMessageAt) return false;
   const disposition = deriveAmbientDisposition(peer, state, now);
   const lastScheduledAt = peer.ambient.lastScheduledAt ?? 0;
+  if (isAmbientScheduleInvalidatedByUserReply(peer, lastScheduledAt)) {
+    return true;
+  }
   return now - lastScheduledAt >= disposition.firstDelayHours * 60 * 60 * 1000;
+}
+
+function isAmbientScheduleInvalidatedByUserReply(peer: AsukaPeerState, lastScheduledAt = peer.ambient.lastScheduledAt ?? 0): boolean {
+  if (!lastScheduledAt) return false;
+  const lastUserAt = peer.relationship.lastUserMessageAt ?? 0;
+  const lastAssistantAt = peer.relationship.lastAssistantMessageAt ?? 0;
+  return lastUserAt > lastScheduledAt && lastAssistantAt >= lastUserAt;
+}
+
+export function getInvalidatedAmbientJobIdsForPeer(context: AsukaPeerContext): string[] {
+  const state = loadState();
+  const peer = state.peers[makePeerKey(context)];
+  if (!peer) return [];
+  if (!isAmbientScheduleInvalidatedByUserReply(peer)) return [];
+  return [...new Set(peer.ambient.jobIds.map((id) => id.trim()).filter(Boolean))];
 }
 
 export function prepareAmbientLifePayload(context: AsukaPeerContext, guardNoReplySince: number): {

@@ -3677,6 +3677,12 @@ export async function sendCronMessage(
         const shouldSend = shouldSendAmbient(payload.peerKey, payload.guardNoReplySince, now);
         if (!shouldSend) {
           console.log(`[${timestamp}] [qqbot] sendCronMessage: skipping proactive for peer=${payload.peerKey} because user already replied`);
+          if (payload.mode === "ambient" && peerContext) {
+            const nextJobs = await scheduleAmbientLifeJobs(peerContext, Date.now());
+            if (nextJobs.length > 0) {
+              console.log(`[${timestamp}] [qqbot] sendCronMessage: rescheduled ambient after stale proactive skip ${nextJobs.join(",")}`);
+            }
+          }
           return { channel: "qqbot" };
         }
       }
