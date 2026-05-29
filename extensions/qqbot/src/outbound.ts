@@ -1570,6 +1570,22 @@ function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
   return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
 }
 
+function describeFetchFailure(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (!cause) return error.message;
+  if (cause instanceof Error) {
+    const code = typeof (cause as any).code === "string" ? ` code=${(cause as any).code}` : "";
+    return `${error.message}; cause=${cause.name}: ${cause.message}${code}`;
+  }
+  if (typeof cause === "object") {
+    const code = typeof (cause as any).code === "string" ? ` code=${(cause as any).code}` : "";
+    const message = typeof (cause as any).message === "string" ? ` message=${(cause as any).message}` : "";
+    return `${error.message}; cause=${String(cause)}${code}${message}`;
+  }
+  return `${error.message}; cause=${String(cause)}`;
+}
+
 async function generateMiniMaxSelfieImageUrl(
   prompt: string,
   config: StudioSelfieConfig,
@@ -1622,22 +1638,27 @@ async function generateStudioMediaSelfieImageUrl(
   referenceImagePath: string,
   size = "1024x1024",
 ): Promise<string> {
-  const form = new FormData();
-  const imageBytes = new Uint8Array(fs.readFileSync(referenceImagePath));
-  form.append("model", config.modelId.replace(/^apibusiness_media:/i, ""));
-  form.append("prompt", buildStudioSelfiePrompt(prompt));
-  form.append("image_size", normalizeStudioMediaImageSize(size));
-  form.append("response_format", "url");
-  form.append("image", new Blob([imageBytes], { type: getImageMimeType(referenceImagePath) }), path.basename(referenceImagePath));
-
-  const response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/edits"), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      Accept: "application/json",
-    },
-    body: form,
-  });
+  let response: Response;
+  try {
+    response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/generations"), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: config.modelId.replace(/^apibusiness_media:/i, ""),
+        prompt: buildStudioSelfiePrompt(prompt),
+        image_size: normalizeStudioMediaImageSize(size),
+        n: 1,
+        response_format: "url",
+        image_url: buildImageDataUrlFromFile(referenceImagePath),
+      }),
+    });
+  } catch (error) {
+    throw new Error(`Studio Media image generation fetch failed: ${describeFetchFailure(error)}`);
+  }
 
   const bodyText = await response.text();
   let body: any;
@@ -1652,7 +1673,7 @@ async function generateStudioMediaSelfieImageUrl(
     const message = typeof error === "object" && error
       ? error.message || JSON.stringify(error)
       : error || body?.message || body?.text || bodyText || response.statusText;
-    throw new Error(`Studio Media image edit failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
+    throw new Error(`Studio Media image generation failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
   }
 
   return extractStudioImageUrl(body);

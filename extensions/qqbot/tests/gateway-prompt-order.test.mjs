@@ -51,6 +51,23 @@ assert.match(
   /runtimeMessage !== OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE[\s\S]{0,180}OpenClaw official image generation failed: runtime=\$\{runtimeMessage\}/,
   "OpenClaw image generation should fall back externally after one official runtime failure"
 );
+for (const [label, text] of [["gateway", source], ["outbound", outboundSource]]) {
+  assert.match(
+    text,
+    /buildStudioMediaApiUrl\(config\.baseUrl,\s*"images\/generations"\)/,
+    `${label} Studio Media fallback should use xmapi's documented image generation endpoint`
+  );
+  assert.match(
+    text,
+    /"Content-Type":\s*"application\/json"[\s\S]{0,500}image_url:\s*buildImageDataUrlFromFile\(referenceImagePath\)/,
+    `${label} Studio Media fallback should send the reference image as JSON image_url`
+  );
+  assert.doesNotMatch(
+    text,
+    /function generateStudioMediaSelfieImageUrl[\s\S]{0,900}images\/edits/,
+    `${label} Studio Media fallback should not call the multipart edit endpoint for gpt-image-2`
+  );
+}
 assert.ok(
   source.includes("优先用自然口语里的“我/你/我们”"),
   "chat persona should prefer first/second-person wording without hard rejection rules"
