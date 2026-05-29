@@ -38,5 +38,6 @@ node tests/asuka-search.test.mjs
 node tests/asuka-time-context.test.mjs
 node tests/asuka-time-contradiction.test.mjs
 node tests/gateway-prompt-order.test.mjs
+node tests/openclaw-image-generation-retry.test.mjs
 node tests/message-buffer.test.mjs
 node tests/ref-index-store.test.mjs
