@@ -32,10 +32,6 @@ export type OfficialOpenClawImageOptions = {
 const DEFAULT_OPENCLAW_IMAGE_MODEL = "openai-codex/chatgpt-image-latest";
 const DEFAULT_OPENCLAW_IMAGE_SIZE = "1024x1024";
 const DEFAULT_OPENCLAW_OUTPUT_FORMAT = "png";
-const DEFAULT_OPENCLAW_IMAGE_TRANSIENT_RETRY_COUNT = 1;
-const MAX_OPENCLAW_IMAGE_TRANSIENT_RETRY_COUNT = 2;
-const DEFAULT_OPENCLAW_IMAGE_RETRY_DELAY_MS = 2_000;
-const MAX_OPENCLAW_IMAGE_RETRY_DELAY_MS = 15_000;
 const IMAGE_RUNTIME_MODULE_RELATIVE = path.join("dist", "plugin-sdk", "image-generation-runtime.js");
 let cachedRuntimeModule: Promise<GenerateImageRuntimeModule | null> | undefined;
 
@@ -138,86 +134,6 @@ function buildPrompt(options: OfficialOpenClawImageOptions): string {
   return [options.identityPrompt, options.prompt].filter(Boolean).join("\n");
 }
 
-function parseBoundedNonNegativeInt(value: string | undefined, fallback: number, max: number): number {
-  if (!value?.trim()) return fallback;
-  const parsed = Number.parseInt(value.trim(), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-  return Math.min(parsed, max);
-}
-
-function parseBoundedPositiveInt(value: string | undefined, fallback: number, max: number): number {
-  if (!value?.trim()) return fallback;
-  const parsed = Number.parseInt(value.trim(), 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.min(parsed, max);
-}
-
-function resolveOpenClawImageTransientRetryCount(): number {
-  return parseBoundedNonNegativeInt(
-    process.env.QQBOT_OPENCLAW_IMAGE_TRANSIENT_RETRIES || process.env.OPENCLAW_IMAGE_TRANSIENT_RETRIES,
-    DEFAULT_OPENCLAW_IMAGE_TRANSIENT_RETRY_COUNT,
-    MAX_OPENCLAW_IMAGE_TRANSIENT_RETRY_COUNT,
-  );
-}
-
-function resolveOpenClawImageRetryDelayMs(): number {
-  return parseBoundedPositiveInt(
-    process.env.QQBOT_OPENCLAW_IMAGE_RETRY_DELAY_MS || process.env.OPENCLAW_IMAGE_RETRY_DELAY_MS,
-    DEFAULT_OPENCLAW_IMAGE_RETRY_DELAY_MS,
-    MAX_OPENCLAW_IMAGE_RETRY_DELAY_MS,
-  );
-}
-
-function formatOpenClawImageError(error: unknown): string {
-  if (error instanceof Error) {
-    const cause = (error as Error & { cause?: unknown }).cause;
-    const causeText = cause instanceof Error ? ` | ${cause.message}` : cause ? ` | ${String(cause)}` : "";
-    return `${error.message}${causeText}`;
-  }
-  return String(error);
-}
-
-function isTransientOpenClawImageDisconnect(error: unknown): boolean {
-  const message = formatOpenClawImageError(error).toLowerCase();
-  if (!message) return false;
-  if (/(401|403|unauthorized|forbidden|login required|oauth profile|missing api key|missing access token|refresh failed)/i.test(message)) return false;
-  if (/(fetch timeout after|request timed out|timed out after 240000ms|reference image not found|returned no image)/i.test(message)) return false;
-
-  return [
-    "other side closed",
-    "socket hang up",
-    "econnreset",
-    "und_err_socket",
-    "connection reset",
-    "fetch failed",
-  ].some((needle) => message.includes(needle))
-    || (message.includes("terminated") && (message.includes("side closed") || message.includes("fetch") || message.includes("socket")));
-}
-
-async function delay(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function runWithTransientOpenClawImageRetry<T>(
-  label: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const retryCount = resolveOpenClawImageTransientRetryCount();
-  const retryDelayMs = resolveOpenClawImageRetryDelayMs();
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (attempt >= retryCount || !isTransientOpenClawImageDisconnect(error)) throw error;
-      console.warn(
-        `[image-generation] ${label} transient disconnect; retrying OpenClaw official image generation `
-        + `attempt ${attempt + 2}/${retryCount + 1}: ${formatOpenClawImageError(error)}`,
-      );
-      await delay(retryDelayMs);
-    }
-  }
-}
-
 function candidateRuntimeModulePaths(): string[] {
   const candidates = [
     process.env.OPENCLAW_IMAGE_RUNTIME_MODULE?.trim(),
@@ -314,12 +230,10 @@ async function generateWithCli(options: OfficialOpenClawImageOptions, modelRef: 
       options.modelOverride || modelRef,
       "--json",
     ];
-    await runWithTransientOpenClawImageRetry("cli", async () => {
-      await execOpenClaw(args, {
-        env: getQQBotLocalOpenClawEnv(),
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 240_000,
-      });
+    await execOpenClaw(args, {
+      env: getQQBotLocalOpenClawEnv(),
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 240_000,
     });
     const imageBytes = await fs.promises.readFile(outputPath);
     return toDataUrl(imageBytes, "image/png");
