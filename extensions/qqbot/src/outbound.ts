@@ -2081,7 +2081,7 @@ export function resolveCronDeliveryFallbackText(
   transcriptAnchoredFallback?: string | null,
 ): string {
   const candidates = payload.mode === "ambient"
-    ? [payload.content, payload.selfieCaption, transcriptAnchoredFallback]
+    ? [transcriptAnchoredFallback, payload.selfieCaption, payload.content]
     : [payload.selfieCaption, payload.content, transcriptAnchoredFallback];
   const fallback = candidates.find((item) => typeof item === "string" && item.trim());
   return trimDeliveryText(fallback || "");
@@ -2093,8 +2093,11 @@ function selectSafeCronDeliveryText(
   renderedText: string,
 ): string | null {
   const promptTimeZone = getPromptTimeZone(account);
-  const fallbackText = resolveCronDeliveryFallbackText(payload);
-  const candidates = [renderedText, fallbackText, payload.content]
+  const transcriptAnchoredFallback = payload.mode === "ambient"
+    ? buildTranscriptAnchoredFallbackText(account, payload)
+    : null;
+  const fallbackText = resolveCronDeliveryFallbackText(payload, transcriptAnchoredFallback);
+  const candidates = [renderedText, fallbackText, payload.selfieCaption, payload.content]
     .map((item) => (item ?? "").trim())
     .filter(Boolean);
   for (const candidate of candidates) {

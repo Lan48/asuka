@@ -125,8 +125,8 @@ try {
       targetType: "c2c",
       targetAddress: "user-ambient-advance",
     }, "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。"),
-    firstAmbient.content,
-    "ambient fallback should prefer the current payload seed over transcript template text",
+    "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。",
+    "ambient fallback should prefer transcript-anchored fallback over the fixed payload seed",
   );
   markProactiveDelivered("acct-test:direct:user-ambient-advance", {
     at: base + 42_000,
