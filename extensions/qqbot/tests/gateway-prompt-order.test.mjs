@@ -46,6 +46,11 @@ assert.match(
   /execOpenClaw\(args,[\s\S]{0,120}env: getQQBotLocalOpenClawEnv\(\)/,
   "image generation CLI fallback should run with the resolved local OpenClaw environment"
 );
+assert.match(
+  imageGenerationSource,
+  /runtimeMessage !== OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE[\s\S]{0,180}OpenClaw official image generation failed: runtime=\$\{runtimeMessage\}/,
+  "OpenClaw image generation should fall back externally after one official runtime failure"
+);
 assert.ok(
   source.includes("优先用自然口语里的“我/你/我们”"),
   "chat persona should prefer first/second-person wording without hard rejection rules"

@@ -32,6 +32,7 @@ export type OfficialOpenClawImageOptions = {
 const DEFAULT_OPENCLAW_IMAGE_MODEL = "openai-codex/chatgpt-image-latest";
 const DEFAULT_OPENCLAW_IMAGE_SIZE = "1024x1024";
 const DEFAULT_OPENCLAW_OUTPUT_FORMAT = "png";
+const OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE = "OpenClaw image generation runtime is not available";
 const IMAGE_RUNTIME_MODULE_RELATIVE = path.join("dist", "plugin-sdk", "image-generation-runtime.js");
 let cachedRuntimeModule: Promise<GenerateImageRuntimeModule | null> | undefined;
 
@@ -185,7 +186,7 @@ async function loadRuntimeModule(): Promise<GenerateImageRuntimeModule | null> {
 
 async function generateWithRuntime(options: OfficialOpenClawImageOptions, modelRef: string): Promise<string> {
   const runtime = await loadRuntimeModule();
-  if (!runtime) throw new Error("OpenClaw image generation runtime is not available");
+  if (!runtime) throw new Error(OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE);
   const imageBytes = fs.readFileSync(options.referenceImagePath);
   const result = await runtime.generateImage({
     cfg: buildEffectiveConfig(options.cfg, modelRef),
@@ -252,6 +253,9 @@ export async function generateOfficialOpenClawImageDataUrl(options: OfficialOpen
     return await generateWithRuntime(options, modelRef);
   } catch (error) {
     const runtimeMessage = error instanceof Error ? error.message : String(error);
+    if (runtimeMessage !== OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE) {
+      throw new Error(`OpenClaw official image generation failed: runtime=${runtimeMessage}`);
+    }
     try {
       return await generateWithCli(options, modelRef);
     } catch (cliError) {
