@@ -37,7 +37,16 @@ try {
     shouldSendAmbient,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
-  const { resolveCronDeliveryFallbackText } = await import("../dist/src/outbound.js");
+  const {
+    getCronDeliveryBatchSemanticKey,
+    getCronDeliveryPostRenderSkipReason,
+    getProactiveSendDuplicateWindowMs,
+    isTranscriptAnchoredFallbackText,
+    normalizeGeneratedDeliveryText,
+    resolveCronDeliveryFallbackText,
+    shouldSkipDuplicateCronDeliveryForBatch,
+    shouldSkipRepairForDueBatchPromise,
+  } = await import("../dist/src/outbound.js");
 
   const parse = (text) => parseAssistantPromises(text, {
     now: new Date(base),
@@ -124,9 +133,131 @@ try {
       content: firstAmbient.content,
       targetType: "c2c",
       targetAddress: "user-ambient-advance",
-    }, "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。"),
-    "（把手边的事停了一下，轻轻笑了笑）……都到中午了，我还是想来碰碰你。",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。",
     "ambient fallback should prefer transcript-anchored fallback over the fixed payload seed",
+  );
+  assert.equal(
+    isTranscriptAnchoredFallbackText("（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    true,
+    "deterministic transcript fallback text should be detectable",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。", {
+      retryReason: "proactive_semantic_duplicate:候选仍在重复蛋白归你蛋黄归我的分工。",
+    }),
+    "ambient_semantic_duplicate_suppressed",
+    "semantic duplicate should be consumed and advanced instead of retried as shared-session unavailable",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "ambient_shared_session_unavailable",
+    "ambient proactive should not send deterministic transcript fallback when shared-session rendering fails",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "早，我在。你刚才说的我还记着。"),
+    null,
+    "ambient proactive should still send natural shared-session output",
+  );
+  const longGeneratedText = "（我把手机拿近了一点，先轻轻吸了一口气。）……我在，刚才那句话我还接着。后面还有一大段会被模型继续写下去，甚至可能写到半句才被截断，像是低头轻轻贴了一";
+  assert.equal(
+    normalizeGeneratedDeliveryText(longGeneratedText),
+    "（我把手机拿近了一点，先轻轻吸了一口气。）……我在，刚才那句话我还接着。",
+    "long shared-session output should be cut at a complete sentence instead of creating an incomplete ellipsis fallback",
+  );
+  assert.ok(
+    getProactiveSendDuplicateWindowMs("（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。") > 5 * 60 * 1000,
+    "deterministic transcript fallback text should get a longer duplicate window",
+  );
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "promise",
+      content: "我来找你了。不是你把我叫出来的，是我之前答应过你，所以这次我自己来了。",
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+      promiseId: "promise-template",
+      peerKey: "acct-test:direct:user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。",
+    "promise fallback should prefer transcript-anchored fallback over abstract promise payload templates",
+  );
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "repair",
+      content: "我来把前面答应过的那句补回来。之前说过要来找你，这次不想再让它空着。",
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+      promiseId: "repair-template",
+      peerKey: "acct-test:direct:user-ambient-advance",
+    }),
+    "",
+    "repair fallback should not send abstract promise payload templates when no transcript fallback is available",
+  );
+  const firstPromisePayload = {
+    type: "cron_reminder",
+    mode: "promise",
+    content: "明天陪你。",
+    targetType: "c2c",
+    targetAddress: "user-ambient-advance",
+    promiseId: "due-promise-1",
+    peerKey: "acct-test:direct:user-ambient-advance",
+  };
+  const secondPromisePayload = {
+    ...firstPromisePayload,
+    content: "明天陪你一整天。",
+    promiseId: "due-promise-2",
+  };
+  const dueBatch = [
+    {
+      jobId: "job-due-1",
+      to: "user-ambient-advance",
+      mode: firstPromisePayload.mode,
+      promiseId: firstPromisePayload.promiseId,
+      peerKey: firstPromisePayload.peerKey,
+      targetType: firstPromisePayload.targetType,
+      targetAddress: firstPromisePayload.targetAddress,
+      semanticKey: getCronDeliveryBatchSemanticKey(firstPromisePayload),
+    },
+    {
+      jobId: "job-due-2",
+      to: "user-ambient-advance",
+      mode: secondPromisePayload.mode,
+      promiseId: secondPromisePayload.promiseId,
+      peerKey: secondPromisePayload.peerKey,
+      targetType: secondPromisePayload.targetType,
+      targetAddress: secondPromisePayload.targetAddress,
+      semanticKey: getCronDeliveryBatchSemanticKey(secondPromisePayload),
+    },
+  ];
+  assert.equal(
+    shouldSkipDuplicateCronDeliveryForBatch(secondPromisePayload, { currentJobId: "job-due-2", dueBatch }),
+    true,
+    "same-peer same-intent promise due later in the current batch should be suppressed",
+  );
+  assert.equal(
+    shouldSkipRepairForDueBatchPromise(firstPromisePayload, "due-promise-2", "acct-test:direct:user-ambient-advance", { currentJobId: "job-due-1", dueBatch }),
+    true,
+    "repair-before-proactive should not pre-send a promise that is already due in the same batch",
   );
   markProactiveDelivered("acct-test:direct:user-ambient-advance", {
     at: base + 42_000,

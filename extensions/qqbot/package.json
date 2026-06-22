@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "bin",
+    "scripts",
     "src",
     "skills",
     "index.ts",
@@ -36,6 +37,7 @@
   "scripts": {
     "build": "tsc || true",
     "dev": "tsc --watch",
+    "postinstall": "node scripts/patch-runtime-cron.mjs",
     "test": "bash tests/run-tests.sh",
     "test:local": "bash tests/run-tests.sh",
     "prepack": "npm install --omit=dev"
@@ -43,11 +45,13 @@
   "dependencies": {
     "mpg123-decoder": "^1.0.3",
     "silk-wasm": "^3.7.1",
+    "undici": "^7.26.0",
     "ws": "^8.18.0"
   },
   "bundledDependencies": [
     "mpg123-decoder",
     "silk-wasm",
+    "undici",
     "ws"
   ],
   "devDependencies": {
@@ -64,6 +68,7 @@
   "bundleDependencies": [
     "mpg123-decoder",
     "silk-wasm",
+    "undici",
     "ws"
   ]
 }

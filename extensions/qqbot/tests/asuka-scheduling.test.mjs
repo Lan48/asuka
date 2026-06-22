@@ -61,14 +61,17 @@ function readScheduledDeliveries() {
 
 try {
   const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
-  const { scheduleAmbientLifeJobs } = await import("../dist/src/ambient-scheduler.js");
+  const { scheduleAmbientLifeJobs, schedulePlannedAmbientDelivery } = await import("../dist/src/ambient-scheduler.js");
   const { schedulePromiseJobs } = await import("../dist/src/promise-scheduler.js");
+  const { removeScheduledDeliveryJobsForPeer, retryScheduledDeliveryJob } = await import("../dist/src/scheduled-delivery-store.js");
   const { setQQBotCronService } = await import("../dist/src/runtime.js");
+  const { decodeCronPayload } = await import("../dist/src/utils/payload.js");
   const { removeCronJobDirect, removeCronJobLive } = await import("../dist/src/utils/openclaw-command.js");
   const {
     appendPromiseFollowUpJob,
     buildAsukaStatePrompt,
     cancelPromisesFromUserMessage,
+    clearAmbientScheduledJobs,
     markPromiseDelivered,
     markPromiseDeliveryFallback,
     markPromiseDeliveryFailed,
@@ -250,27 +253,78 @@ process.exit(42);
   recordInboundInteraction(ambientDirect, "你醒了吗", base + 90_000);
   recordAssistantReply(ambientDirect, "醒了，我在。", [], base + 91_000);
   const firstAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 91_000);
-  assert.equal(firstAmbientJobs.length, 1, "first ambient schedule should create one internal scheduled delivery");
+  assert.equal(firstAmbientJobs.length, 1, "first ambient schedule should create one internal planner delivery");
   let ambientDeliveries = readScheduledDeliveries();
+  const firstAmbientJob = ambientDeliveries.jobs.find((job) => job.id === firstAmbientJobs[0]);
+  assert.ok(firstAmbientJob, "first ambient planner job should be present before newer chat arrives");
+  const firstAmbientPayload = decodeCronPayload(firstAmbientJob.message).payload;
+  assert.equal(firstAmbientPayload.mode, "ambient_plan", "assistant reply should schedule a 10-minute planner first");
+  assert.match(firstAmbientPayload.content, /判断下一条主动消息的发送时间/, "planner payload should not contain a user-visible proactive message");
+  assert.equal(
+    firstAmbientJob.state.nextRunAtMs,
+    base + 91_000 + 10 * 60 * 1000,
+    "planner should run ten minutes after the last assistant message",
+  );
+  const retryAmbient = await retryScheduledDeliveryJob(
+    firstAmbientJobs[0],
+    "ambient_timing_plan_unavailable",
+    base + 91_500,
+    { delayMs: 10 * 60 * 1000, maxRetries: 3 },
+  );
+  assert.equal(retryAmbient.retried, true, "transient ambient planner failure should retry instead of consuming the job");
+  ambientDeliveries = readScheduledDeliveries();
+  const retriedAmbientJob = ambientDeliveries.jobs.find((job) => job.id === firstAmbientJobs[0]);
+  assert.ok(retriedAmbientJob, "retried ambient job should remain in the scheduled delivery store");
+  assert.equal(retriedAmbientJob.state.retryCount, 1, "ambient retry should persist retry count");
+  assert.equal(retriedAmbientJob.state.lastError, "ambient_timing_plan_unavailable", "ambient retry should persist reason");
   assert.ok(
-    ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
-    "first ambient job should be present before newer chat arrives",
+    retriedAmbientJob.state.nextRunAtMs > base + 91_500,
+    "ambient retry should move nextRunAtMs forward",
   );
 
   recordInboundInteraction(ambientDirect, "我又回你一句", base + 92_000);
+  const removedAmbient = await removeScheduledDeliveryJobsForPeer({
+    accountId: ambientDirect.accountId,
+    peerKey: `${ambientDirect.accountId}:${ambientDirect.peerKind}:${ambientDirect.peerId}`,
+    modes: ["ambient_plan", "ambient"],
+  });
+  assert.ok("removedCount" in removedAmbient, "peer ambient cancellation should succeed");
+  assert.equal(removedAmbient.removedCount, 1, "user reply should cancel the pending planner before it can schedule a proactive message");
+  clearAmbientScheduledJobs(ambientDirect);
   recordAssistantReply(ambientDirect, "嗯，我接住了。", [], base + 93_000);
-  assert.equal(
-    shouldScheduleAmbientForPeer(ambientDirect, base + 93_000),
-    false,
-    "a user reply newer than the previous ambient guard should not duplicate an already scheduled ambient job",
-  );
+  assert.equal(shouldScheduleAmbientForPeer(ambientDirect, base + 93_000), true, "after cancelling the stale pending job, the latest assistant reply may schedule a fresh planner");
   const duplicateAmbientJobs = await scheduleAmbientLifeJobs(ambientDirect, base + 93_000);
-  assert.equal(duplicateAmbientJobs.length, 0, "new chat should not create a replacement delivery while the original job is still pending");
+  assert.equal(duplicateAmbientJobs.length, 1, "new chat should create a fresh planner tied to the latest assistant reply");
   ambientDeliveries = readScheduledDeliveries();
   assert.ok(
-    ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
-    "the pending ambient job should remain scheduled so delivery can render against latest context",
+    !ambientDeliveries.jobs.some((job) => job.id === firstAmbientJobs[0]),
+    "the stale pending ambient planner should be removed after user reply",
   );
+  process.env.ASUKA_PROACTIVE_TIMING_TEST_PLAN = JSON.stringify({
+    delayMinutes: 27,
+    intent: "等厨房里的饭差不多做好后，再轻轻接上刚才的语境",
+    topicAnchor: "厨房里的晚饭收尾",
+    sceneBeat: "从做饭转到饭做好后的摆盘和招呼",
+    noveltyGoal: "推进到饭做好后的下一动作，不再停留在锅里还在煮",
+    blockedAnchors: ["锅里还在煮", "继续催饭快好"],
+    reason: "最近对话显示 Asuka 在做饭，适合等完成后再续",
+  });
+  const plannedDelivery = await schedulePlannedAmbientDelivery(ambientDirect, base + 93_000);
+  delete process.env.ASUKA_PROACTIVE_TIMING_TEST_PLAN;
+  assert.equal(plannedDelivery.jobIds.length, 1, "planner should create one delivery after model timing verdict");
+  ambientDeliveries = readScheduledDeliveries();
+  const plannedDeliveryJob = ambientDeliveries.jobs.find((job) => job.id === plannedDelivery.jobIds[0]);
+  assert.ok(plannedDeliveryJob, "planned delivery should be persisted");
+  const plannedDeliveryPayload = decodeCronPayload(plannedDeliveryJob.message).payload;
+  assert.equal(plannedDeliveryPayload.mode, "ambient", "planner-created job should be the actual ambient delivery");
+  assert.match(plannedDeliveryPayload.content, /^PROACTIVE_BEAT:/, "delivery payload should carry a structured proactive beat");
+  assert.match(plannedDeliveryPayload.content, /厨房里的晚饭收尾/, "delivery payload should persist the planned topic anchor");
+  assert.match(plannedDeliveryPayload.content, /饭做好后的下一动作/, "delivery payload should persist the novelty goal");
+  assert.doesNotMatch(plannedDeliveryPayload.content, /我现在更想离你近一点。|我刚刚又想到你了。/, "delivery payload should not persist static proactive fallback text");
+  const stateAfterBeatPlan = readState();
+  const beatLedger = stateAfterBeatPlan.peers[`${ambientDirect.accountId}:${ambientDirect.peerKind}:${ambientDirect.peerId}`].ambient.proactiveBeatLedger;
+  assert.match(beatLedger.recentBeats[0].topicAnchor, /厨房里的晚饭收尾/, "planned beat should be written to ambient beat ledger");
+  assert.match(beatLedger.recentBeats[0].noveltyGoal, /饭做好后的下一动作/, "planned beat ledger should preserve novelty goal");
 
   const failedSchedulePromise = createPromise("约定，明天晚上我给你发消息。", 40_000);
   markPromiseScheduleFailed(failedSchedulePromise.id, "cron add failed", base + 41_000);

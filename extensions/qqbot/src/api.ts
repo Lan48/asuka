@@ -12,7 +12,6 @@ const API_BASE = "https://api.sgroup.qq.com";
 const TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
 const INLINE_REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 const INLINE_REMOTE_IMAGE_TIMEOUT_MS = 45_000;
-const INLINE_REMOTE_IMAGE_HOSTS = new Set(["ossdown.com"]);
 const INLINE_REMOTE_IMAGE_DNS_FALLBACKS: Record<string, string[]> = {
   "ossdown.com": [
     "104.21.64.1",
@@ -54,8 +53,7 @@ let onMessageSentHook: OnMessageSentCallback | null = null;
 function shouldInlineRemoteImageUrl(imageUrl: string): boolean {
   try {
     const url = new URL(imageUrl);
-    const host = url.hostname.toLowerCase();
-    return (url.protocol === "http:" || url.protocol === "https:") && INLINE_REMOTE_IMAGE_HOSTS.has(host);
+    return url.protocol === "http:" || url.protocol === "https:";
   } catch {
     return false;
   }
@@ -207,8 +205,7 @@ async function inlineRemoteImageForUpload(imageUrl: string): Promise<string> {
   }
 
   const message = lastError instanceof Error ? lastError.message : String(lastError);
-  console.warn(`[qqbot-api] Falling back to URL image upload for ${host}: ${message}`);
-  return imageUrl;
+  throw new Error(`remote image localization failed for ${host}: ${message}`);
 }
 
 /**

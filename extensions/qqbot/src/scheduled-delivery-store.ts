@@ -31,6 +31,7 @@ export interface ScheduledDeliveryJob {
     nextRunAtMs?: number;
     lastRunAtMs?: number;
     runCount?: number;
+    retryCount?: number;
     lastError?: string;
     updatedAtMs?: number;
   };
@@ -52,7 +53,9 @@ interface ScheduledDeliveryStore {
 }
 
 interface LoggerLike {
+  info?: (msg: string) => void;
   warn?: (msg: string) => void;
+  error?: (msg: string) => void;
 }
 
 const CRON_PREFIX = "QQBOT_CRON:";
@@ -356,6 +359,49 @@ export async function removeScheduledDeliveryJob(
   }
 }
 
+export async function removeScheduledDeliveryJobsForPeer(
+  input: {
+    accountId?: string;
+    peerKey: string;
+    modes?: string[];
+  },
+  options: { env?: NodeJS.ProcessEnv; log?: LoggerLike } = {},
+): Promise<{ removedCount: number; jobIds: string[]; storePath: string } | { error: string }> {
+  const peerKey = input.peerKey.trim();
+  if (!peerKey) return { error: "missing scheduled delivery peerKey" };
+  const modes = new Set((input.modes ?? []).map((mode) => mode.trim()).filter(Boolean));
+  try {
+    let removedCount = 0;
+    const jobIds: string[] = [];
+    const storePath = await mutateStore(options.env ?? process.env, (store, currentStorePath) => {
+      const kept: ScheduledDeliveryJob[] = [];
+      for (const job of store.jobs) {
+        if (input.accountId && job.accountId && job.accountId !== input.accountId) {
+          kept.push(job);
+          continue;
+        }
+        const decoded = decodeCronPayload(job.message);
+        const payload = decoded.payload;
+        const matchesPeer = decoded.isCronPayload && payload?.peerKey === peerKey;
+        const matchesMode = modes.size === 0 || (payload?.mode ? modes.has(payload.mode) : false);
+        if (matchesPeer && matchesMode) {
+          removedCount += 1;
+          jobIds.push(job.id);
+        } else {
+          kept.push(job);
+        }
+      }
+      store.jobs = kept;
+      return currentStorePath;
+    });
+    return { removedCount, jobIds, storePath };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options.log?.warn?.(`[scheduled-delivery] failed to remove peer jobs ${peerKey}: ${message}`);
+    return { error: message };
+  }
+}
+
 export async function listDueScheduledDeliveryJobs(
   accountId: string,
   nowMs = Date.now(),
@@ -389,10 +435,42 @@ export async function markScheduledDeliverySucceeded(
       nextRunAtMs,
       lastRunAtMs: nowMs,
       runCount: (job.state?.runCount ?? 0) + 1,
+      retryCount: undefined,
       lastError: undefined,
       updatedAtMs: nowMs,
     };
   });
+}
+
+export async function retryScheduledDeliveryJob(
+  jobId: string,
+  reason: string,
+  nowMs = Date.now(),
+  options: { env?: NodeJS.ProcessEnv; delayMs?: number; maxRetries?: number } = {},
+): Promise<{ retried: boolean; retryCount: number; nextRunAtMs?: number }> {
+  let result = { retried: false, retryCount: 0, nextRunAtMs: undefined as number | undefined };
+  const delayMs = Math.max(60_000, options.delayMs ?? 10 * 60 * 1000);
+  const maxRetries = Math.max(0, options.maxRetries ?? 3);
+  await mutateStore(options.env ?? process.env, (store) => {
+    const job = store.jobs.find((existing) => existing.id === jobId);
+    if (!job) return;
+    const retryCount = (job.state?.retryCount ?? 0) + 1;
+    result = { retried: retryCount <= maxRetries, retryCount, nextRunAtMs: undefined };
+    if (!result.retried) return;
+    const nextRunAtMs = nowMs + delayMs * Math.min(4, 2 ** (retryCount - 1));
+    job.enabled = true;
+    job.state = {
+      ...job.state,
+      nextRunAtMs,
+      lastRunAtMs: nowMs,
+      runCount: (job.state?.runCount ?? 0) + 1,
+      retryCount,
+      lastError: reason,
+      updatedAtMs: nowMs,
+    };
+    result.nextRunAtMs = nextRunAtMs;
+  });
+  return result;
 }
 
 export async function markScheduledDeliveryFailed(

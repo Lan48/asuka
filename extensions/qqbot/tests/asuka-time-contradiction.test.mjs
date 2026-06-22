@@ -20,6 +20,16 @@ assert.equal(
   "late-night visible replies should reject morning greetings unless explicitly negated",
 );
 assert.equal(
+  isTimeContradictoryDeliveryText("……都到中午了，我也还在这里。", "Asia/Shanghai", lateNight),
+  true,
+  "late-night visible replies should reject explicit noon wording",
+);
+assert.equal(
+  isTimeContradictoryDeliveryText("下午那阵风还在，我来看看你。", "Asia/Shanghai", lateNight),
+  true,
+  "late-night visible replies should reject explicit afternoon wording",
+);
+assert.equal(
   isTimeContradictoryDeliveryText("这个点我不重演刚醒那段了，我在这里。", "Asia/Shanghai", lateNight),
   false,
   "time-aware corrections should not be rejected just because they mention the stale scene",
@@ -30,14 +40,21 @@ assert.equal(
   "late morning should reject stale bed/wake-up stage directions",
 );
 assert.equal(
+  isTimeContradictoryDeliveryText("早，我刚醒，今天也在。", "Asia/Shanghai", lateMorning, {
+    recentContextText: "你（2小时前）: 还在床边吗\n我（1小时前）: ……早上好。我还在。你还在睡，我就先不吵你。",
+  }),
+  false,
+  "late morning should allow morning/bed continuity when recent context explicitly supports it",
+);
+assert.equal(
   isTimeContradictoryDeliveryText("晚安，关灯睡吧。", "Asia/Shanghai", evening),
   false,
   "evening bedtime language should remain valid outside daytime",
 );
 assert.equal(
   buildTimeAwareDeliveryFallback("（缩进你怀里）在陪陪我", { forceImage: true }),
-  "好，我按你刚刚说的画面来。",
-  "forced image fallback should stay conversational and image-oriented",
+  "",
+  "forced image fallback should not fabricate a fixed visible image-confirmation reply",
 );
 
 console.log("[qqbot:test] asuka time-contradiction fixtures passed");

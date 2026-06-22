@@ -3,6 +3,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import os from "node:os";
 import path from "node:path";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount, WSPayload, C2CMessageEvent, GuildMessageEvent, GroupMessageEvent } from "./types.js";
 import { getAccessToken, getGatewayUrl, sendC2CMessage, sendChannelMessage, sendGroupMessage, clearTokenCache, sendC2CImageMessage, sendGroupImageMessage, sendC2CVoiceMessage, sendGroupVoiceMessage, sendC2CVideoMessage, sendGroupVideoMessage, sendC2CFileMessage, sendGroupFileMessage, initApiConfig, startBackgroundTokenRefresh, stopBackgroundTokenRefresh, sendC2CInputNotify, onMessageSent } from "./api.js";
@@ -22,16 +23,16 @@ import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
-import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
+import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, clearAmbientScheduledJobs, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
 import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
 import { scheduleAmbientLifeJobs } from "./ambient-scheduler.js";
 import { startScheduledDeliveryRunner } from "./scheduled-delivery-runner.js";
+import { removeScheduledDeliveryJobsForPeer } from "./scheduled-delivery-store.js";
 import { execOpenClaw, removeCronJobDirect, removeCronJobLive, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
-import { buildTimeAwareDeliveryFallback, isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
 import {
   generateOfficialOpenClawImageDataUrl,
@@ -48,6 +49,7 @@ const MODEL_PROVIDER_ERROR_RE = /(?:The `reasoning_content` in the thinking mode
 const STRUCTURED_PAYLOAD_PREFIX = "QQBOT_PAYLOAD:";
 const STRUCTURED_PAYLOAD_PREFIX_RE = /(^|[^A-Za-z0-9_])(?:QQBOT|QBOT)_PAYLOAD\s*:/i;
 const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
+const MODEL_THINKING_BLOCK_RE = /<\s*think\b[^>]*>[\s\S]*?(?:<\s*\/\s*think\s*>|$)/gi;
 
 type ReplyDeliverPayload = {
   text?: string;
@@ -65,6 +67,7 @@ interface StudioSelfieConfig {
   baseUrl: string;
   modelId: string;
   quality: string;
+  proxyUrl?: string;
 }
 
 interface DirectSelfieRuntimeConfig extends StudioSelfieConfig {
@@ -74,6 +77,8 @@ interface DirectSelfieRuntimeConfig extends StudioSelfieConfig {
 const DEFAULT_STUDIO_SELFIE_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
 const DEFAULT_STUDIO_SELFIE_MODEL = "third_party_media:gemini-3-pro-image-preview";
 const DEFAULT_MINIMAX_IMAGE_MODEL = "image-01";
+const STUDIO_MEDIA_IMAGE_CLIENT_ABORT_MS = 180_000;
+const LOCAL_STUDIO_PROXY_PREFLIGHT_TIMEOUT_MS = 1_200;
 
 function getConfigString(...values: unknown[]): string {
   for (const value of values) {
@@ -90,12 +95,15 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
   const minimaxProvider = rootConfig?.models?.providers?.minimax || {};
   const providerApiKey = getConfigString(minimaxProvider.apiKey);
   const providerBaseUrl = getConfigString(minimaxProvider.baseUrl);
-  const apiKey = getConfigString(skillCfg.apiKey, skillEnv.STUDIO_API_KEY, skillEnv.DASHSCOPE_API_KEY, providerApiKey);
-  const authProfile = getConfigString(skillEnv.STUDIO_AUTH_PROFILE, skillEnv.OPENCLAW_AUTH_PROFILE);
+  const apiKey = getConfigString(skillCfg.apiKey, skillEnv.STUDIO_API_KEY, process.env.STUDIO_API_KEY, skillEnv.DASHSCOPE_API_KEY, process.env.DASHSCOPE_API_KEY, providerApiKey);
+  const authProfile = getConfigString(skillEnv.STUDIO_AUTH_PROFILE, process.env.STUDIO_AUTH_PROFILE, skillEnv.OPENCLAW_AUTH_PROFILE, process.env.OPENCLAW_AUTH_PROFILE);
   const baseUrl = getConfigString(
     skillEnv.STUDIO_API_BASE_URL,
+    process.env.STUDIO_API_BASE_URL,
     skillEnv.STUDIO_BASE_URL,
+    process.env.STUDIO_BASE_URL,
     skillEnv.DASHSCOPE_BASE_URL,
+    process.env.DASHSCOPE_BASE_URL,
     apiKey === providerApiKey ? providerBaseUrl : "",
     DEFAULT_STUDIO_SELFIE_BASE_URL,
   );
@@ -104,7 +112,11 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
     skillEnv.STUDIO_IMAGE_EDIT_MODEL,
     skillEnv.STUDIO_IMAGE_MODEL,
     skillEnv.STUDIO_MODEL,
+    process.env.STUDIO_IMAGE_EDIT_MODEL,
+    process.env.STUDIO_IMAGE_MODEL,
+    process.env.STUDIO_MODEL,
     skillEnv.DASHSCOPE_MODEL,
+    process.env.DASHSCOPE_MODEL,
     shouldUseMiniMaxDefaults ? DEFAULT_MINIMAX_IMAGE_MODEL : "",
     DEFAULT_STUDIO_SELFIE_MODEL,
   );
@@ -114,16 +126,18 @@ export function resolveDirectSelfieRuntimeConfig(rootConfig: Record<string, any>
     authProfile,
     baseUrl,
     modelId,
-    quality: getConfigString(skillEnv.STUDIO_IMAGE_QUALITY, "standard"),
-    referenceImagePath: getConfigString(skillEnv.ASUKA_REFERENCE_IMAGE_PATH),
+    quality: getConfigString(skillEnv.STUDIO_IMAGE_QUALITY, process.env.STUDIO_IMAGE_QUALITY, "standard"),
+    proxyUrl: getConfigString(skillEnv.STUDIO_IMAGE_PROXY_URL, process.env.STUDIO_IMAGE_PROXY_URL, skillEnv.STUDIO_PROXY_URL, process.env.STUDIO_PROXY_URL),
+    referenceImagePath: getConfigString(skillEnv.ASUKA_REFERENCE_IMAGE_PATH, process.env.ASUKA_REFERENCE_IMAGE_PATH),
   };
 }
 
 const SELFIE_IDENTITY_LOCK_PROMPT = [
   "每次生成图片都必须让 Asuka 作为画面主角，并严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
-  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
-  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
-  "身份和外貌一致性优先级高于场景创意；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
+  "优先保持参考图里的小而紧致的鹅蛋脸、脸头比例、柔和颧颊线条、小巧下颌和下巴、自然深色眉形、略圆的杏眼和温柔双眼皮、细小鼻梁、克制淡唇、白皙清透肤色、自然深色长发、轻薄空气刘海、年龄感和清冷柔和的日系写真气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要中韩网红化、不要二次元化、不要娃娃大眼、不要尖锐 V 脸、不要浓妆成熟模特脸、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意、服装、姿势、光线和美化风格；图片不必固定为手持自拍，可以是 Asuka 在当前情景下的照片、生活瞬间、半身/全身画面或与用户要求元素同框的场景。",
+  "不要在生图提示里命名、暗示或声称任何真实公众人物；只使用参考图可见外貌特征作为原创 Asuka 的身份锚点。",
 ].join(" ");
 const SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT = [
   "穿着策略：除非用户明确指定服装，否则不要照抄参考图衣服；根据当前时间、地点、天气、动作和情绪选择可信的夏季日常穿搭。",
@@ -144,6 +158,7 @@ const MAX_CHAT_RECENT_TRANSCRIPT_CHARS = 18_000;
 const MAX_CHAT_RECENT_TRANSCRIPT_ENTRIES = 40;
 const MAX_LOOP_GUARD_REPLY_CHARS = 80;
 const MAX_SELFIE_PROMPT_CHARS = 4200;
+const DEFAULT_SELFIE_VISIBLE_REPLY = "嗯，我给你看现在这一刻。";
 let asukaVisualIdentityAnchorCache: string | undefined;
 
 interface DirectSelfiePromptContext {
@@ -333,6 +348,7 @@ function loadAsukaVisualIdentityAnchor(): string {
   const collected: string[] = [];
   const blockPatterns = [
     /^\s*-\s+\*\*(?:Appearance|Look|Visual|Body|Creature|长相|外观|视觉身份|身材)\*\*:\s*(.+?)\s*$/i,
+    /^\s*-\s+\*\*(?:Reference Face|Face|Facial Anchor|参考脸|脸部锚点)\*\*:\s*(.+?)\s*$/i,
     /^\s*-\s+((?:Her|Your)\s+appearance\s+is\s+.+?)\s*$/i,
     /^\s*-\s+((?:She|You)\s+has\s+.+?(?:figure|curves|bust|skin).+?)\s*$/i,
     /^\s*-\s+(The intended visual target is .+?)\s*$/i,
@@ -396,7 +412,7 @@ function loadAsukaVisualIdentityAnchor(): string {
     }
   }
 
-  const joined = collected.slice(0, 4).join("；");
+  const joined = collected.slice(0, 6).join("；");
   asukaVisualIdentityAnchorCache = joined
     ? `人物外观锚点：${joined}。请在不破坏参考脸一致性的前提下延续这些外观特征。`
     : "人物外观锚点：保持 Asuka 参考脸一致，外观稳定、时尚、有鲜明视觉辨识度。";
@@ -976,6 +992,115 @@ function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
   return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
 }
 
+function buildStudioMediaApiUrlCandidates(baseUrl: string, resourcePath: string): string[] {
+  const urls = [buildStudioMediaApiUrl(baseUrl, resourcePath)];
+  try {
+    const parsed = new URL(baseUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "www.xmapi.cc") {
+      parsed.hostname = "code.xmapi.cc";
+      urls.push(buildStudioMediaApiUrl(parsed.toString(), resourcePath));
+    } else if (host === "code.xmapi.cc") {
+      parsed.hostname = "www.xmapi.cc";
+      urls.push(buildStudioMediaApiUrl(parsed.toString(), resourcePath));
+    }
+  } catch {
+    // Non-URL base strings fall back to the configured endpoint only.
+  }
+  return [...new Set(urls)];
+}
+
+function shouldRetryStudioMediaOnAlternateBase(response: Response): boolean {
+  return response.status === 502 || response.status === 503 || response.status === 504;
+}
+
+function readStudioMediaErrorMessage(body: any, bodyText: string, response: Response): string {
+  const error = body?.error;
+  const message = typeof error === "object" && error
+    ? error.message || JSON.stringify(error)
+    : error || body?.message || body?.text || bodyText || response.statusText;
+  return String(message).slice(0, 500);
+}
+
+function getEnvProxyUrl(overrideProxyUrl?: string): string {
+  const override = getConfigString(overrideProxyUrl);
+  if (override) return override;
+  return getConfigString(
+    process.env.https_proxy,
+    process.env.HTTPS_PROXY,
+    process.env.http_proxy,
+    process.env.HTTP_PROXY,
+    process.env.all_proxy,
+    process.env.ALL_PROXY,
+  );
+}
+
+function getProxySource(overrideProxyUrl?: string): "override" | "env" | "none" {
+  if (getConfigString(overrideProxyUrl)) return "override";
+  return getEnvProxyUrl() ? "env" : "none";
+}
+
+function describeProxyForLog(overrideProxyUrl?: string): string {
+  const proxyUrl = getEnvProxyUrl(overrideProxyUrl);
+  if (!proxyUrl) return "none";
+  try {
+    const parsed = new URL(proxyUrl);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return proxyUrl.replace(/\/\/[^/@\s]+@/, "//***@");
+  }
+}
+
+function getLoopbackProxyProbeTarget(overrideProxyUrl?: string): { host: string; port: number } | null {
+  const proxyUrl = getConfigString(overrideProxyUrl);
+  if (!proxyUrl) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(proxyUrl);
+  } catch {
+    return null;
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!["localhost", "127.0.0.1", "::1"].includes(hostname)) return null;
+  const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : parsed.protocol.startsWith("socks") ? 1080 : 80));
+  if (!Number.isFinite(port) || port <= 0) return null;
+  return { host: hostname === "localhost" ? "127.0.0.1" : hostname, port };
+}
+
+async function assertLoopbackProxyReachable(overrideProxyUrl?: string): Promise<void> {
+  const target = getLoopbackProxyProbeTarget(overrideProxyUrl);
+  if (!target) return;
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.connect({ host: target.host, port: target.port });
+    const done = (error?: Error) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    socket.setTimeout(LOCAL_STUDIO_PROXY_PREFLIGHT_TIMEOUT_MS);
+    socket.once("connect", () => done());
+    socket.once("timeout", () => done(new Error(`connect timeout after ${LOCAL_STUDIO_PROXY_PREFLIGHT_TIMEOUT_MS}ms`)));
+    socket.once("error", done);
+  }).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Studio override proxy preflight failed: proxy=${describeProxyForLog(overrideProxyUrl)}; endpoint=${target.host}:${target.port}; reason=${message}`);
+  });
+}
+
+async function buildProxyDispatcherInit(overrideProxyUrl?: string): Promise<Record<string, unknown>> {
+  const proxyUrl = getEnvProxyUrl(overrideProxyUrl);
+  if (!proxyUrl) return {};
+  await assertLoopbackProxyReachable(overrideProxyUrl);
+  try {
+    const undici = await import("undici");
+    return { dispatcher: new undici.ProxyAgent(proxyUrl) };
+  } catch {
+    return {};
+  }
+}
+
 function describeFetchFailure(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
   const cause = (error as Error & { cause?: unknown }).cause;
@@ -1044,45 +1169,59 @@ async function generateStudioMediaSelfieImageUrl(
   referenceImagePath: string,
   size = "1024x1024",
 ): Promise<string> {
-  let response: Response;
-  try {
-    response = await fetch(buildStudioMediaApiUrl(config.baseUrl, "images/generations"), {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${config.apiKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        model: config.modelId.replace(/^apibusiness_media:/i, ""),
-        prompt: buildStudioSelfiePrompt(prompt),
-        image_size: normalizeStudioMediaImageSize(size),
-        n: 1,
-        response_format: "url",
-        image_url: buildImageDataUrlFromFile(referenceImagePath),
-      }),
-    });
-  } catch (error) {
-    throw new Error(`Studio Media image generation fetch failed: ${describeFetchFailure(error)}`);
+  const urls = buildStudioMediaApiUrlCandidates(config.baseUrl, "images/generations");
+  const requestBody = JSON.stringify({
+    model: config.modelId.replace(/^apibusiness_media:/i, ""),
+    prompt: buildStudioSelfiePrompt(prompt),
+    image_size: normalizeStudioMediaImageSize(size),
+    n: 1,
+    response_format: "url",
+    image_url: buildImageDataUrlFromFile(referenceImagePath),
+  });
+  const errors: string[] = [];
+
+  for (let index = 0; index < urls.length; index += 1) {
+    const url = urls[index];
+    let response: Response;
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), STUDIO_MEDIA_IMAGE_CLIENT_ABORT_MS);
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: requestBody,
+        ...(await buildProxyDispatcherInit(config.proxyUrl)),
+      } as RequestInit);
+    } catch (error) {
+      errors.push(`${url}: fetch failed: ${describeFetchFailure(error)}`);
+      if (index + 1 < urls.length) continue;
+      throw new Error(`Studio Media image generation fetch failed: ${errors.join(" | ")}; proxySource=${getProxySource(config.proxyUrl)}; proxy=${describeProxyForLog(config.proxyUrl)}; clientAbortMs=${STUDIO_MEDIA_IMAGE_CLIENT_ABORT_MS}`);
+    } finally {
+      clearTimeout(abortTimer);
+    }
+
+    const bodyText = await response.text();
+    let body: any;
+    try {
+      body = bodyText ? JSON.parse(bodyText) : {};
+    } catch {
+      body = { text: bodyText };
+    }
+
+    if (response.ok) return extractStudioImageUrl(body);
+
+    const message = readStudioMediaErrorMessage(body, bodyText, response);
+    errors.push(`${url}: HTTP ${response.status}: ${message}`);
+    if (index + 1 < urls.length && shouldRetryStudioMediaOnAlternateBase(response)) continue;
+    throw new Error(`Studio Media image generation failed: ${errors.join(" | ")}`);
   }
 
-  const bodyText = await response.text();
-  let body: any;
-  try {
-    body = bodyText ? JSON.parse(bodyText) : {};
-  } catch {
-    body = { text: bodyText };
-  }
-
-  if (!response.ok) {
-    const error = body?.error;
-    const message = typeof error === "object" && error
-      ? error.message || JSON.stringify(error)
-      : error || body?.message || body?.text || bodyText || response.statusText;
-    throw new Error(`Studio Media image generation failed: HTTP ${response.status}: ${String(message).slice(0, 500)}`);
-  }
-
-  return extractStudioImageUrl(body);
+  throw new Error("Studio Media image generation failed: no endpoint attempted");
 }
 
 async function generateStudioSelfieImageUrl(
@@ -1159,7 +1298,7 @@ function resolveSelfieVisiblePayloadText(
   replyText: string,
   rawVisibleText: string,
   caption: string | undefined,
-  userText: string,
+  _userText: string,
 ): string {
   const visibleText = cleanOutgoingTextSegment(resolveVisiblePayloadText(replyText, rawVisibleText));
   if (visibleText) return visibleText;
@@ -1167,11 +1306,18 @@ function resolveSelfieVisiblePayloadText(
   const captionText = cleanOutgoingTextSegment(caption || "");
   if (captionText) return captionText;
 
-  const requestText = cleanOutgoingTextSegment(stripTrailingSelfieTrigger(userText)).replace(/\s+/g, " ").trim();
-  if (requestText && !/^按最近对话语境生成一张(?:本人|Asuka 为主角的)?图片$/.test(requestText)) {
-    return "好，我按你刚刚说的来。";
-  }
-  return "好，我按刚刚的语境给你发一张。";
+  return "";
+}
+
+function resolveSelfieFlowContextText(
+  visibleText: string | null | undefined,
+  caption: string | undefined,
+  userText: string,
+): string {
+  return cleanOutgoingTextSegment(visibleText || "")
+    || cleanOutgoingTextSegment(caption || "")
+    || cleanOutgoingTextSegment(buildForcedSelfieUserText(userText))
+    || DEFAULT_SELFIE_VISIBLE_REPLY;
 }
 
 function stripStructuredPayloadForVisibleText(text: string): string {
@@ -1340,6 +1486,8 @@ const MESSAGE_BUFFER_MAX_MESSAGES = 20; // 单次合并最多消息数
 const MESSAGE_BUFFER_MAX_CONTENT_CHARS = 12_000; // 单次合并最多原始文本长度
 const PENDING_DISPATCH_TTL_MS = 2 * 60 * 60 * 1000;
 const PENDING_DISPATCH_RECOVERY_DELAY_MS = 8_000;
+const PENDING_DISPATCH_STALE_PROCESSING_MS = 3 * 60 * 1000;
+const PENDING_DISPATCH_WATCHDOG_INTERVAL_MS = 30_000;
 
 interface PendingDispatchRecord {
   id: string;
@@ -1349,7 +1497,7 @@ interface PendingDispatchRecord {
   createdAt: number;
   updatedAt: number;
   attempts: number;
-  state: "pending" | "processing" | "recovering";
+  state: "pending" | "processing" | "recovering" | "sent" | "postprocessing" | "failed";
   lastError?: string;
 }
 
@@ -1468,6 +1616,49 @@ function clearPendingDispatches(accountId: string, pendingIds: string[] | undefi
     }
   });
   log?.debug?.(`[qqbot:${accountId}] Cleared pending dispatch(es) (${reason}): ${pendingIds.join(",")}`);
+}
+
+function markPendingDispatchesState(
+  accountId: string,
+  pendingIds: string[] | undefined,
+  state: PendingDispatchRecord["state"],
+  reason: string,
+  log?: GatewayContext["log"],
+): void {
+  if (!pendingIds?.length) return;
+  const now = Date.now();
+  updatePendingDispatchStore((store) => {
+    for (const id of pendingIds) {
+      const record = store[id];
+      if (!record || record.accountId !== accountId) continue;
+      record.state = state;
+      record.updatedAt = now;
+      if (state === "failed") {
+        record.lastError = reason;
+      }
+      store[id] = record;
+    }
+  });
+  log?.debug?.(`[qqbot:${accountId}] Marked pending dispatch(es) ${state} (${reason}): ${pendingIds.join(",")}`);
+}
+
+function markStaleProcessingDispatchesFailed(accountId: string, staleBeforeMs: number, log?: GatewayContext["log"]): string[] {
+  const failedPeerIds = new Set<string>();
+  const now = Date.now();
+  updatePendingDispatchStore((store) => {
+    for (const record of Object.values(store)) {
+      if (!record || record.accountId !== accountId) continue;
+      if (record.state !== "processing" && record.state !== "postprocessing") continue;
+      if (record.updatedAt >= staleBeforeMs) continue;
+      record.state = "failed";
+      record.updatedAt = now;
+      record.lastError = "stale processing lease expired";
+      store[record.id] = record;
+      failedPeerIds.add(record.peerId);
+      log?.error?.(`[qqbot:${accountId}] Marked stale pending dispatch failed: id=${record.id}, peer=${record.peerId}, ageMs=${now - record.createdAt}`);
+    }
+  });
+  return [...failedPeerIds];
 }
 
 function recoverPendingDispatches(accountId: string, createdBeforeMs: number, log?: GatewayContext["log"]): QueuedMessage[] {
@@ -1643,7 +1834,9 @@ function filterInternalMarkers(text: string): string {
   
   // 过滤内部控制标记，例如:
   // [[reply_to: ROBOT1.0_kbc...]], [[reply_to_current]], \[[reply_to_current]\]
-  let result = text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "");
+  let result = text
+    .replace(MODEL_THINKING_BLOCK_RE, "")
+    .replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "");
   
   // 清理可能产生的多余空行
   result = result.replace(/\n{3,}/g, "\n\n").trim();
@@ -2044,6 +2237,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   
   const userQueues = new Map<string, QueuedMessage[]>(); // peerId → 消息队列
   const activeUsers = new Set<string>(); // 正在处理中的用户
+  const activeUserStartedAt = new Map<string, number>(); // peerId → 当前处理开始时间
   const messageBuffers = new Map<string, {
     messages: QueuedMessage[];
     firstReceivedAt: number;
@@ -2055,6 +2249,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   let handleMessageFnRef: ((msg: QueuedMessage) => Promise<void>) | null = null;
   let totalEnqueued = 0; // 全局已入队总数（用于溢出保护）
   let pendingRecoveryScheduled = false;
+  let pendingDispatchWatchdog: ReturnType<typeof setInterval> | null = null;
 
   const countBufferedMessages = (): number => {
     let count = 0;
@@ -2296,8 +2491,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
       return;
     }
 
-    activeUsers.add(peerId);
-    publishQueueStatus({ queueState: "processing" });
+	    activeUsers.add(peerId);
+	    activeUserStartedAt.set(peerId, Date.now());
+	    publishQueueStatus({ queueState: "processing" });
 
     try {
       while (queue.length > 0 && !isAborted) {
@@ -2312,10 +2508,11 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           log?.error(`[qqbot:${account.accountId}] Message processor error for ${peerId}: ${err}`);
         }
       }
-    } finally {
-      activeUsers.delete(peerId);
-      userQueues.delete(peerId);
-      publishQueueStatus({ queueState: "idle" });
+	    } finally {
+	      activeUsers.delete(peerId);
+	      activeUserStartedAt.delete(peerId);
+	      userQueues.delete(peerId);
+	      publishQueueStatus({ queueState: "idle" });
       // 处理完后，检查是否有等待并发槽位的用户
       for (const [waitingPeerId, waitingQueue] of userQueues) {
         if (waitingQueue.length > 0 && !activeUsers.has(waitingPeerId)) {
@@ -2326,17 +2523,47 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     }
   };
 
-  const startMessageProcessor = (handleMessageFn: (msg: QueuedMessage) => Promise<void>): void => {
-    handleMessageFnRef = handleMessageFn;
-    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users, buffer ${messageBufferConfig.bufferMs}ms/${messageBufferConfig.maxMs}ms)`);
-  };
+	  const startMessageProcessor = (handleMessageFn: (msg: QueuedMessage) => Promise<void>): void => {
+	    handleMessageFnRef = handleMessageFn;
+	    log?.info(`[qqbot:${account.accountId}] Message processor started (per-user concurrency, max ${MAX_CONCURRENT_USERS} users, buffer ${messageBufferConfig.bufferMs}ms/${messageBufferConfig.maxMs}ms)`);
+	  };
 
-  abortSignal.addEventListener("abort", () => {
+	  pendingDispatchWatchdog = setInterval(() => {
+	    const now = Date.now();
+	    const staleActivePeers: string[] = [];
+	    for (const [peerId, startedAt] of activeUserStartedAt.entries()) {
+	      if (now - startedAt < PENDING_DISPATCH_STALE_PROCESSING_MS) continue;
+	      staleActivePeers.push(peerId);
+	    }
+	    const staleStorePeers = markStaleProcessingDispatchesFailed(
+	      account.accountId,
+	      now - PENDING_DISPATCH_STALE_PROCESSING_MS,
+	      log,
+	    );
+	    for (const peerId of new Set([...staleActivePeers, ...staleStorePeers])) {
+	      if (activeUsers.delete(peerId)) {
+	        activeUserStartedAt.delete(peerId);
+	        appendGatewayDiagnosticLine(account.accountId, `pending watchdog released stale active peer=${peerId}`);
+	        log?.error(`[qqbot:${account.accountId}] Released stale active queue slot for ${peerId}`);
+	      }
+	      const queue = userQueues.get(peerId);
+	      if (queue && queue.length > 0) {
+	        void drainUserQueue(peerId);
+	      }
+	    }
+	  }, PENDING_DISPATCH_WATCHDOG_INTERVAL_MS);
+	  pendingDispatchWatchdog.unref?.();
+
+	  abortSignal.addEventListener("abort", () => {
     const flushedBufferCount = flushAllBufferedMessages("channel abort");
     if (flushedBufferCount > 0) {
       log?.info(`[qqbot:${account.accountId}] Flushed ${flushedBufferCount} buffered message batch(es) before channel abort`);
     }
-    isAborted = true;
+	    isAborted = true;
+	    if (pendingDispatchWatchdog) {
+	      clearInterval(pendingDispatchWatchdog);
+	      pendingDispatchWatchdog = null;
+	    }
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -2756,6 +2983,22 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
         };
 
         recordInboundInteraction(asukaPeerContext, proactiveNudge.isNudge ? "用户轻轻催你主动续聊" : userContent);
+        if (!proactiveNudge.isNudge && asukaPeerContext.peerKind === "direct") {
+          const peerKeyForAmbientCancel = `${asukaPeerContext.accountId}:${asukaPeerContext.peerKind}:${asukaPeerContext.peerId}`;
+          const cancelledAmbient = await removeScheduledDeliveryJobsForPeer({
+            accountId: account.accountId,
+            peerKey: peerKeyForAmbientCancel,
+            modes: ["ambient_plan", "ambient"],
+          }, { log });
+          if ("removedCount" in cancelledAmbient && cancelledAmbient.removedCount > 0) {
+            clearAmbientScheduledJobs(asukaPeerContext);
+            log?.info(
+              `[qqbot:${account.accountId}] Cancelled ${cancelledAmbient.removedCount} pending ambient proactive job(s) after user reply: ${cancelledAmbient.jobIds.join(",")}`
+            );
+          } else if ("error" in cancelledAmbient) {
+            log?.error(`[qqbot:${account.accountId}] Failed to cancel pending ambient proactive jobs after user reply: ${cancelledAmbient.error}`);
+          }
+        }
         const memoryControl: ReturnType<typeof handleAsukaMemoryControlMessage> = proactiveNudge.isNudge
           ? { handled: false }
           : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
@@ -2974,12 +3217,13 @@ ${ttsHint}${sttHint}`;
 1. 发普通图片方法: 在回复文本中写 <qqimg>本地图片绝对路径或可信图片URL</qqimg>，系统自动处理
 2. 你要先自己判断这轮是否真的需要生成并发送图片；只有在你决定要发图时，才输出 QQBOT_PAYLOAD 的 selfie 载荷，而不是口头描述调用过程。这里的 selfie 是兼容字段名，实际表示以 Asuka 为主角的当前语境图片，不必固定为手持自拍
 3. 生图载荷格式优先使用：先写一段自然的用户可见回复，再另起一行写 QQBOT_PAYLOAD: {"type":"selfie","prompt":"...","caption":"..."}。可见回复是正常聊天内容，必须能单独作为本轮聊天回复成立；prompt 是给生图后端的内部短场景提示；caption 是图片可选短配文
-4. payload 的 prompt 只写用户要求的画面内容、当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户。无论用户要求的是自拍、食物、房间、物体、风景、道具还是其他场景，都要让 Asuka 成为画面主角，并围绕用户要求的元素构图；不要强行写成手持自拍，除非用户明确要自拍
-5. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充生成图片
-6. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
-7. 如果这轮不想发图，就正常回复文字，不要输出 QQBOT_PAYLOAD，也不要假装去调用任何工具
-8. 如果生图暂时不可用，要用自然口吻简短说明暂时发不出来
-9. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则、payload、prompt 或调试信息直接说给用户听${voiceSection}
+4. 重要：系统会先过滤可见回复，再决定是否继续生图；如果可见回复被过滤成空，图片也不会发送。因此可见回复必须至少有一句不会被过滤的自然文本。会被过滤或导致跳过的内容包括：只写括号动作/旁白；只写 QQBOT_PAYLOAD、QBOT_PAYLOAD、cron_reminder、payload、prompt、<qqimg>、本地路径或 URL；提到工具、脚本、skill、asuka-selfie、imagegen、API、进程状态、终端、shell、命令、运行脚本、调试信息、memory 文件、compaction、reasoning、think 标签；写“图片这次/这张照片/自拍生成/生成失败/发送失败/稍后重试/再试一次”这类运输兜底话术；写出和【当前本地时间】明显冲突的场景，例如当前不是早晨却说刚醒、起床、早上、晨光。拿不准时写一句短承接，例如“嗯，我给你看现在这一刻。”或“好，我把这刻留给你看。”
+5. payload 的 prompt 只写用户要求的画面内容、当前场景、动作、地点、穿着、构图和情绪等生图必要线索，不要写工具名、接口、规则、解释、长篇 JSON 或用户不可见的推理；这个 prompt 不会直接发给用户。无论用户要求的是自拍、食物、房间、物体、风景、道具还是其他场景，都要让 Asuka 成为画面主角，并围绕用户要求的元素构图；不要强行写成手持自拍，除非用户明确要自拍
+6. 禁止使用 picsum.photos、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充生成图片
+7. 如果是普通图片且你手里已经有真实图片路径或可信 URL，可以在自然回复里使用 <qqimg> 标签发送
+8. 如果这轮不想发图，就正常回复文字，不要输出 QQBOT_PAYLOAD，也不要假装去调用任何工具
+9. 如果生图暂时不可用，要用自然口吻简短说明暂时发不出来；但只要你输出 selfie payload，就必须同时提供一段不会被过滤的自然可见回复
+10. 永远不要把你的内部决策过程、工具调用计划、技能名、脚本名、API、进程状态、标签规则、payload、prompt 或调试信息直接说给用户听${voiceSection}
 
 【发送文件 - 必须遵守】
 1. 发文件方法: 在回复文本中写 <qqfile>文件路径或URL</qqfile>，系统自动处理
@@ -3031,6 +3275,7 @@ ${ttsHint}${sttHint}`;
             ? [
                 "- 本轮回复方式: 用户输入以 `-` 结尾，表示本轮明确要求按当前语境生成并发送 Asuka 主角图片；图片内容以用户正文和最近上下文为准，不一定是手持自拍。",
                 "- 处理方式: 不要解释触发符，不要说“我去拍一张，等我一下”。本阶段只输出一段自然、承接上下文的用户可见回复，不要输出任何 QQBOT_PAYLOAD、<qqimg> 标签、本地图片路径、内部 prompt 或执行过程。",
+                "- 可见回复过滤条件: 后续内部流程会先过滤这段可见回复；如果被过滤成空，图片也不会发送。不要只写括号动作/旁白；不要写 QQBOT_PAYLOAD、QBOT_PAYLOAD、cron_reminder、payload、prompt、<qqimg>、本地路径或 URL；不要提工具、脚本、skill、asuka-selfie、imagegen、API、进程状态、终端、shell、命令、运行脚本、调试信息、memory 文件、compaction、reasoning、think 标签；不要写“图片这次/这张照片/自拍生成/生成失败/发送失败/稍后重试/再试一次”这类运输兜底话术；不要写和【当前本地时间】明显冲突的场景，例如当前不是早晨却说刚醒、起床、早上、晨光。拿不准时写一句短承接，例如“嗯，我给你看现在这一刻。”或“好，我把这刻留给你看。”。",
                 "- 后续内部流程会在这段文本发送后，再用用户正文、最近上下文和刚刚生成的可见回复生成图片 prompt，然后单独发送图片。",
                 "- 内容要求: 后续图片必须以 Asuka 为画面主角，并结合用户要求的元素、地点、动作、构图和情绪；如果用户要食物、房间、物体、风景或道具，就生成 Asuka 与这些元素同框的当前情景图片，不要把所有请求都写成固定自拍。",
               ].join("\n")
@@ -3211,23 +3456,17 @@ ${ttsHint}${sttHint}`;
           }
         };
 
-        const resolveTimeSafeVisibleReplyText = (text: string, options?: { forceImage?: boolean }): string => {
-          const cleanedText = cleanOutgoingTextSegment(text);
-          const visibleText = isTimeContradictoryDeliveryText(cleanedText, getPromptTimeZone(account), Date.now())
-            ? buildTimeAwareDeliveryFallback(userContent, { forceImage: options?.forceImage ?? forceSelfieFromTrailingDash })
-            : cleanedText;
-          if (visibleText !== cleanedText) {
-            log?.info(
-              `[qqbot:${account.accountId}] Replaced time-contradictory visible reply: "${cleanedText.slice(0, 120)}" -> "${visibleText.slice(0, 120)}"`
-            );
-          }
-          return visibleText;
+        const resolveTimeSafeVisibleReplyText = (text: string, _options?: { forceImage?: boolean }): string => {
+          return cleanOutgoingTextSegment(text);
         };
 
-        const sendVisibleReplyText = async (text: string): Promise<boolean> => {
-          const visibleText = resolveTimeSafeVisibleReplyText(text);
+        const sendVisibleReplyTextAndReturn = async (
+          text: string,
+          options?: { forceImage?: boolean },
+        ): Promise<string | null> => {
+          const visibleText = resolveTimeSafeVisibleReplyText(text, options);
           if (!visibleText) {
-            return false;
+            return null;
           }
           try {
             const visibleSegments = splitAsukaNarrationSegments(visibleText);
@@ -3243,11 +3482,15 @@ ${ttsHint}${sttHint}`;
               });
             }
             log?.info(`[qqbot:${account.accountId}] Sent visible reply text before structured follow-up: ${visibleText.slice(0, 80)}, segments=${visibleSegments.length}`);
-            return true;
+            return visibleText;
           } catch (err) {
             log?.error(`[qqbot:${account.accountId}] Failed to send visible reply text: ${err}`);
-            return false;
+            return null;
           }
+        };
+
+        const sendVisibleReplyText = async (text: string): Promise<boolean> => {
+          return Boolean(await sendVisibleReplyTextAndReturn(text));
         };
 
         if (memoryControl.handled) {
@@ -3258,8 +3501,12 @@ ${ttsHint}${sttHint}`;
 
         const runDirectSelfieFlow = async (prompt: string, options?: { background?: boolean }): Promise<boolean> => {
           const selfieConfig = resolveDirectSelfieRuntimeConfig(cfg as Record<string, any>);
-          const { apiKey, authProfile, baseUrl, modelId, quality } = selfieConfig;
+          const { apiKey, authProfile, baseUrl, modelId, quality, proxyUrl } = selfieConfig;
+          const studioImageConfig = { apiKey, authProfile, baseUrl, modelId, quality, proxyUrl };
           const officialImageConfigured = hasOfficialOpenClawImageGenerationConfig(cfg as Record<string, any>);
+          const studioImageConfigured = Boolean(apiKey || authProfile) && isStudioMediaImageConfig(studioImageConfig);
+          const preferOfficialImageGeneration = officialImageConfigured;
+          log?.info(`[qqbot:${account.accountId}] Direct selfie image config: model=${modelId}, baseUrl=${baseUrl}, preferOfficial=${preferOfficialImageGeneration}, studioConfigured=${studioImageConfigured}, officialConfigured=${officialImageConfigured}, proxySource=${getProxySource(proxyUrl)}, proxy=${describeProxyForLog(proxyUrl)}`);
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
             const candidates = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath);
@@ -3324,7 +3571,7 @@ ${ttsHint}${sttHint}`;
               throw new Error("no bundled reference image found");
             }
             let imageUrl: string;
-            if (officialImageConfigured) {
+            if (preferOfficialImageGeneration) {
               try {
                 imageUrl = await generateOfficialOpenClawImageDataUrl({
                   cfg: cfg as Record<string, any>,
@@ -3338,11 +3585,14 @@ ${ttsHint}${sttHint}`;
               } catch (officialError) {
                 if (!apiKey && !authProfile) throw officialError;
                 log?.error(`[qqbot:${account.accountId}] OpenClaw official selfie image generation failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
-                imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+                imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
                 log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
               }
+            } else if (studioImageConfigured) {
+              imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
+              log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
             } else {
-              imageUrl = await generateStudioSelfieImageUrl(prompt, { apiKey, authProfile, baseUrl, modelId, quality }, referenceImagePath);
+              imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
               log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
             }
             return await sendGeneratedSelfieImage(imageUrl);
@@ -3707,55 +3957,74 @@ ${ttsHint}${sttHint}`;
                   );
                 }
 
-                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${replyText.length}`);
-                const parsedPromises = await parseAssistantPromisesWithLlm(replyText, {
-                  userText: userContent,
-                  accountId: account.accountId,
-                  log,
-                });
-                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises done count=${parsedPromises.length}`);
-                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess record-assistant start");
-                const loggedPromises = recordAssistantReply(asukaPeerContext, replyText, parsedPromises);
-                appendGatewayDiagnosticLine(account.accountId, `deliver postprocess record-assistant done logged=${loggedPromises.length}`);
-                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory start");
-                recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, replyText);
-                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory done");
-                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene start");
-                await refreshSceneState(asukaPeerContext, {
-                  trigger: "assistant",
-                  text: replyText,
-                });
-                appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene done");
-                let scheduledPromiseCount = 0;
-                for (const promise of loggedPromises) {
-                  if (!promise.schedule) {
-                    continue;
-                  }
-                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise start id=${promise.id}`);
-                  const scheduled = await schedulePromiseJobs(promise, log);
-                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise done id=${promise.id} ok=${"primaryJobId" in scheduled}`);
-                  if ("primaryJobId" in scheduled) {
-                    scheduledPromiseCount++;
-                    markPromiseScheduled(promise.id, scheduled.primaryJobId);
-                    for (const jobId of scheduled.followUpJobIds) {
-                      appendPromiseFollowUpJob(promise.id, jobId);
-                    }
-                    log?.info(
-                      `[qqbot:${account.accountId}] Scheduled Asuka promise ${promise.id} as job ${scheduled.primaryJobId}, followUps=${scheduled.followUpJobIds.length}`
-                    );
-                  } else {
-                    markPromiseScheduleFailed(promise.id, scheduled.error);
-                    log?.error(`[qqbot:${account.accountId}] Failed to schedule Asuka promise ${promise.id}: ${scheduled.error}`);
-                  }
-                }
-                if (scheduledPromiseCount === 0 && asukaPeerContext.peerKind === "direct") {
-                  appendGatewayDiagnosticLine(account.accountId, "deliver postprocess ambient start");
-                  const ambientJobs = await scheduleAmbientLifeJobs(asukaPeerContext, Date.now(), log);
-                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess ambient done count=${ambientJobs.length}`);
-                  if (ambientJobs.length > 0) {
-                    log?.info(`[qqbot:${account.accountId}] Scheduled ambient Asuka life-line jobs: ${ambientJobs.join(",")}`);
-                  }
-                }
+                const postprocessReplyText = replyText;
+                let backgroundPostprocessQueued = false;
+                const queueBackgroundPostprocess = (reason: string): void => {
+                  if (backgroundPostprocessQueued) return;
+                  backgroundPostprocessQueued = true;
+                  appendGatewayDiagnosticLine(account.accountId, `deliver postprocess queued reason=${reason} textLength=${postprocessReplyText.length}`);
+                  markPendingDispatchesState(account.accountId, pendingIdsForEvent, "postprocessing", `reply sent; background postprocess queued: ${reason}`, log);
+                  setImmediate(() => {
+                    void (async () => {
+                      try {
+                        appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${postprocessReplyText.length}`);
+                        const parsedPromises = await parseAssistantPromisesWithLlm(postprocessReplyText, {
+                          userText: userContent,
+                          accountId: account.accountId,
+                          log,
+                        });
+                        appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises done count=${parsedPromises.length}`);
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess record-assistant start");
+                        const loggedPromises = recordAssistantReply(asukaPeerContext, postprocessReplyText, parsedPromises);
+                        appendGatewayDiagnosticLine(account.accountId, `deliver postprocess record-assistant done logged=${loggedPromises.length}`);
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory start");
+                        recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, postprocessReplyText);
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory done");
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene start");
+                        await refreshSceneState(asukaPeerContext, {
+                          trigger: "assistant",
+                          text: postprocessReplyText,
+                        });
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene done");
+                        let scheduledPromiseCount = 0;
+                        for (const promise of loggedPromises) {
+                          if (!promise.schedule) {
+                            continue;
+                          }
+                          appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise start id=${promise.id}`);
+                          const scheduled = await schedulePromiseJobs(promise, log);
+                          appendGatewayDiagnosticLine(account.accountId, `deliver postprocess schedule-promise done id=${promise.id} ok=${"primaryJobId" in scheduled}`);
+                          if ("primaryJobId" in scheduled) {
+                            scheduledPromiseCount++;
+                            markPromiseScheduled(promise.id, scheduled.primaryJobId);
+                            for (const jobId of scheduled.followUpJobIds) {
+                              appendPromiseFollowUpJob(promise.id, jobId);
+                            }
+                            log?.info(
+                              `[qqbot:${account.accountId}] Scheduled Asuka promise ${promise.id} as job ${scheduled.primaryJobId}, followUps=${scheduled.followUpJobIds.length}`
+                            );
+                          } else {
+                            markPromiseScheduleFailed(promise.id, scheduled.error);
+                            log?.error(`[qqbot:${account.accountId}] Failed to schedule Asuka promise ${promise.id}: ${scheduled.error}`);
+                          }
+                        }
+                        if (scheduledPromiseCount === 0 && asukaPeerContext.peerKind === "direct") {
+                          appendGatewayDiagnosticLine(account.accountId, "deliver postprocess ambient start");
+                          const ambientJobs = await scheduleAmbientLifeJobs(asukaPeerContext, Date.now(), log);
+                          appendGatewayDiagnosticLine(account.accountId, `deliver postprocess ambient done count=${ambientJobs.length}`);
+                          if (ambientJobs.length > 0) {
+                            log?.info(`[qqbot:${account.accountId}] Scheduled ambient Asuka life-line jobs: ${ambientJobs.join(",")}`);
+                          }
+                        }
+                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess complete");
+                      } catch (postprocessError) {
+                        const formatted = formatGatewayDiagnosticValue(postprocessError);
+                        appendGatewayDiagnosticLine(account.accountId, `deliver postprocess caught: ${formatted}`);
+                        log?.error(`[qqbot:${account.accountId}] Background deliver postprocess failed: ${formatted}`);
+                      }
+                    })();
+                  });
+                };
                 
                 appendGatewayDiagnosticLine(account.accountId, "deliver send-path start");
                 const mediaTagRegex = /<(qqimg|qqvoice|qqvideo|qqfile)>([^<>]+)<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
@@ -4150,12 +4419,15 @@ ${ttsHint}${sttHint}`;
                   }
                   
                   // 记录活动并返回
-                  pluginRuntime.channel.activity.record({
-                    channel: "qqbot",
-                    accountId: account.accountId,
-                    direction: "outbound",
-                  });
-                  return;
+	                  pluginRuntime.channel.activity.record({
+	                    channel: "qqbot",
+	                    accountId: account.accountId,
+	                    direction: "outbound",
+	                  });
+	                  markPendingDispatchesState(account.accountId, pendingIdsForEvent, "sent", "deliver media-tag path completed", log);
+	                  appendGatewayDiagnosticLine(account.accountId, `deliver complete kind=${info.kind}`);
+	                  queueBackgroundPostprocess("media-tag path completed");
+	                  return;
                 }
                 
                 // ============ 结构化载荷检测与分发 ============
@@ -4185,14 +4457,25 @@ ${ttsHint}${sttHint}`;
                       log?.info(
                         `[qqbot:${account.accountId}] Recovered incomplete selfie payload after parse error: ${payloadResult.error}; incomplete fields=${recoveredSelfie.incompleteFields.join(",") || "none"}`,
                       );
-                      await sendVisibleReplyText(recoveredVisibleText);
+                      const sentRecoveredVisibleText = await sendVisibleReplyTextAndReturn(
+                        recoveredVisibleText,
+                        { forceImage: forceSelfieFromTrailingDash },
+                      );
+                      const recoveredFlowText = resolveSelfieFlowContextText(
+                        sentRecoveredVisibleText || recoveredVisibleText,
+                        recoveredSelfie.payload.caption,
+                        userContent,
+                      );
+                      if (!sentRecoveredVisibleText) {
+                        log?.info(`[qqbot:${account.accountId}] Recovered selfie payload visible text not sent; continuing image flow with fallback context text`);
+                      }
                       const recoveredSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
                         modelSelfiePrompt: recoveredSelfie.payload.prompt,
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
-                        recoveredVisibleText,
+                        recoveredFlowText,
                         event.senderId,
                         recoveredSelfieContext,
                       );
@@ -4308,14 +4591,25 @@ ${ttsHint}${sttHint}`;
                         parsedPayload.caption,
                         userContent,
                       );
-                      await sendVisibleReplyText(selfieVisibleText);
+                      const sentSelfieVisibleText = await sendVisibleReplyTextAndReturn(
+                        selfieVisibleText,
+                        { forceImage: forceSelfieFromTrailingDash },
+                      );
+                      const selfieFlowText = resolveSelfieFlowContextText(
+                        sentSelfieVisibleText || selfieVisibleText,
+                        parsedPayload.caption,
+                        userContent,
+                      );
+                      if (!sentSelfieVisibleText) {
+                        log?.info(`[qqbot:${account.accountId}] Selfie payload visible text not sent; continuing image flow with fallback context text`);
+                      }
                       const payloadSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
                         modelSelfiePrompt: parsedPayload.prompt,
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
-                        selfieVisibleText,
+                        selfieFlowText,
                         event.senderId,
                         payloadSelfieContext,
                       );
@@ -4555,15 +4849,25 @@ ${ttsHint}${sttHint}`;
                     undefined,
                     userContent,
                   );
-                  const timeSafeSelfieVisibleText = resolveTimeSafeVisibleReplyText(selfieVisibleText, { forceImage: true });
                   log?.info(
                     `[qqbot:${account.accountId}] Forced trailing-dash image turn produced normal text; image prompt will be built after sending that reply`
                   );
-                  await sendVisibleReplyText(timeSafeSelfieVisibleText);
+                  const sentSelfieVisibleText = await sendVisibleReplyTextAndReturn(
+                    selfieVisibleText,
+                    { forceImage: true },
+                  );
+                  const selfieFlowText = resolveSelfieFlowContextText(
+                    sentSelfieVisibleText || selfieVisibleText,
+                    undefined,
+                    userContent,
+                  );
+                  if (!sentSelfieVisibleText) {
+                    log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image visible text not sent; continuing image flow with fallback context text`);
+                  }
                   log?.info(`[qqbot:${account.accountId}] Building post-reply image prompt for trailing-dash request`);
                   const selfiePrompt = buildDirectSelfiePromptFromContext(
                     userContent,
-                    timeSafeSelfieVisibleText,
+                    selfieFlowText,
                     event.senderId,
                     directSelfieContext,
                   );
@@ -4865,12 +5169,14 @@ ${ttsHint}${sttHint}`;
                   }
                 }
 
-                pluginRuntime.channel.activity.record({
-                  channel: "qqbot",
-                  accountId: account.accountId,
-                  direction: "outbound",
-                });
-                appendGatewayDiagnosticLine(account.accountId, `deliver complete kind=${info.kind}`);
+	                pluginRuntime.channel.activity.record({
+	                  channel: "qqbot",
+	                  accountId: account.accountId,
+	                  direction: "outbound",
+	                });
+	                markPendingDispatchesState(account.accountId, pendingIdsForEvent, "sent", "deliver send-path completed", log);
+	                appendGatewayDiagnosticLine(account.accountId, `deliver complete kind=${info.kind}`);
+	                queueBackgroundPostprocess("send-path completed");
                 } catch (err) {
                   hasResponse = true;
                   if (timeoutId) {
@@ -4926,14 +5232,13 @@ ${ttsHint}${sttHint}`;
             if (!hasResponse) {
               log?.error(`[qqbot:${account.accountId}] No response within timeout`);
               if (forceSelfieFromTrailingDash && event.type === "c2c") {
-                const timeoutSelfieVisibleText = resolveSelfieVisiblePayloadText("", "", undefined, userContent);
-                if (claimUserFacingDeliver("timeout-selfie", timeoutSelfieVisibleText)) {
+                log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image turn timed out before a natural visible reply; generating image from existing context`);
+                if (claimUserFacingDeliver("timeout-selfie", "")) {
                   hasResponse = true;
                   hasBlockResponse = true;
-                  await sendVisibleReplyText(timeoutSelfieVisibleText);
                   const timeoutSelfiePrompt = buildDirectSelfiePromptFromContext(
                     userContent,
-                    timeoutSelfieVisibleText,
+                    "",
                     event.senderId,
                     directSelfieContext,
                   );

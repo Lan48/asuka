@@ -67,7 +67,8 @@ export function resolveAuthProfilesPath(): string {
 }
 
 function readAuthProfileStore(authProfilesPath: string): AuthProfileStore {
-  return JSON.parse(fs.readFileSync(authProfilesPath, "utf8")) as AuthProfileStore;
+  const raw = fs.readFileSync(authProfilesPath, "utf8");
+  return JSON.parse(raw.replace(/^\uFEFF/, "")) as AuthProfileStore;
 }
 
 function writeAuthProfileStore(authProfilesPath: string, store: AuthProfileStore): void {

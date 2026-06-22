@@ -212,6 +212,18 @@ assert.equal(
   "invalid single-Q payload typo should still be suppressed in outbound delivery",
 );
 
+assert.equal(
+  looksLikeInternalDeliveryLeak('<think>The user said "还好" about noodles, so I should act slightly pouty.</think>（我轻轻撇嘴。）'),
+  true,
+  "model thinking tags should be suppressed before proactive delivery",
+);
+
+assert.equal(
+  looksLikeInternalDeliveryLeak('<think>The user said "还好" about noodles, so I should act slightly pouty.'),
+  true,
+  "unterminated model thinking blocks should be suppressed before proactive delivery",
+);
+
 for (const incompleteText of [
   "现在补…",
   "我…",

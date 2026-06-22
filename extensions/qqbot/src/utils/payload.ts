@@ -16,7 +16,7 @@
 export interface CronReminderPayload {
   type: 'cron_reminder';
   /** 内部模式：普通提醒 / 承诺兑现 / 未回复追发 */
-  mode?: 'reminder' | 'promise' | 'followup' | 'ambient' | 'repair';
+  mode?: 'reminder' | 'promise' | 'followup' | 'ambient_plan' | 'ambient' | 'repair';
   /** 提醒内容 */
   content: string;
   /** 目标类型：c2c (私聊) 或 group (群聊) */

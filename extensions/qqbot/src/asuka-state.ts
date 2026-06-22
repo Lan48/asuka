@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig } from "./config.js";
+import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 import { formatRelativeTimeForPrompt, formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
@@ -81,6 +81,8 @@ export type AsukaSceneTimeContinuity =
   | "advanced_from_night"
   | "reset_by_user"
   | "reset_by_model";
+export type AsukaSceneContinuityStatus = "current" | "continue_with_shift" | "faded" | "reset" | "unknown";
+export type AsukaProactiveDeliveryFreshnessStatus = "duplicate" | "fresh" | "continuation" | "unknown";
 
 export interface AsukaSceneState {
   kind: AsukaSceneKind;
@@ -100,6 +102,43 @@ export interface AsukaSceneState {
   transitionHint?: string;
   version: number;
   source: AsukaSceneSource;
+}
+
+export interface AsukaSceneContinuityVerdict {
+  sceneStatus: AsukaSceneContinuityStatus;
+  transitionInstruction: string;
+  staleElements: string[];
+  allowedContinuity: string;
+  reason: string;
+  source: "model" | "fallback_model" | "mock" | "unavailable" | "invalid";
+}
+
+export interface AsukaProactiveDeliveryFreshnessVerdict {
+  status: AsukaProactiveDeliveryFreshnessStatus;
+  reason: string;
+  requiredShift: string;
+  source: "model" | "fallback_model" | "mock" | "unavailable" | "invalid";
+}
+
+export interface AsukaProactiveTimingPlan {
+  delayMinutes: number;
+  intent: string;
+  reason: string;
+  topicAnchor: string;
+  sceneBeat: string;
+  noveltyGoal: string;
+  blockedAnchors: string[];
+  source: "model" | "fallback_model" | "mock";
+}
+
+export interface AsukaProactiveBeatLedgerEntry {
+  topicAnchor: string;
+  sceneBeat: string;
+  noveltyGoal: string;
+  blockedAnchors: string[];
+  suppressedReason?: string;
+  plannedAt: number;
+  deliveryDueAt?: number;
 }
 
 export interface AsukaPromise {
@@ -169,11 +208,21 @@ interface AsukaProactiveDedupLockState {
   acquiredAt: number;
 }
 
+interface AsukaProactiveDedupRecentTextState {
+  normalizedText: string;
+  deliveredAt: number;
+}
+
 interface AsukaProactiveDedupState {
   lastText?: string;
   lastNormalizedText?: string;
   lastDeliveredAt?: number;
+  recentTexts?: AsukaProactiveDedupRecentTextState[];
   lock?: AsukaProactiveDedupLockState;
+}
+
+interface AsukaProactiveBeatLedgerState {
+  recentBeats?: AsukaProactiveBeatLedgerEntry[];
 }
 
 interface AsukaPeerState {
@@ -198,6 +247,7 @@ interface AsukaPeerState {
     currentAttention?: "self_thread" | "pull_close" | "miss_you" | "repair";
     jobIds: string[];
     proactiveDedup?: AsukaProactiveDedupState;
+    proactiveBeatLedger?: AsukaProactiveBeatLedgerState;
   };
 }
 
@@ -254,6 +304,8 @@ const PROMISE_FOLLOW_UP_LIMIT = 3;
 const AMBIENT_STYLE_VERSION = 2;
 const PROACTIVE_DEDUP_WINDOW_MS = 5 * 60 * 1000;
 const PROACTIVE_LOCK_TIMEOUT_MS = 45 * 1000;
+const PROACTIVE_DEDUP_RECENT_TEXT_LIMIT = 20;
+const PROACTIVE_DEDUP_RECENT_TEXT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const PHYSICAL_SCENE_CONFIDENCE_THRESHOLD = 0.6;
 const SCENE_TRANSCRIPT_LIMIT = 8;
 const SCENE_MODEL_TIMEOUT_MS = 12000;
@@ -344,11 +396,18 @@ function loadState(): AsukaStateFile {
           currentAttention: "self_thread",
           jobIds: [],
           proactiveDedup: {},
+          proactiveBeatLedger: {},
         };
         migrated = true;
-      } else if (!peer.ambient.proactiveDedup) {
-        peer.ambient.proactiveDedup = {};
-        migrated = true;
+      } else {
+        if (!peer.ambient.proactiveDedup) {
+          peer.ambient.proactiveDedup = {};
+          migrated = true;
+        }
+        if (!peer.ambient.proactiveBeatLedger) {
+          peer.ambient.proactiveBeatLedger = {};
+          migrated = true;
+        }
       }
       peer.ambient.lastTopicPreview = summarizeText(peer.ambient.lastTopicPreview, 80);
       const shouldRefreshAmbient =
@@ -1292,6 +1351,52 @@ function extractTextFromCompletionPayload(raw: any): string {
   return "";
 }
 
+function summarizeModelTextForLog(raw: string, maxChars = 300): string {
+  return raw.replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+function describeSceneModelForLog(model: OpenAICompletionsModelConfig): string {
+  let host = "unknown-host";
+  try {
+    host = new URL(model.baseUrl).host;
+  } catch {
+    host = model.baseUrl.replace(/^https?:\/\//i, "").split("/")[0] || "unknown-host";
+  }
+  const apiKey = model.apiKey;
+  const keyHint = apiKey.length > 10 ? `${apiKey.slice(0, 4)}****${apiKey.slice(-4)}` : "configured";
+  return `model=${model.model} host=${host} key=${keyHint}`;
+}
+
+function getProactiveTimingPlanRejectReason(rawText: string): string {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return "empty_model_text";
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      delayMinutes?: unknown;
+      intent?: unknown;
+      sceneBeat?: unknown;
+      noveltyGoal?: unknown;
+    };
+    const rawDelay = Number(parsed.delayMinutes);
+    if (!Number.isFinite(rawDelay)) return "missing_or_invalid_delayMinutes";
+    const intent = sanitizeSceneFreeText(String(parsed.intent ?? ""), 220);
+    const sceneBeat = sanitizeSceneFreeText(String(parsed.sceneBeat ?? ""), 160);
+    const noveltyGoal = sanitizeSceneFreeText(String(parsed.noveltyGoal ?? ""), 180);
+    if (!intent && !sceneBeat && !noveltyGoal) return "missing_plan_semantics";
+    return "schema_rejected";
+  } catch {
+    return "invalid_json";
+  }
+}
+
+function isDeepSeekModelConfig(model: OpenAICompletionsModelConfig): boolean {
+  return /deepseek/i.test(`${model.baseUrl} ${model.model}`);
+}
+
+function orderProactiveTimingModels<T extends { config: OpenAICompletionsModelConfig }>(models: T[]): T[] {
+  return [...models].sort((a, b) => Number(isDeepSeekModelConfig(b.config)) - Number(isDeepSeekModelConfig(a.config)));
+}
+
 function parseSceneInferenceCandidate(rawText: string, source: AsukaSceneSource): SceneInferenceCandidate | null {
   const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
   if (!jsonText) return null;
@@ -1338,6 +1443,544 @@ function parseSceneInferenceCandidate(rawText: string, source: AsukaSceneSource)
   } catch {
     return null;
   }
+}
+
+function normalizeSceneContinuityStatus(value: unknown): AsukaSceneContinuityStatus {
+  if (value === "current" || value === "continue_with_shift" || value === "faded" || value === "reset" || value === "unknown") {
+    return value;
+  }
+  return "unknown";
+}
+
+function sanitizeSceneContinuityList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => sanitizeSceneFreeText(String(item ?? ""), 32))
+    .filter((item): item is string => Boolean(item))
+    .slice(0, 8);
+}
+
+function parseSceneContinuityVerdict(
+  rawText: string,
+  source: AsukaSceneContinuityVerdict["source"],
+): AsukaSceneContinuityVerdict | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      sceneStatus?: unknown;
+      transitionInstruction?: unknown;
+      staleElements?: unknown;
+      allowedContinuity?: unknown;
+      reason?: unknown;
+    };
+    return {
+      sceneStatus: normalizeSceneContinuityStatus(parsed.sceneStatus),
+      transitionInstruction: sanitizeSceneFreeText(String(parsed.transitionInstruction ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS) ?? "",
+      staleElements: sanitizeSceneContinuityList(parsed.staleElements),
+      allowedContinuity: sanitizeSceneFreeText(String(parsed.allowedContinuity ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS) ?? "",
+      reason: sanitizeSceneFreeText(String(parsed.reason ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS) ?? "",
+      source,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildUnavailableSceneContinuityVerdict(reason: string): AsukaSceneContinuityVerdict {
+  return {
+    sceneStatus: "unknown",
+    transitionInstruction: "",
+    staleElements: [],
+    allowedContinuity: "",
+    reason,
+    source: "unavailable",
+  };
+}
+
+function buildSceneContinuityJudgePrompt(params: {
+  context: AsukaPeerContext;
+  peer: AsukaPeerState;
+  scene?: AsukaSceneState;
+  now: number;
+  triggerIntent?: string;
+  transcript: string;
+}): string {
+  const scene = params.scene;
+  const disposition = deriveAmbientDisposition(params.peer, loadState(), params.now);
+  return [
+    "你是 Asuka 的主动消息场景连续性裁决器，只能输出一个 JSON 对象，不要解释。",
+    "你的任务不是写最终消息，而是判断上一场景现在是否还自然成立。",
+    "不要使用固定分钟阈值；请基于生活常识、当前本地时间、上一场景描述、最近普通对话和最近主动消息判断。",
+    "主动消息不要求每次硬性推进：如果旧场景仍自然成立，sceneStatus 输出 current；如果只是要保留情绪但动作该往后走，输出 continue_with_shift；如果旧具体动作已经自然结束，输出 faded；如果已经换了场景，输出 reset。",
+    "输出格式: {\"sceneStatus\":\"current|continue_with_shift|faded|reset|unknown\",\"transitionInstruction\":\"给最终回复模型的一句自然过场要求\",\"staleElements\":[\"不能再复用的旧动作或物件\"],\"allowedContinuity\":\"仍可保留的情绪、关系或话题线索\",\"reason\":\"一句话说明判断依据\"}",
+    `当前本地时间: ${formatZonedDateTimeForPrompt(params.now, ASUKA_PROMPT_TIME_ZONE)}`,
+    `当前触发意图: ${normalizeSceneContextText(params.triggerIntent) || "none"}`,
+    `关系阶段: ${params.peer.relationship.phase}, warmth=${params.peer.relationship.warmth}, intimacy=${params.peer.relationship.intimacy}`,
+    `主动倾向: ${describeAttention(params.peer.ambient.currentAttention ?? disposition.attention)}`,
+    scene
+      ? [
+        `上一结构化场景: label=${scene.label}, kind=${scene.kind}, lifePhase=${scene.lifePhase}, activity=${scene.activity}, place=${scene.place}, owner=${scene.owner}, timeContinuity=${scene.timeContinuity}`,
+        `上一场景摘要: ${normalizePromptPerspective(scene.summary)}`,
+        `距离上一场景开始: ${formatSceneAgeBucketForPrompt(scene.startedAt, params.now)}`,
+        scene.lastObservedAt ? `距离最后明确观察: ${formatSceneAgeBucketForPrompt(scene.lastObservedAt, params.now)}` : "",
+        scene.transitionHint ? `上一过渡建议: ${scene.transitionHint}` : "",
+      ].filter(Boolean).join("\n")
+      : "上一结构化场景: none",
+    params.peer.relationship.lastUserText ? `用户最近一句: ${normalizePromptPerspective(params.peer.relationship.lastUserText)}` : "",
+    params.peer.relationship.lastAssistantText ? `我最近一句: ${normalizePromptPerspective(params.peer.relationship.lastAssistantText)}` : "",
+    params.peer.ambient.lastTopicPreview ? `最近一条主动消息摘要: ${normalizePromptPerspective(params.peer.ambient.lastTopicPreview)}` : "",
+    params.transcript ? `最近普通对话:\n${params.transcript}` : "最近普通对话: none",
+  ].filter(Boolean).join("\n");
+}
+
+export function formatSceneContinuityVerdictForPrompt(verdict?: AsukaSceneContinuityVerdict | null): string {
+  if (!verdict) return "";
+  return [
+    "【主动场景连续性裁决】",
+    `- 裁决: ${verdict.sceneStatus}`,
+    verdict.transitionInstruction ? `- 过场要求: ${verdict.transitionInstruction}` : "",
+    verdict.allowedContinuity ? `- 可以保留: ${verdict.allowedContinuity}` : "",
+    verdict.staleElements.length > 0 ? `- 不要复用旧动作/物件: ${verdict.staleElements.join("、")}` : "",
+    verdict.reason ? `- 裁决理由: ${verdict.reason}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+export function getSceneContinuityTextViolation(
+  text: string,
+  verdict?: AsukaSceneContinuityVerdict | null,
+): string | null {
+  if (!text || !verdict) return null;
+  if (verdict.sceneStatus === "current") return null;
+  const normalizedText = normalizeSceneContextText(text);
+  for (const element of verdict.staleElements) {
+    const normalizedElement = normalizeSceneContextText(element);
+    if (!normalizedElement) continue;
+    if (normalizedText.includes(normalizedElement)) {
+      return `scene_continuity_stale_element:${element}`;
+    }
+  }
+  return null;
+}
+
+export async function judgeProactiveSceneContinuity(
+  context: AsukaPeerContext,
+  options: {
+    triggerIntent?: string;
+    at?: number;
+  } = {},
+): Promise<AsukaSceneContinuityVerdict> {
+  const mock = process.env.ASUKA_SCENE_CONTINUITY_TEST_VERDICT?.trim();
+  if (mock) {
+    return parseSceneContinuityVerdict(mock, "mock") ?? {
+      sceneStatus: "unknown",
+      transitionInstruction: "",
+      staleElements: [],
+      allowedContinuity: "",
+      reason: "invalid mock scene continuity verdict",
+      source: "invalid",
+    };
+  }
+
+  const now = options.at ?? Date.now();
+  const state = loadState();
+  const peer = state.peers[makePeerKey(context)];
+  if (!peer) return buildUnavailableSceneContinuityVerdict("missing peer state");
+
+  const resolved = resolveQQBotSceneInferenceConfig(context.accountId);
+  const models = [
+    { config: resolved.primary, source: "model" as const },
+    { config: resolved.fallback, source: "fallback_model" as const },
+  ].filter((item): item is { config: NonNullable<typeof resolved.primary>; source: "model" | "fallback_model" } => Boolean(item.config));
+  if (models.length === 0) return buildUnavailableSceneContinuityVerdict("scene continuity model unavailable");
+
+  const transcript = buildSceneInferenceTranscript(peer.peerId, options.triggerIntent);
+  const prompt = buildSceneContinuityJudgePrompt({
+    context,
+    peer,
+    scene: peer.scene,
+    now,
+    triggerIntent: options.triggerIntent,
+    transcript,
+  });
+
+  for (const model of models) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SCENE_MODEL_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${model.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${model.config.apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: model.config.model,
+          ...getOpenAICompletionsThinkingParams(model.config.model, "off"),
+          temperature: 0.1,
+          max_tokens: 180,
+          messages: [
+            {
+              role: "system",
+              content: "你只负责判断主动消息场景连续性，必须只输出 JSON 对象。",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+      const detail = await response.text();
+      if (!response.ok) continue;
+      const verdict = parseSceneContinuityVerdict(extractTextFromCompletionPayload(JSON.parse(detail)), model.source);
+      if (verdict) return verdict;
+    } catch {
+      // Try fallback model below.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return buildUnavailableSceneContinuityVerdict("scene continuity judge failed");
+}
+
+function normalizeProactiveDeliveryFreshnessStatus(value: unknown): AsukaProactiveDeliveryFreshnessStatus {
+  if (value === "duplicate" || value === "fresh" || value === "continuation" || value === "unknown") {
+    return value;
+  }
+  return "unknown";
+}
+
+function parseProactiveDeliveryFreshnessVerdict(
+  rawText: string,
+  source: AsukaProactiveDeliveryFreshnessVerdict["source"],
+): AsukaProactiveDeliveryFreshnessVerdict | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      status?: unknown;
+      reason?: unknown;
+      requiredShift?: unknown;
+    };
+    return {
+      status: normalizeProactiveDeliveryFreshnessStatus(parsed.status),
+      reason: sanitizeSceneFreeText(String(parsed.reason ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS) ?? "",
+      requiredShift: sanitizeSceneFreeText(String(parsed.requiredShift ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS) ?? "",
+      source,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseProactiveTimingPlan(
+  rawText: string,
+  source: AsukaProactiveTimingPlan["source"],
+): AsukaProactiveTimingPlan | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      delayMinutes?: unknown;
+      intent?: unknown;
+      reason?: unknown;
+      topicAnchor?: unknown;
+      sceneBeat?: unknown;
+      noveltyGoal?: unknown;
+      blockedAnchors?: unknown;
+    };
+    const rawDelay = Number(parsed.delayMinutes);
+    if (!Number.isFinite(rawDelay)) return null;
+    const delayMinutes = Math.max(1, Math.min(12 * 60, Math.round(rawDelay)));
+    const intent = sanitizeSceneFreeText(String(parsed.intent ?? ""), 220)
+      || "顺着最近对话和当前生活状态，自然决定要不要再轻轻主动说一句。";
+    const reason = sanitizeSceneFreeText(String(parsed.reason ?? ""), MAX_SCENE_TRANSITION_HINT_CHARS)
+      || "model planned next proactive timing from context";
+    const topicAnchor = sanitizeSceneFreeText(String(parsed.topicAnchor ?? ""), 120) || intent;
+    const sceneBeat = sanitizeSceneFreeText(String(parsed.sceneBeat ?? ""), 160) || intent;
+    const noveltyGoal = sanitizeSceneFreeText(String(parsed.noveltyGoal ?? ""), 180) || "让时间、动作或情绪比上一条主动消息自然往前走。";
+    const blockedAnchors = Array.isArray(parsed.blockedAnchors)
+      ? parsed.blockedAnchors
+        .map((item) => sanitizeSceneFreeText(String(item ?? ""), 60))
+        .filter((item): item is string => Boolean(item))
+        .slice(0, 8)
+      : [];
+    return { delayMinutes, intent, reason, topicAnchor, sceneBeat, noveltyGoal, blockedAnchors, source };
+  } catch {
+    return null;
+  }
+}
+
+function formatProactiveBeatLedgerForPrompt(peer: AsukaPeerState): string {
+  const beats = peer.ambient.proactiveBeatLedger?.recentBeats ?? [];
+  if (beats.length === 0) return "";
+  return beats
+    .slice(-5)
+    .map((beat, index) => [
+      `#${index + 1}`,
+      beat.topicAnchor ? `topic=${normalizePromptPerspective(beat.topicAnchor)}` : "",
+      beat.sceneBeat ? `beat=${normalizePromptPerspective(beat.sceneBeat)}` : "",
+      beat.noveltyGoal ? `novelty=${normalizePromptPerspective(beat.noveltyGoal)}` : "",
+      beat.blockedAnchors.length > 0 ? `blocked=${beat.blockedAnchors.map(normalizePromptPerspective).join("、")}` : "",
+      beat.suppressedReason ? `suppressed=${normalizePromptPerspective(beat.suppressedReason)}` : "",
+    ].filter(Boolean).join("；"))
+    .join("\n");
+}
+
+function buildProactiveTimingPlanPrompt(params: {
+  peer: AsukaPeerState;
+  now: number;
+  guardNoReplySince: number;
+  transcript: string;
+}): string {
+  const scene = params.peer.scene;
+  const beatLedger = formatProactiveBeatLedgerForPrompt(params.peer);
+  return [
+    "你是 Asuka 主动消息的发送时机裁决器。",
+    "硬性输出规则：只能输出一个 JSON object；不能解释；不能使用 markdown；不能使用 ``` 代码块；不能复述任务；不能输出 JSON 之外的任何文字。",
+    "任务：用户在 Asuka 最后一条消息之后已经 10 分钟没有回复。请根据当前本地时间、最近对话、Asuka 的场景状态和生活常识，决定下一条主动消息应该再等多久发送，并规划它的语义 beat。",
+    "不要生成要发送给用户的正文；这里只决定发送间隔、下一步语义、禁止复用的旧锚点。真正正文会在发送前根据最新上下文另行生成。",
+    "不要使用固定默认值。比如如果上下文显示 Asuka 正在做饭、洗澡、出门、学习、准备睡觉，请你自己判断这件事通常还需要多久才适合自然续一句。",
+    "如果旧场景还能延续，也必须选择下一动作、下一情绪或下一关系变化；不能回到上一条主动消息的同一个承诺、同一个梗、同一个动作。",
+    "delayMinutes 是从现在开始再等待的分钟数，必须是 1 到 720 之间的整数；缺少 delayMinutes 会被视为失败。",
+    "intent/topicAnchor/sceneBeat/noveltyGoal 都是内部意图，不要写成可直接发送给用户的完整消息。",
+    "最小合法 JSON 示例: {\"delayMinutes\":25,\"intent\":\"早餐后自然续一句\",\"topicAnchor\":\"早餐后的陪伴\",\"sceneBeat\":\"从吃饭转到收拾或起身\",\"noveltyGoal\":\"推进到早餐结束后的下一动作\",\"blockedAnchors\":[\"继续喂食\"],\"reason\":\"最近对话显示正在早餐场景\"}",
+    `当前本地时间: ${formatZonedDateTimeForPrompt(params.now, ASUKA_PROMPT_TIME_ZONE)}`,
+    `Asuka 最后一条消息时间: ${formatZonedDateTimeForPrompt(params.guardNoReplySince, ASUKA_PROMPT_TIME_ZONE)}`,
+    scene ? `当前场景: ${scene.summary}; lifePhase=${scene.lifePhase}; activity=${scene.activity}; place=${scene.place}; lastObserved=${formatRelativeTimeForPrompt(scene.lastObservedAt ?? scene.lastInferredAt, params.now)}` : "当前场景: none",
+    params.peer.relationship.lastAssistantText ? `Asuka 最后一条: ${normalizePromptPerspective(params.peer.relationship.lastAssistantText)}` : "",
+    params.peer.relationship.lastUserText ? `用户最后一条: ${normalizePromptPerspective(params.peer.relationship.lastUserText)}` : "",
+    params.peer.ambient.lastTopicPreview ? `上一条主动消息摘要: ${normalizePromptPerspective(params.peer.ambient.lastTopicPreview)}` : "",
+    beatLedger ? `最近主动 beat / 被抑制原因:\n${beatLedger}` : "",
+    params.transcript ? `最近对话:\n${params.transcript}` : "最近对话: none",
+  ].filter(Boolean).join("\n");
+}
+
+export async function planNextProactiveTiming(
+  context: AsukaPeerContext,
+  guardNoReplySince: number,
+  options: { at?: number } = {},
+): Promise<AsukaProactiveTimingPlan | null> {
+  const mock = process.env.ASUKA_PROACTIVE_TIMING_TEST_PLAN?.trim();
+  if (mock) {
+    return parseProactiveTimingPlan(mock, "mock");
+  }
+
+  const now = options.at ?? Date.now();
+  const state = loadState();
+  const peer = state.peers[makePeerKey(context)];
+  if (!peer) return null;
+  const resolved = resolveQQBotSceneInferenceConfig(context.accountId);
+  const models = orderProactiveTimingModels([
+    { config: resolved.primary, source: "model" as const },
+    { config: resolved.fallback, source: "fallback_model" as const },
+  ].filter((item): item is { config: NonNullable<typeof resolved.primary>; source: "model" | "fallback_model" } => Boolean(item.config)));
+  if (models.length === 0) {
+    console.warn(`[asuka-state] proactive timing planner unavailable: no model config account=${context.accountId}`);
+    return null;
+  }
+
+  const transcript = buildSceneInferenceTranscript(peer.peerId, peer.relationship.lastAssistantText);
+  const prompt = buildProactiveTimingPlanPrompt({ peer, now, guardNoReplySince, transcript });
+  for (const model of models) {
+    const modelDescription = describeSceneModelForLog(model.config);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SCENE_MODEL_TIMEOUT_MS);
+    try {
+      console.info(`[asuka-state] proactive timing planner request source=${model.source} ${modelDescription}`);
+      const response = await fetch(`${model.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${model.config.apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: model.config.model,
+          ...getOpenAICompletionsThinkingParams(model.config.model, "off"),
+          temperature: 0.1,
+          max_tokens: 160,
+          messages: [
+            {
+              role: "system",
+              content: "你只负责决定下一条主动消息的发送时机。必须只输出一个 JSON object，不要解释，不要 markdown，不要代码块，不要输出 JSON 之外的文字。",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+      const detail = await response.text();
+      if (!response.ok) {
+        console.warn(`[asuka-state] proactive timing planner http_failed source=${model.source} status=${response.status} ${modelDescription} body=${summarizeModelTextForLog(detail)}`);
+        continue;
+      }
+      let completionText = "";
+      try {
+        completionText = extractTextFromCompletionPayload(JSON.parse(detail));
+      } catch (error) {
+        console.warn(`[asuka-state] proactive timing planner response_parse_error source=${model.source} ${modelDescription} error=${error instanceof Error ? error.message : String(error)} body=${summarizeModelTextForLog(detail)}`);
+        continue;
+      }
+      const plan = parseProactiveTimingPlan(completionText, model.source);
+      if (plan) {
+        console.info(`[asuka-state] proactive timing planner success source=${model.source} delayMinutes=${plan.delayMinutes} ${modelDescription}`);
+        return plan;
+      }
+      console.warn(`[asuka-state] proactive timing planner plan_parse_failed source=${model.source} reason=${getProactiveTimingPlanRejectReason(completionText)} ${modelDescription} text=${summarizeModelTextForLog(completionText)}`);
+    } catch (error) {
+      const reason = error instanceof Error && error.name === "AbortError"
+        ? "timeout"
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      console.warn(`[asuka-state] proactive timing planner request_failed source=${model.source} reason=${reason} ${modelDescription}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return null;
+}
+
+function buildUnavailableProactiveDeliveryFreshnessVerdict(
+  reason: string,
+  status: AsukaProactiveDeliveryFreshnessStatus = "unknown",
+): AsukaProactiveDeliveryFreshnessVerdict {
+  return {
+    status,
+    reason,
+    requiredShift: "",
+    source: "unavailable",
+  };
+}
+
+function buildProactiveDeliveryFreshnessJudgePrompt(params: {
+  peer: AsukaPeerState;
+  now: number;
+  candidateText: string;
+  triggerIntent?: string;
+  sceneVerdict?: AsukaSceneContinuityVerdict | null;
+  transcript: string;
+}): string {
+  const verdictPrompt = formatSceneContinuityVerdictForPrompt(params.sceneVerdict);
+  return [
+    "你是 Asuka 主动消息的语义复读裁决器，只能输出一个 JSON 对象，不要解释。",
+    "你的任务不是改写消息，而是判断候选主动消息相对最近一条主动消息是否在无意识复读同一个动作/场面。",
+    "不要使用固定分钟阈值；请基于当前本地时间、最近对话、上一条主动消息、候选文本和场景连续性裁决判断。",
+    "status 规则：duplicate=基本复读上一条主动消息或回到已判定陈旧的动作；continuation=延续同一情绪/关系但显式体现时间、动作或情绪向后走；fresh=自然的新一句；unknown=证据不足。",
+    "输出格式: {\"status\":\"duplicate|fresh|continuation|unknown\",\"reason\":\"一句话说明依据\",\"requiredShift\":\"如果要重试，给最终回复模型的一句推进要求\"}",
+    `当前本地时间: ${formatZonedDateTimeForPrompt(params.now, ASUKA_PROMPT_TIME_ZONE)}`,
+    `当前触发意图: ${normalizeSceneContextText(params.triggerIntent) || "none"}`,
+    params.peer.ambient.lastTopicPreview ? `上一条主动消息摘要: ${normalizePromptPerspective(params.peer.ambient.lastTopicPreview)}` : "上一条主动消息摘要: none",
+    params.peer.relationship.lastAssistantText ? `我最近一句: ${normalizePromptPerspective(params.peer.relationship.lastAssistantText)}` : "",
+    params.peer.relationship.lastUserText ? `用户最近一句: ${normalizePromptPerspective(params.peer.relationship.lastUserText)}` : "",
+    verdictPrompt,
+    params.transcript ? `最近普通对话:\n${params.transcript}` : "最近普通对话: none",
+    `候选主动消息:\n${normalizePromptPerspective(params.candidateText)}`,
+  ].filter(Boolean).join("\n");
+}
+
+export async function judgeProactiveDeliveryFreshness(
+  context: AsukaPeerContext,
+  candidateText: string,
+  options: {
+    triggerIntent?: string;
+    at?: number;
+    sceneVerdict?: AsukaSceneContinuityVerdict | null;
+  } = {},
+): Promise<AsukaProactiveDeliveryFreshnessVerdict> {
+  const mock = process.env.ASUKA_PROACTIVE_DELIVERY_FRESHNESS_TEST_VERDICT?.trim();
+  if (mock) {
+    return parseProactiveDeliveryFreshnessVerdict(mock, "mock") ?? {
+      status: "unknown",
+      reason: "invalid mock proactive delivery freshness verdict",
+      requiredShift: "",
+      source: "invalid",
+    };
+  }
+
+  const normalizedCandidate = normalizeSceneContextText(candidateText);
+  if (!normalizedCandidate) {
+    return {
+      status: "duplicate",
+      reason: "empty candidate text",
+      requiredShift: "重新生成一条完整自然的主动消息。",
+      source: "invalid",
+    };
+  }
+
+  const now = options.at ?? Date.now();
+  const state = loadState();
+  const peer = state.peers[makePeerKey(context)];
+  if (!peer) return buildUnavailableProactiveDeliveryFreshnessVerdict("missing peer state", "fresh");
+  if (!peer.ambient.lastTopicPreview) {
+    return buildUnavailableProactiveDeliveryFreshnessVerdict("no previous proactive message", "fresh");
+  }
+
+  const resolved = resolveQQBotSceneInferenceConfig(context.accountId);
+  const models = [
+    { config: resolved.primary, source: "model" as const },
+    { config: resolved.fallback, source: "fallback_model" as const },
+  ].filter((item): item is { config: NonNullable<typeof resolved.primary>; source: "model" | "fallback_model" } => Boolean(item.config));
+  if (models.length === 0) {
+    return buildUnavailableProactiveDeliveryFreshnessVerdict("proactive freshness model unavailable");
+  }
+
+  const transcript = buildSceneInferenceTranscript(peer.peerId, options.triggerIntent);
+  const prompt = buildProactiveDeliveryFreshnessJudgePrompt({
+    peer,
+    now,
+    candidateText,
+    triggerIntent: options.triggerIntent,
+    sceneVerdict: options.sceneVerdict,
+    transcript,
+  });
+
+  for (const model of models) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SCENE_MODEL_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${model.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${model.config.apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: model.config.model,
+          ...getOpenAICompletionsThinkingParams(model.config.model, "off"),
+          temperature: 0.1,
+          max_tokens: 160,
+          messages: [
+            {
+              role: "system",
+              content: "你只负责判断主动消息是否语义复读，必须只输出 JSON 对象。",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+      const detail = await response.text();
+      if (!response.ok) continue;
+      const verdict = parseProactiveDeliveryFreshnessVerdict(extractTextFromCompletionPayload(JSON.parse(detail)), model.source);
+      if (verdict) return verdict;
+    } catch {
+      // Try fallback model below.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return buildUnavailableProactiveDeliveryFreshnessVerdict("proactive freshness judge failed");
 }
 
 async function inferSceneCandidateWithModel(
@@ -1726,6 +2369,19 @@ function refreshProactiveDedupLedger(peer: AsukaPeerState, content: string, at: 
   dedup.lastText = normalizedText || undefined;
   dedup.lastNormalizedText = normalizedText || undefined;
   dedup.lastDeliveredAt = at;
+  if (normalizedText) {
+    const recentTexts = (dedup.recentTexts ?? [])
+      .filter((item) =>
+        item.normalizedText
+        && item.normalizedText !== normalizedText
+        && typeof item.deliveredAt === "number"
+        && at - item.deliveredAt < PROACTIVE_DEDUP_RECENT_TEXT_RETENTION_MS
+      );
+    dedup.recentTexts = [
+      { normalizedText, deliveredAt: at },
+      ...recentTexts,
+    ].slice(0, PROACTIVE_DEDUP_RECENT_TEXT_LIMIT);
+  }
   delete dedup.lock;
 }
 
@@ -2107,7 +2763,11 @@ export function cancelPromisesFromUserMessage(
   };
 }
 
-export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now()): string {
+export function buildAsukaStatePrompt(
+  context: AsukaPeerContext,
+  now = Date.now(),
+  sceneContinuityVerdict?: AsukaSceneContinuityVerdict | null,
+): string {
   const state = loadState();
   const peer = state.peers[makePeerKey(context)];
   if (!peer) return "";
@@ -2167,6 +2827,11 @@ export function buildAsukaStatePrompt(context: AsukaPeerContext, now = Date.now(
     `- 亲密度: ${peer.relationship.intimacy}/100`,
     `- 关系温度: ${peer.relationship.warmth}/100（${peer.relationship.label}）`,
   ];
+
+  const continuityPrompt = formatSceneContinuityVerdictForPrompt(sceneContinuityVerdict);
+  if (continuityPrompt) {
+    sections.push(continuityPrompt);
+  }
 
   if (peer.relationship.lastUserText) {
     sections.push(`- 你刚才在说: ${normalizePromptPerspective(peer.relationship.lastUserText)}`);
@@ -2361,6 +3026,7 @@ export function shouldScheduleAmbientForPeer(context: AsukaPeerContext, now = Da
   if (hasRecentPendingJob) return false;
   if (repairCandidates.length > 0) return true;
   if (!peer.relationship.lastAssistantMessageAt) return false;
+  if (peer.relationship.lastAssistantMessageAt > lastScheduledAt) return true;
   return now - lastScheduledAt >= disposition.firstDelayHours * 60 * 60 * 1000;
 }
 
@@ -2488,6 +3154,88 @@ export function markAmbientScheduled(
   saveState();
 }
 
+export function clearAmbientScheduledJobs(context: AsukaPeerContext): void {
+  const peer = getOrCreatePeer(context);
+  peer.ambient.jobIds = [];
+  saveState();
+}
+
+function normalizeBlockedAnchors(input: string[]): string[] {
+  const seen = new Set<string>();
+  const anchors: string[] = [];
+  for (const item of input) {
+    const cleaned = sanitizeSceneFreeText(item, 60);
+    if (!cleaned || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    anchors.push(cleaned);
+    if (anchors.length >= 10) break;
+  }
+  return anchors;
+}
+
+function getProactiveBeatLedger(peer: AsukaPeerState): AsukaProactiveBeatLedgerState {
+  if (!peer.ambient.proactiveBeatLedger) {
+    peer.ambient.proactiveBeatLedger = {};
+  }
+  return peer.ambient.proactiveBeatLedger;
+}
+
+export function recordProactiveBeatPlanned(
+  context: AsukaPeerContext,
+  plan: AsukaProactiveTimingPlan,
+  options?: { plannedAt?: number; deliveryDueAt?: number },
+): void {
+  const peer = getOrCreatePeer(context);
+  const ledger = getProactiveBeatLedger(peer);
+  const plannedAt = options?.plannedAt ?? Date.now();
+  const entry: AsukaProactiveBeatLedgerEntry = {
+    topicAnchor: plan.topicAnchor,
+    sceneBeat: plan.sceneBeat,
+    noveltyGoal: plan.noveltyGoal,
+    blockedAnchors: normalizeBlockedAnchors(plan.blockedAnchors),
+    plannedAt,
+    deliveryDueAt: options?.deliveryDueAt,
+  };
+  ledger.recentBeats = [entry, ...(ledger.recentBeats ?? [])].slice(0, 12);
+  saveState();
+}
+
+export function recordProactiveBeatSuppressed(
+  peerKey: string,
+  options: {
+    reason: string;
+    requiredShift?: string;
+    payloadContent?: string;
+    at?: number;
+  },
+): void {
+  const state = loadState();
+  const peer = state.peers[peerKey];
+  if (!peer) return;
+  const ledger = getProactiveBeatLedger(peer);
+  const existing = ledger.recentBeats?.[0];
+  const reason = sanitizeSceneFreeText(options.reason, MAX_SCENE_TRANSITION_HINT_CHARS) || "semantic duplicate suppressed";
+  const requiredShift = sanitizeSceneFreeText(options.requiredShift, MAX_SCENE_TRANSITION_HINT_CHARS);
+  const payloadContent = sanitizeSceneFreeText(options.payloadContent, 180);
+  const blockedAnchors = normalizeBlockedAnchors([
+    ...(existing?.blockedAnchors ?? []),
+    payloadContent ?? "",
+    reason,
+  ]);
+  const updated: AsukaProactiveBeatLedgerEntry = {
+    topicAnchor: existing?.topicAnchor ?? payloadContent ?? "主动消息语义重复",
+    sceneBeat: requiredShift ?? existing?.sceneBeat ?? payloadContent ?? "推进到新的动作或情绪",
+    noveltyGoal: requiredShift ?? existing?.noveltyGoal ?? "避开上一条主动消息的重复语义，选择下一动作或下一情绪。",
+    blockedAnchors,
+    suppressedReason: reason,
+    plannedAt: existing?.plannedAt ?? options.at ?? Date.now(),
+    deliveryDueAt: existing?.deliveryDueAt,
+  };
+  ledger.recentBeats = [updated, ...(ledger.recentBeats ?? []).slice(existing ? 1 : 0)].slice(0, 12);
+  peer.ambient.jobIds = [];
+  saveState();
+}
+
 export function markAmbientDelivered(peerKey: string, options: {
   content: string;
   threadId?: string;
@@ -2587,8 +3335,22 @@ export function tryAcquireProactiveDedupLock(
   const dedup = getOrCreateProactiveDedupState(peer);
   const lastNormalizedText = dedup.lastNormalizedText;
   const lastDeliveredAt = dedup.lastDeliveredAt;
+  const recentDuplicate = (dedup.recentTexts ?? []).find((item) =>
+    item.normalizedText === normalizedText
+    && typeof item.deliveredAt === "number"
+    && now - item.deliveredAt < duplicateWindowMs
+  );
   if (dedup.lock && now - dedup.lock.acquiredAt >= lockTimeoutMs) {
     delete dedup.lock;
+  }
+  if (recentDuplicate) {
+    return {
+      acquired: false,
+      normalizedText,
+      reason: "duplicate",
+      lastNormalizedText: recentDuplicate.normalizedText,
+      lastDeliveredAt: recentDuplicate.deliveredAt,
+    };
   }
   if (
     lastNormalizedText &&
@@ -2684,6 +3446,18 @@ export function markPromiseDelivered(promiseId: string, options?: { at?: number;
       peer.relationship.lastRepairAt = at;
     }
   }
+  saveState();
+}
+
+export function markPromiseDuplicateSuppressed(promiseId: string, at = Date.now()): void {
+  const state = loadState();
+  const promise = state.promises[promiseId];
+  if (!promise) return;
+  if (getPromiseState(promise) === "cancelled" || getPromiseState(promise) === "replied") return;
+  setPromiseState(promise, "delivered");
+  promise.deliveredAt = at;
+  promise.updatedAt = at;
+  promise.lastError = undefined;
   saveState();
 }
 

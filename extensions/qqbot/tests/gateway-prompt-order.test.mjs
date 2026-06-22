@@ -5,7 +5,17 @@ import path from "node:path";
 const source = fs.readFileSync(path.join(process.cwd(), "src", "gateway.ts"), "utf-8");
 const outboundSource = fs.readFileSync(path.join(process.cwd(), "src", "outbound.ts"), "utf-8");
 const configSource = fs.readFileSync(path.join(process.cwd(), "src", "config.ts"), "utf-8");
+const asukaStateSource = fs.readFileSync(path.join(process.cwd(), "src", "asuka-state.ts"), "utf-8");
 const imageGenerationSource = fs.readFileSync(path.join(process.cwd(), "src", "utils", "openclaw-image-generation.ts"), "utf-8");
+const apiSource = fs.readFileSync(path.join(process.cwd(), "src", "api.ts"), "utf-8");
+
+function requiredSlice(text, label, startNeedle, endNeedle) {
+  const start = text.indexOf(startNeedle);
+  assert.ok(start >= 0, `${label} should contain ${startNeedle}`);
+  const end = text.indexOf(endNeedle, start);
+  assert.ok(end > start, `${label} should contain ${endNeedle} after ${startNeedle}`);
+  return text.slice(start, end);
+}
 
 const stableIndex = source.indexOf("const stablePromptSections");
 const dynamicIndex = source.indexOf("const dynamicContextSections");
@@ -48,18 +58,68 @@ assert.match(
 );
 assert.match(
   imageGenerationSource,
-  /runtimeMessage !== OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE[\s\S]{0,180}OpenClaw official image generation failed: runtime=\$\{runtimeMessage\}/,
-  "OpenClaw image generation should fall back externally after one official runtime failure"
+  /runtimeMessage !== OPENCLAW_IMAGE_RUNTIME_UNAVAILABLE_MESSAGE[\s\S]{0,260}OpenClaw official image generation failed: class=\$\{classification\}; runtime=\$\{runtimeMessage\}/,
+  "OpenClaw image generation should fall back externally after one classified official runtime failure"
+);
+assert.match(
+  imageGenerationSource,
+  /runtime-child\.mjs[\s\S]{0,2400}spawn\(process\.execPath,/,
+  "OpenClaw official image runtime should run in an isolated child process"
+);
+assert.match(
+  imageGenerationSource,
+  /setTimeout\([\s\S]{0,220}child\.kill\(\)[\s\S]{0,220}timed out after \$\{timeoutMs\}ms and was killed/,
+  "OpenClaw official image runtime timeout should kill the child process"
+);
+assert.match(
+  imageGenerationSource,
+  /request start provider=\$\{diagnostic\.provider\}[\s\S]{0,260}proxyMode=\$\{diagnostic\.proxyMode\}[\s\S]{0,120}envProxy=\$\{diagnostic\.proxy\}/,
+  "OpenClaw official image runtime should log proxy and request diagnostics"
+);
+assert.match(
+  apiSource,
+  /return url\.protocol === "http:" \|\| url\.protocol === "https:";/,
+  "QQ image uploads should localize every remote HTTP(S) image URL before /files upload"
+);
+assert.match(
+  apiSource,
+  /throw new Error\(`remote image localization failed for \$\{host\}: \$\{message\}`\);/,
+  "QQ image uploads should fail clearly instead of falling back to brittle remote URL uploads"
+);
+assert.match(
+  asukaStateSource,
+  /function orderProactiveTimingModels[\s\S]{0,260}isDeepSeekModelConfig/,
+  "proactive timing planner should explicitly order DeepSeek-capable models first"
+);
+assert.match(
+  asukaStateSource,
+  /const models = orderProactiveTimingModels\(/,
+  "proactive timing planner should apply DeepSeek-first ordering without changing shared scene resolver behavior"
+);
+assert.match(
+  asukaStateSource,
+  /只能输出一个 JSON object[\s\S]{0,160}不能解释[\s\S]{0,160}不能使用 markdown[\s\S]{0,160}不能输出 JSON 之外的任何文字/,
+  "proactive timing planner prompt should strictly require JSON-only output"
+);
+assert.match(
+  asukaStateSource,
+  /proactive timing planner plan_parse_failed[\s\S]{0,180}getProactiveTimingPlanRejectReason/,
+  "proactive timing planner should log parse failure reasons"
+);
+assert.doesNotMatch(
+  asukaStateSource,
+  /proactive timing planner[\s\S]{0,240}apiKey/,
+  "proactive timing planner logs should not include raw apiKey fields"
 );
 for (const [label, text] of [["gateway", source], ["outbound", outboundSource]]) {
   assert.match(
     text,
-    /buildStudioMediaApiUrl\(config\.baseUrl,\s*"images\/generations"\)/,
-    `${label} Studio Media fallback should use xmapi's documented image generation endpoint`
+    /buildStudioMediaApiUrlCandidates\(config\.baseUrl,\s*"images\/generations"\)/,
+    `${label} Studio Media fallback should use xmapi's documented image generation endpoint candidates`
   );
   assert.match(
     text,
-    /"Content-Type":\s*"application\/json"[\s\S]{0,500}image_url:\s*buildImageDataUrlFromFile\(referenceImagePath\)/,
+    /const requestBody = JSON\.stringify\([\s\S]{0,700}image_url:\s*buildImageDataUrlFromFile\(referenceImagePath\)[\s\S]{0,900}"Content-Type":\s*"application\/json"/,
     `${label} Studio Media fallback should send the reference image as JSON image_url`
   );
   assert.doesNotMatch(
@@ -67,7 +127,61 @@ for (const [label, text] of [["gateway", source], ["outbound", outboundSource]])
     /function generateStudioMediaSelfieImageUrl[\s\S]{0,900}images\/edits/,
     `${label} Studio Media fallback should not call the multipart edit endpoint for gpt-image-2`
   );
+  assert.match(
+    text,
+    /STUDIO_MEDIA_IMAGE_CLIENT_ABORT_MS\s*=\s*180_000/,
+    `${label} Studio Media image generation should use a client abort guard constant`
+  );
+  assert.match(
+    text,
+    /function generateStudioMediaSelfieImageUrl[\s\S]{0,2400}AbortController/,
+    `${label} Studio Media image generation should use AbortController`
+  );
+  assert.match(
+    text,
+    /Studio Media image generation fetch failed:[\s\S]{0,240}clientAbortMs=\$\{STUDIO_MEDIA_IMAGE_CLIENT_ABORT_MS\}/,
+    `${label} Studio Media image generation should fail with a client-side abort guard with diagnosable errors`
+  );
+  const envProxyFunction = requiredSlice(text, label, "function getEnvProxyUrl", "function getProxySource");
+  assert.match(envProxyFunction, /HTTPS_PROXY[\s\S]{0,220}ALL_PROXY/, `${label} Studio Media image generation should honor env proxy variables`);
+  const loopbackPreflightFunctions = requiredSlice(text, label, "function getLoopbackProxyProbeTarget", "async function buildProxyDispatcherInit");
+  assert.match(
+    loopbackPreflightFunctions,
+    /LOCAL_STUDIO_PROXY_PREFLIGHT_TIMEOUT_MS[\s\S]{0,1200}Studio override proxy preflight failed/,
+    `${label} Studio Media image generation should fail fast when a loopback override proxy is down`
+  );
+  const dispatcherFunction = requiredSlice(text, label, "async function buildProxyDispatcherInit", "function describeFetchFailure");
+  assert.match(
+    dispatcherFunction,
+    /const proxyUrl = getEnvProxyUrl\(overrideProxyUrl\)[\s\S]{0,220}await assertLoopbackProxyReachable\(overrideProxyUrl\)[\s\S]{0,240}new undici\.ProxyAgent\(proxyUrl\)/,
+    `${label} Studio Media image generation should preflight loopback overrides before building a proxy dispatcher`
+  );
+  assert.match(
+    text,
+    /STUDIO_IMAGE_PROXY_URL[\s\S]{0,140}STUDIO_PROXY_URL/,
+    `${label} Studio Media image generation should allow a dedicated Studio proxy override`
+  );
 }
+assert.match(
+  source.slice(source.indexOf("const runDirectSelfieFlow = async"), source.indexOf("const sendDirectMediaPayload")),
+  /preferOfficialImageGeneration[\s\S]*officialImageConfigured[\s\S]*if \(preferOfficialImageGeneration\)[\s\S]*generateOfficialOpenClawImageDataUrl[\s\S]*falling back to Studio-compatible path/,
+  "direct selfie flow should prefer official OpenClaw image generation before Studio-compatible fallback"
+);
+assert.match(
+  source.slice(source.indexOf("export function resolveDirectSelfieRuntimeConfig"), source.indexOf("const SELFIE_IDENTITY_LOCK_PROMPT")),
+  /STUDIO_IMAGE_PROXY_URL[\s\S]{0,120}process\.env\.STUDIO_IMAGE_PROXY_URL[\s\S]{0,180}STUDIO_PROXY_URL[\s\S]{0,120}process\.env\.STUDIO_PROXY_URL/,
+  "direct selfie flow should fall back to process env Studio proxy overrides when OpenClaw passes a narrowed channel config"
+);
+assert.match(
+  source,
+  /Direct selfie image config:[\s\S]{0,260}preferOfficial=\$\{preferOfficialImageGeneration\}[\s\S]{0,180}proxySource=\$\{getProxySource\(proxyUrl\)\}[\s\S]{0,120}proxy=\$\{describeProxyForLog\(proxyUrl\)\}/,
+  "direct selfie flow should log the effective proxy source without exposing credentials"
+);
+assert.match(
+  outboundSource.slice(outboundSource.indexOf("async function runDirectSelfieFlowForCron"), outboundSource.indexOf("async function refreshProactiveSceneAfterDelivery")),
+  /preferOfficialImageGeneration[\s\S]*officialImageConfigured[\s\S]*if \(preferOfficialImageGeneration\)[\s\S]*generateOfficialOpenClawImageDataUrl[\s\S]*falling back to Studio-compatible path/,
+  "cron selfie flow should prefer official OpenClaw image generation before Studio-compatible fallback"
+);
 assert.ok(
   source.includes("优先用自然口语里的“我/你/我们”"),
   "chat persona should prefer first/second-person wording without hard rejection rules"
@@ -240,9 +354,11 @@ assert.ok(
   source.includes("禁止覆盖 voice 或使用 voiceModify"),
   "voice prompt should forbid model-driven voice/timbre switching"
 );
-assert.ok(
-  source.includes(String.raw`text.replace(/\\?\[\\?\[[a-z_][a-z0-9_]*(?::\s*[^\]\r\n]*)?\]\\?\]/gi, "")`),
-  "internal marker filtering should remove escaped and unescaped bracket markers"
+const internalMarkerFilterSnippet = requiredSlice(source, "gateway", "function filterInternalMarkers", "export function stripWrappingDialogueQuotes");
+assert.match(
+  internalMarkerFilterSnippet,
+  /MODEL_THINKING_BLOCK_RE[\s\S]{0,180}\\\\\?\\\[\\\\\?\\\[/,
+  "internal marker filtering should remove model thinking blocks and escaped/unescaped bracket markers"
 );
 assert.match(
   source,
@@ -372,6 +488,11 @@ assert.doesNotMatch(
   /sendVisibleReplyText\("我去拍一张，等我一下。"\)/,
   "trailing dash selfie trigger should not send a fixed waiting message"
 );
+assert.doesNotMatch(
+  source,
+  /好，我按你刚刚说的画面来。|好，我按刚刚的语境给你发一张。/,
+  "trailing dash selfie trigger should not contain fixed visible image-confirmation replies"
+);
 assert.ok(
   !/if \(shouldForceSelfieFromTrailingDash\(event\.content\)\)[\s\S]{0,1400}return;/.test(source),
   "trailing dash selfie trigger should not short-circuit before the agent/model turn"
@@ -393,13 +514,13 @@ assert.match(
 );
 assert.match(
   source,
-  /function resolveSelfieVisiblePayloadText\([\s\S]{0,900}const visibleText = cleanOutgoingTextSegment\(resolveVisiblePayloadText[\s\S]{0,900}const captionText = cleanOutgoingTextSegment\(caption \|\| ""\)[\s\S]{0,900}return "好，我按刚刚的语境给你发一张。"/,
-  "selfie payload handling should recover a safe visible reply when the model emits only a payload"
+  /function resolveSelfieVisiblePayloadText\([\s\S]{0,900}const visibleText = cleanOutgoingTextSegment\(resolveVisiblePayloadText[\s\S]{0,900}const captionText = cleanOutgoingTextSegment\(caption \|\| ""\)[\s\S]{0,900}return "";/,
+  "selfie payload handling should not fabricate a fixed visible reply when the model emits only a payload"
 );
 assert.match(
   source,
-  /const selfieVisibleText = resolveSelfieVisiblePayloadText\([\s\S]{0,420}parsedPayload\.caption[\s\S]{0,420}await sendVisibleReplyText\(selfieVisibleText\)[\s\S]{0,700}buildDirectSelfiePromptFromContext\([\s\S]{0,180}selfieVisibleText[\s\S]{0,420}runDirectSelfieFlow\(selfiePrompt,\s*\{\s*background:\s*true\s*\}\)/,
-  "selfie payload should send visible text first, then build the image prompt from that sent reply"
+  /const selfieVisibleText = resolveSelfieVisiblePayloadText\([\s\S]{0,420}parsedPayload\.caption[\s\S]{0,520}const sentSelfieVisibleText = await sendVisibleReplyTextAndReturn[\s\S]{0,520}const selfieFlowText = resolveSelfieFlowContextText\([\s\S]{0,260}sentSelfieVisibleText \|\| selfieVisibleText[\s\S]{0,260}parsedPayload\.caption[\s\S]{0,900}buildDirectSelfiePromptFromContext\([\s\S]{0,180}selfieFlowText[\s\S]{0,420}runDirectSelfieFlow\(selfiePrompt,\s*\{\s*background:\s*true\s*\}\)/,
+  "selfie payload should try visible text first, then continue image flow with fallback context when visible text is not sent"
 );
 const directSelfiePromptBuilderIndex = source.indexOf("function buildDirectSelfiePromptFromContext");
 assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct selfie prompt builder");
@@ -419,6 +540,18 @@ assert.match(
   /SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT[\s\S]{0,1200}夏季日系校园极简风[\s\S]{0,1200}泳装、内衣感或过度暴露造型/,
   "gateway should define a summer wardrobe strategy for image generation"
 );
+for (const [label, text] of [["gateway", source], ["outbound", outboundSource]]) {
+  assert.match(
+    text,
+    /小而紧致的鹅蛋脸[\s\S]{0,260}略圆的杏眼[\s\S]{0,260}轻薄空气刘海[\s\S]{0,260}不要中韩网红化/,
+    `${label} identity lock should preserve the configured reference face traits instead of drifting into a generic influencer face`
+  );
+  assert.match(
+    text,
+    /不要在生图提示里命名、暗示或声称任何真实公众人物/,
+    `${label} identity lock should avoid naming real public figures while using the reference image as the face anchor`
+  );
+}
 assert.match(
   directSelfiePromptBuilder,
   /loadAsukaVisualIdentityAnchor\(\)[\s\S]{0,160}SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT/,
@@ -441,6 +574,11 @@ assert.match(
   /Body[\s\S]{0,900}Her\|Your[\s\S]{0,900}figure\|curves\|bust\|skin/,
   "gateway visual identity loader should include body descriptors and prose appearance lines"
 );
+assert.match(
+  visualAnchorSnippet,
+  /Reference Face\|Face\|Facial Anchor[\s\S]{0,2400}collected\.slice\(0,\s*6\)/,
+  "gateway visual identity loader should include the explicit reference-face bullet from IDENTITY.md"
+);
 const outboundVisualAnchorIndex = outboundSource.indexOf("function loadAsukaVisualIdentityAnchor");
 assert.ok(outboundVisualAnchorIndex >= 0, "outbound should define a visual identity anchor loader");
 const outboundVisualAnchorSnippet = outboundSource.slice(outboundVisualAnchorIndex, outboundVisualAnchorIndex + 2800);
@@ -459,14 +597,19 @@ assert.match(
   "cron selfie visual identity loader should match direct message behavior"
 );
 assert.match(
+  outboundVisualAnchorSnippet,
+  /Reference Face\|Face\|Facial Anchor[\s\S]{0,2400}collected\.slice\(0,\s*6\)/,
+  "cron selfie visual identity loader should include the explicit reference-face bullet from IDENTITY.md"
+);
+assert.match(
   source,
   /const responseTimeout = forceSelfieFromTrailingDash \? 20 \* 60 \* 1000 : 5 \* 60 \* 1000/,
   "trailing dash image requests should wait up to 20 minutes and normal replies should avoid premature fallback"
 );
 assert.match(
   source,
-  /No response within timeout[\s\S]{0,900}forceSelfieFromTrailingDash[\s\S]{0,900}resolveSelfieVisiblePayloadText[\s\S]{0,900}buildDirectSelfiePromptFromContext[\s\S]{0,900}runDirectSelfieFlow/,
-  "trailing dash selfie requests should fall back to visible text plus selfie generation when the model turn times out"
+  /No response within timeout[\s\S]{0,900}forceSelfieFromTrailingDash[\s\S]{0,900}timed out before a natural visible reply; generating image from existing context[\s\S]{0,900}buildDirectSelfiePromptFromContext\([\s\S]{0,220}userContent,\s*""[\s\S]{0,900}runDirectSelfieFlow/,
+  "trailing dash selfie requests should generate from existing context when the model turn times out"
 );
 const mediaTagGuardIndex = source.indexOf("Ignored model media tags in forced trailing-dash image turn");
 const parsePromisesIndex = source.indexOf("deliver postprocess parse-promises start");
@@ -479,13 +622,12 @@ assert.ok(
 const mediaTagGuardSnippet = source.slice(mediaTagGuardIndex - 900, mediaTagGuardIndex + 500);
 assert.match(
   mediaTagGuardSnippet,
-  /forceSelfieFromTrailingDash[\s\S]{0,220}hasQQBotMediaTag\(replyText\)[\s\S]{0,520}stripMediaTagsForVisibleText[\s\S]{0,520}resolveTimeSafeVisibleReplyText\(selfieVisibleText,\s*\{\s*forceImage:\s*true\s*\}\)/,
-  "forced trailing-dash media tag guard should strip fake paths and keep deterministic image flow"
+  /hasQQBotMediaTag\(replyText\)[\s\S]{0,520}stripMediaTagsForVisibleText[\s\S]{0,520}resolveTimeSafeVisibleReplyText\(selfieVisibleText,\s*\{\s*forceImage:\s*true\s*\}\)[\s\S]{0,520}Ignored model media tags/,
+  "forced trailing-dash media tag guard should strip fake paths without applying a second safe-natural-text gate"
 );
-assert.match(
-  source,
-  /resolveTimeSafeVisibleReplyText[\s\S]{0,800}isTimeContradictoryDeliveryText[\s\S]{0,800}buildTimeAwareDeliveryFallback/,
-  "ordinary visible reply sends should pass through time-contradiction filtering at the final send boundary"
+assert.ok(
+  !/resolveTimeSafeVisibleReplyText[\s\S]{0,800}isTimeContradictoryDeliveryText[\s\S]{0,800}buildTimeAwareDeliveryFallback/.test(source),
+  "ordinary visible reply sends should not apply post-generation time-contradiction replacement after prompt-side constraints"
 );
 assert.match(
   source,
@@ -499,13 +641,24 @@ assert.match(
 );
 assert.match(
   source,
-  /resolveTimeSafeVisibleReplyText\(selfieVisibleText,\s*\{\s*forceImage:\s*true\s*\}\)/,
-  "forced image plain-text fallback should use image-oriented time-safe visible text"
+  /const sentSelfieVisibleText = await sendVisibleReplyTextAndReturn\([\s\S]{0,180}selfieVisibleText[\s\S]{0,180}\{\s*forceImage:\s*true\s*\}[\s\S]{0,420}const selfieFlowText = resolveSelfieFlowContextText\([\s\S]{0,260}sentSelfieVisibleText \|\| selfieVisibleText[\s\S]{0,720}buildDirectSelfiePromptFromContext\([\s\S]{0,180}selfieFlowText/,
+  "forced image prompt should prefer sent visible text and continue with fallback context if no visible text was sent"
+);
+const cronSelfiePromptSlice = requiredSlice(outboundSource, "outbound", "function buildCronSelfiePrompt", "async function runDirectSelfieFlowForCron");
+assert.match(
+  cronSelfiePromptSlice,
+  /buildAsukaStatePrompt\(peerContext,\s*deliveryContext\.nowMs[\s\S]{0,120}deliveryContext\.sceneVerdict\)/,
+  "cron selfie prompt should include proactive state with scene continuity verdict"
 );
 assert.match(
-  outboundSource,
-  /function buildCronSelfiePrompt\(\s*account: ResolvedQQBotAccount[\s\S]{0,1300}buildAsukaStatePrompt\(peerContext\)[\s\S]{0,1300}buildConversationDigestPrompt\(peerContext\)[\s\S]{0,1300}resolveRecentTranscriptFromNormalSession\(peerId\)/,
-  "cron selfie prompt should include proactive state, digest, and normal-session transcript context"
+  cronSelfiePromptSlice,
+  /buildConversationDigestPrompt\(peerContext\)/,
+  "cron selfie prompt should include conversation digest context"
+);
+assert.match(
+  cronSelfiePromptSlice,
+  /resolveRecentTranscriptFromNormalSession\(peerId\)/,
+  "cron selfie prompt should include normal-session transcript context"
 );
 assert.match(
   outboundSource,
