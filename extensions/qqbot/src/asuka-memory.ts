@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
+import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 
 type AsukaMemoryType =
@@ -21,6 +22,16 @@ type AsukaMemoryStatus = "active" | "superseded" | "forgotten";
 type AsukaMemoryImportance = "normal" | "important";
 type AsukaLifeEventKind = "study" | "media_work" | "outing" | "home" | "weather" | "daily";
 type AsukaContinuityKind = "preference" | "boundary" | "emotional_continuity";
+type AsukaSelfSignalCategory =
+  | "attachment_style"
+  | "care_style"
+  | "communication_style"
+  | "commitment_style"
+  | "temperament"
+  | "boundaries"
+  | "vulnerabilities"
+  | "aesthetic_taste";
+type AsukaSelfSignalAction = "add" | "update" | "replace" | "ignore";
 
 interface AsukaMemoryItem {
   id: string;
@@ -41,6 +52,7 @@ interface AsukaMemoryItem {
   freshnessUntil?: number;
   lifeEventKind?: AsukaLifeEventKind;
   continuityKind?: AsukaContinuityKind;
+  personalityCategory?: AsukaSelfSignalCategory;
   importance?: AsukaMemoryImportance;
   temporary?: boolean;
   importanceUpdatedAt?: number;
@@ -62,13 +74,14 @@ const MEMORY_FILE = path.join(MEMORY_DIR, "memory.json");
 const MAX_MEMORY_TEXT_LENGTH = 180;
 const MAX_MEMORY_COUNT_PER_PEER = 120;
 const MAX_ASUKA_SELF_THREAD_PER_PEER = 12;
-const MAX_ASUKA_SELF_SIGNAL_PER_PEER = 8;
+const MAX_ASUKA_SELF_SIGNAL_PER_PEER = 24;
+const MAX_ASUKA_SELF_SIGNAL_PER_CATEGORY = 3;
 const MAX_PROMPT_CHARS = 1100;
 const MAX_LIST_MEMORIES = 12;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVE_THREAD_TTL_MS = 21 * DAY_MS;
 const SELF_THREAD_TTL_MS = 10 * DAY_MS;
-const SELF_SIGNAL_TTL_MS = 60 * DAY_MS;
+const SELF_SIGNAL_TTL_MS = 180 * DAY_MS;
 const TEMPORARY_MEMORY_TTL_MS = 7 * DAY_MS;
 const ACTIVE_THREAD_COMPACT_AFTER_MS = 7 * DAY_MS;
 const RECENT_ACTIVE_PROMPT_MS = 3 * DAY_MS;
@@ -87,7 +100,19 @@ const BOUNDARY_RE = /(我不喜欢|我讨厌|不要|别再|别叫|不想|雷点|
 const RELATIONSHIP_RE = /(我们|上次|那次|之前|一起|约定|拉钩|纪念|吵架|和好|想你|喜欢你|爱你)/;
 const ACTIVE_THREAD_RE = /(最近|这几天|这周|今天|明天|回头|继续|下次|等会|一会|待会|正在|准备|计划)/;
 const ASUKA_SELF_THREAD_RE = /(我(最近|这几天|这周|今天|明天|现在|刚刚|等会|准备|正在).*(上课|自习|作业|课题|拍照|拍视频|剪视频|咖啡|宿舍|学校|校园|西湖|湖滨|运河|雨|散步|电影|音乐|练舞|整理|复习|画面|镜头|照片))/;
-const ASUKA_SELF_SIGNAL_RE = /我(其实|还是|一直|会|更|不太|有点|真的)?[^。！？!?]{0,80}(喜欢|更喜欢|不喜欢|习惯|在意|怕|介意|想靠近|想离你近|会想你|想陪着你|不想敷衍|想认真对你)/;
+const ASUKA_SELF_SIGNAL_RE = /我(其实|还是|一直|会|更|不太|有点|真的)?[^。！？!?]{0,80}(喜欢|更喜欢|愿意|更愿意|不喜欢|习惯|在意|怕|介意|想靠近|想离你近|会想你|想陪着你|不想敷衍|想认真对你)/;
+const ASUKA_SELF_SIGNAL_STABLE_RE = /(一直|总是|通常|习惯|更喜欢|不喜欢|不太喜欢|不想|不会|会认真|不想敷衍|认真对你|慢慢|稳定|每次|以后)/;
+const SELF_SIGNAL_MODEL_TIMEOUT_MS = 8000;
+const SELF_SIGNAL_CATEGORIES = new Set<AsukaSelfSignalCategory>([
+  "attachment_style",
+  "care_style",
+  "communication_style",
+  "commitment_style",
+  "temperament",
+  "boundaries",
+  "vulnerabilities",
+  "aesthetic_taste",
+]);
 const MEMORY_LIST_RE = /(你(都)?(还)?记得我(什么|哪些)|你(都)?记住了我(什么|哪些)|你(都)?记着我(什么|哪些)|看看(你)?(的)?记忆|查看(你)?(的)?记忆|列出(你)?(的)?记忆|记忆列表|记忆分类|记忆类别|重要(的)?记忆)/;
 const MEMORY_FORGET_RE = /(忘了|忘掉|忘记|别记|不要记|删掉|删除|清除|清空|抹掉)/;
 const MEMORY_MARK_IMPORTANT_RE = /(标为重要|设为重要|当成重要|标记为重要|这点很重要|这个很重要|特别重要|重点记|一定记住)/;
@@ -238,6 +263,29 @@ function deriveContinuityKind(text: string): AsukaContinuityKind {
   return "emotional_continuity";
 }
 
+function deriveSelfSignalCategory(text: string): AsukaSelfSignalCategory | null {
+  if (/(照片|自拍|图片|画面|镜头|构图|氛围|生活感|自然一点)/.test(text)) return "aesthetic_taste";
+  if (/(敷衍|认真|补上|答应|约定|承诺|说到做到)/.test(text)) return "commitment_style";
+  if (/(靠近|离你近|距离|黏|想你|依赖|慢慢来|拉近)/.test(text)) return "attachment_style";
+  if (/(陪着你|惦记|照顾|留意|担心你|哄你|撑着)/.test(text)) return "care_style";
+  if (/(语气|说话|表达|直白|温柔|克制|解释|机械|撒娇)/.test(text)) return "communication_style";
+  if (/(安静|慢热|敏感|心软|要强|别扭|热闹)/.test(text)) return "temperament";
+  if (/(不舒服|不接受|不想被|别把我|当工具|强迫|营业)/.test(text)) return "boundaries";
+  if (/(怕被忽略|怕打扰|怕你不理|怕显得|软肋|不安)/.test(text)) return "vulnerabilities";
+  return null;
+}
+
+interface AsukaSelfSignalVerdict {
+  action: AsukaSelfSignalAction;
+  continuityKind: AsukaContinuityKind;
+  personalityCategory: AsukaSelfSignalCategory;
+  canonicalText: string;
+  confidence: number;
+  targetMemoryIds: string[];
+  reason: string;
+  source: "model" | "fallback_model" | "mock" | "rule_fallback" | "invalid" | "unavailable";
+}
+
 function classifyAssistantMemory(text: string, at: number): {
   type: AsukaMemoryType;
   source: AsukaMemorySource;
@@ -247,6 +295,7 @@ function classifyAssistantMemory(text: string, at: number): {
   freshnessUntil?: number;
   lifeEventKind?: AsukaLifeEventKind;
   continuityKind?: AsukaContinuityKind;
+  personalityCategory?: AsukaSelfSignalCategory;
 } | null {
   if (ASUKA_SELF_THREAD_RE.test(text)) {
     return {
@@ -260,6 +309,7 @@ function classifyAssistantMemory(text: string, at: number): {
     };
   }
   if (ASUKA_SELF_SIGNAL_RE.test(text)) {
+    const personalityCategory = deriveSelfSignalCategory(text);
     return {
       type: "asuka_self_signal",
       source: "assistant_self_signal",
@@ -267,9 +317,115 @@ function classifyAssistantMemory(text: string, at: number): {
       confidence: 0.64,
       expiresAt: at + SELF_SIGNAL_TTL_MS,
       continuityKind: deriveContinuityKind(text),
+      personalityCategory: personalityCategory ?? "communication_style",
     };
   }
   return null;
+}
+
+function extractFirstJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length; i++) {
+    const char = raw[i]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth++;
+    if (char === "}") {
+      depth--;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function extractTextFromCompletionPayload(raw: any): string {
+  const choice = raw?.choices?.[0];
+  const messageContent = choice?.message?.content;
+  if (typeof messageContent === "string") return messageContent;
+  if (Array.isArray(messageContent)) {
+    return messageContent
+      .map((part) => typeof part?.text === "string" ? part.text : typeof part === "string" ? part : "")
+      .join("")
+      .trim();
+  }
+  if (typeof choice?.text === "string") return choice.text;
+  return "";
+}
+
+function sanitizeSelfSignalCanonicalText(text: string): string {
+  const sanitized = sanitizeMemoryText(text);
+  if (!sanitized || shouldSkipMemory(sanitized)) return "";
+  return sanitized;
+}
+
+function normalizeContinuityKind(value: unknown): AsukaContinuityKind | null {
+  if (value === "preference" || value === "boundary" || value === "emotional_continuity") return value;
+  return null;
+}
+
+function normalizeSelfSignalCategory(value: unknown): AsukaSelfSignalCategory | null {
+  return typeof value === "string" && SELF_SIGNAL_CATEGORIES.has(value as AsukaSelfSignalCategory)
+    ? value as AsukaSelfSignalCategory
+    : null;
+}
+
+function normalizeSelfSignalAction(value: unknown): AsukaSelfSignalAction | null {
+  if (value === "add" || value === "update" || value === "replace" || value === "ignore") return value;
+  return null;
+}
+
+function parseSelfSignalVerdict(rawText: string, source: AsukaSelfSignalVerdict["source"]): AsukaSelfSignalVerdict | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      action?: unknown;
+      continuityKind?: unknown;
+      personalityCategory?: unknown;
+      canonicalText?: unknown;
+      confidence?: unknown;
+      targetMemoryIds?: unknown;
+      reason?: unknown;
+    };
+    const action = normalizeSelfSignalAction(parsed.action);
+    const continuityKind = normalizeContinuityKind(parsed.continuityKind);
+    const personalityCategory = normalizeSelfSignalCategory(parsed.personalityCategory);
+    const canonicalText = sanitizeSelfSignalCanonicalText(String(parsed.canonicalText ?? ""));
+    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence)));
+    if (!action || !continuityKind || !personalityCategory || !Number.isFinite(confidence)) return null;
+    if (action !== "ignore" && !canonicalText) return null;
+    const targetMemoryIds = Array.isArray(parsed.targetMemoryIds)
+      ? parsed.targetMemoryIds.map((item) => String(item ?? "").trim()).filter(Boolean).slice(0, 5)
+      : [];
+    return {
+      action,
+      continuityKind,
+      personalityCategory,
+      canonicalText,
+      confidence,
+      targetMemoryIds,
+      reason: sanitizeMemoryText(String(parsed.reason ?? "")),
+      source,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeForDedup(text: string): string {
@@ -279,12 +435,10 @@ function normalizeForDedup(text: string): string {
     .slice(0, 80);
 }
 
-function deriveAsukaSelfSignalKey(text: string): string {
-  const kind = deriveContinuityKind(text);
-  if (/(照片|自拍|图片|画面|镜头)/.test(text)) return `asuka:${kind}:image`;
-  if (/(靠近|离你近|陪着你|想你|认真对你|敷衍)/.test(text)) return `asuka:${kind}:closeness`;
-  if (/(热闹|安静|催|急)/.test(text)) return `asuka:${kind}:pace`;
-  return `asuka:${kind}:general`;
+function deriveSelfSignalCategoryFromKey(key: string | undefined): AsukaSelfSignalCategory | null {
+  if (!key) return null;
+  const last = key.split(":").pop();
+  return normalizeSelfSignalCategory(last);
 }
 
 function getMemoryStatus(item: AsukaMemoryItem): AsukaMemoryStatus {
@@ -297,7 +451,7 @@ function isActiveMemory(item: AsukaMemoryItem, now: number): boolean {
 
 function deriveMemoryKey(type: AsukaMemoryType, text: string): string | undefined {
   if (type === "asuka_self_signal") {
-    return deriveAsukaSelfSignalKey(text);
+    return undefined;
   }
   if (type === "user_profile") {
     if (/(我叫|叫我|我的名字|别叫)/.test(text)) return "user:name";
@@ -354,6 +508,15 @@ function supersedeConflictingMemories(
       item.salience = Math.min(item.salience, 1);
     }
   }
+}
+
+function supersedeMemory(item: AsukaMemoryItem, newId: string, at: number): void {
+  item.status = "superseded";
+  item.supersededBy = newId;
+  item.supersededAt = at;
+  item.updatedAt = at;
+  item.confidence = Math.min(item.confidence, 0.25);
+  item.salience = Math.min(item.salience, 1);
 }
 
 function compactMemoryText(text: string): string {
@@ -416,6 +579,7 @@ function maintainPeerMemories(state: AsukaMemoryStateFile, peerKey: string, now:
   prunePeerMemories(state, peerKey, now);
   compactStaleActiveThreads(state, peerKey, now);
   pruneActiveMemoriesByType(state, peerKey, "asuka_self_thread", MAX_ASUKA_SELF_THREAD_PER_PEER);
+  pruneAsukaSelfSignalsByCategory(state, peerKey);
   pruneActiveMemoriesByType(state, peerKey, "asuka_self_signal", MAX_ASUKA_SELF_SIGNAL_PER_PEER);
   prunePeerMemories(state, peerKey, now);
 }
@@ -430,6 +594,7 @@ function upsertMemory(context: AsukaPeerContext, input: {
   freshnessUntil?: number;
   lifeEventKind?: AsukaLifeEventKind;
   continuityKind?: AsukaContinuityKind;
+  personalityCategory?: AsukaSelfSignalCategory;
   importance?: AsukaMemoryImportance;
   temporary?: boolean;
   at: number;
@@ -458,6 +623,7 @@ function upsertMemory(context: AsukaPeerContext, input: {
     existing.freshnessUntil = input.freshnessUntil ?? existing.freshnessUntil;
     existing.lifeEventKind = input.lifeEventKind ?? existing.lifeEventKind;
     existing.continuityKind = input.continuityKind ?? existing.continuityKind;
+    existing.personalityCategory = input.personalityCategory ?? existing.personalityCategory;
     if (input.importance) {
       existing.importance = input.importance;
       existing.importanceUpdatedAt = input.at;
@@ -495,6 +661,7 @@ function upsertMemory(context: AsukaPeerContext, input: {
     freshnessUntil: input.freshnessUntil,
     lifeEventKind: input.lifeEventKind,
     continuityKind: input.continuityKind,
+    personalityCategory: input.personalityCategory,
     importance: input.importance,
     temporary: input.temporary,
     importanceUpdatedAt: input.importance ? input.at : undefined,
@@ -502,7 +669,9 @@ function upsertMemory(context: AsukaPeerContext, input: {
     key,
     status: "active",
   };
-  supersedeConflictingMemories(state, peerKey, key, id, text, input.at);
+  if (input.type !== "asuka_self_signal") {
+    supersedeConflictingMemories(state, peerKey, key, id, text, input.at);
+  }
   maintainPeerMemories(state, peerKey, input.at);
   saveState();
   return true;
@@ -544,6 +713,30 @@ function pruneActiveMemoriesByType(
   }
 }
 
+function pruneAsukaSelfSignalsByCategory(state: AsukaMemoryStateFile, peerKey: string): void {
+  const grouped = new Map<AsukaSelfSignalCategory, AsukaMemoryItem[]>();
+  for (const item of Object.values(state.memories)) {
+    if (item.peerKey !== peerKey || item.type !== "asuka_self_signal" || getMemoryStatus(item) !== "active") continue;
+    const category = item.personalityCategory ?? deriveSelfSignalCategory(item.text) ?? deriveSelfSignalCategoryFromKey(item.key);
+    if (!category) continue;
+    item.personalityCategory = category;
+    item.key = item.key ?? `asuka:${category}:${item.id}`;
+    const items = grouped.get(category) ?? [];
+    items.push(item);
+    grouped.set(category, items);
+  }
+  for (const items of grouped.values()) {
+    const sorted = items.sort((a, b) => {
+      const aScore = a.salience * 1000000000000 + a.confidence * 1000000000 + a.updatedAt;
+      const bScore = b.salience * 1000000000000 + b.confidence * 1000000000 + b.updatedAt;
+      return bScore - aScore;
+    });
+    for (const item of sorted.slice(MAX_ASUKA_SELF_SIGNAL_PER_CATEGORY)) {
+      delete state.memories[item.id];
+    }
+  }
+}
+
 export function recordAsukaLongTermMemoryFromUserMessage(
   context: AsukaPeerContext,
   userText: string,
@@ -563,20 +756,114 @@ export function recordAsukaLongTermMemoryFromUserMessage(
   });
 }
 
-export function recordAsukaLongTermMemoryFromAssistantReply(
+function getActiveSelfSignalsForPeer(state: AsukaMemoryStateFile, peerKey: string, now: number): AsukaMemoryItem[] {
+  return getActivePeerMemories(state, peerKey, now)
+    .filter((item) => item.type === "asuka_self_signal")
+    .sort((a, b) => scoreMemory(b, new Set(), now) - scoreMemory(a, new Set(), now));
+}
+
+function applySelfSignalVerdict(
+  context: AsukaPeerContext,
+  text: string,
+  classified: NonNullable<ReturnType<typeof classifyAssistantMemory>>,
+  verdict: AsukaSelfSignalVerdict,
+  at: number,
+): boolean {
+  if (verdict.action === "ignore") return false;
+  const canonicalText = sanitizeSelfSignalCanonicalText(verdict.canonicalText || text);
+  if (!canonicalText) return false;
+
+  const state = loadState();
+  const peerKey = makePeerKey(context);
+  const activeSelfSignals = getActiveSelfSignalsForPeer(state, peerKey, at);
+  const targets = activeSelfSignals.filter((item) => verdict.targetMemoryIds.includes(item.id));
+
+  if ((verdict.action === "update" || verdict.action === "replace") && targets.length === 0) {
+    return false;
+  }
+
+  if (verdict.action === "update" && targets.length > 0) {
+    const target = targets[0]!;
+    target.text = canonicalText;
+    target.updatedAt = at;
+    target.salience = Math.max(target.salience, 8);
+    target.confidence = Math.max(target.confidence, verdict.confidence, classified.confidence);
+    target.expiresAt = at + SELF_SIGNAL_TTL_MS;
+    target.continuityKind = verdict.continuityKind;
+    target.personalityCategory = verdict.personalityCategory;
+    target.key = target.key ?? `asuka:${verdict.personalityCategory}:${target.id}`;
+    target.status = "active";
+    maintainPeerMemories(state, peerKey, at);
+    saveState();
+    return true;
+  }
+
+  const id = randomUUID();
+  state.memories[id] = {
+    id,
+    accountId: context.accountId,
+    peerKey,
+    peerKind: context.peerKind,
+    peerId: context.peerId,
+    type: "asuka_self_signal",
+    text: canonicalText,
+    source: "assistant_self_signal",
+    sourceMessageId: context.messageId,
+    createdAt: at,
+    updatedAt: at,
+    salience: Math.max(classified.salience, 8),
+    confidence: Math.max(classified.confidence, verdict.confidence),
+    expiresAt: at + SELF_SIGNAL_TTL_MS,
+    continuityKind: verdict.continuityKind,
+    personalityCategory: verdict.personalityCategory,
+    privacy: "direct_only",
+    key: `asuka:${verdict.personalityCategory}:${id}`,
+    status: "active",
+  };
+
+  if (verdict.action === "replace") {
+    for (const target of targets) {
+      supersedeMemory(target, id, at);
+    }
+  }
+
+  maintainPeerMemories(state, peerKey, at);
+  saveState();
+  return true;
+}
+
+export async function recordAsukaLongTermMemoryFromAssistantReply(
   context: AsukaPeerContext,
   assistantText: string,
   at = Date.now(),
-): boolean {
+): Promise<boolean> {
   const text = sanitizeMemoryText(assistantText);
   if (shouldSkipMemory(text)) return false;
-  const classified = classifyAssistantMemory(text, at);
-  if (!classified) return false;
-  return upsertMemory(context, {
-    ...classified,
-    text,
-    at,
-  });
+  if (context.peerKind !== "direct") return false;
+  const selfThreadClassified = classifyAssistantMemory(text, at);
+  if (selfThreadClassified?.type === "asuka_self_thread") {
+    return upsertMemory(context, {
+      ...selfThreadClassified,
+      text,
+      at,
+    });
+  }
+  const state = loadState();
+  const peerKey = makePeerKey(context);
+  maintainPeerMemories(state, peerKey, at);
+  const existing = getActiveSelfSignalsForPeer(state, peerKey, at);
+  const verdict = await requestSelfSignalVerdict(context, text, existing);
+  if (!verdict) return false;
+  const classified = classifyAssistantMemory(text, at) ?? {
+    type: "asuka_self_signal" as const,
+    source: "assistant_self_signal" as const,
+    salience: 7,
+    confidence: 0.64,
+    expiresAt: at + SELF_SIGNAL_TTL_MS,
+    continuityKind: verdict.continuityKind,
+    personalityCategory: verdict.personalityCategory,
+  };
+  return applySelfSignalVerdict(context, text, classified, verdict, at);
 }
 
 function tokenize(text: string): string[] {
@@ -596,6 +883,116 @@ function tokenize(text: string): string[] {
 function countTokenOverlap(text: string, queryTokens: Set<string>): number {
   if (queryTokens.size === 0) return 0;
   return tokenize(text).reduce((count, token) => count + (queryTokens.has(token) ? 1 : 0), 0);
+}
+
+function formatSelfSignalCandidatesForJudge(items: AsukaMemoryItem[]): string {
+  if (items.length === 0) return "none";
+  return items
+    .slice(0, 12)
+    .map((item) => `- id=${item.id} category=${item.personalityCategory ?? deriveSelfSignalCategory(item.text) ?? "unknown"} kind=${item.continuityKind ?? deriveContinuityKind(item.text)} text=${normalizePromptPerspective(item.text)}`)
+    .join("\n");
+}
+
+function buildSelfSignalJudgePrompt(text: string, existing: AsukaMemoryItem[]): string {
+  return [
+    "你是 Asuka 长期人格记忆裁决器，只能输出一个 JSON 对象，不要解释。",
+    "任务: 判断这句 Asuka 自己说过的话是否体现稳定人格、相处气质、边界或长期偏好。",
+    "不要记录一次性情绪、当前场景台词、承诺具体事项、工具/接口/payload、用户画像或临时玩笑。",
+    "固定 personalityCategory 只能选: attachment_style, care_style, communication_style, commitment_style, temperament, boundaries, vulnerabilities, aesthetic_taste。",
+    "continuityKind 只能选: preference, boundary, emotional_continuity。",
+    "action 语义: add=同类新侧面; update=和某条旧记忆同一侧面，改写旧记忆; replace=和旧记忆冲突，覆盖旧记忆; ignore=不值得沉淀。",
+    "如果 action 是 update 或 replace，targetMemoryIds 必须包含要处理的旧记忆 id。",
+    "canonicalText 要写成第一人称自然人格记忆句，避免标签化，不超过 80 字。",
+    "输出格式: {\"action\":\"add|update|replace|ignore\",\"continuityKind\":\"preference|boundary|emotional_continuity\",\"personalityCategory\":\"...\",\"canonicalText\":\"...\",\"confidence\":0.0,\"targetMemoryIds\":[\"...\"],\"reason\":\"...\"}",
+    `候选文本: ${normalizePromptPerspective(text)}`,
+    `已有 Asuka 人格记忆:\n${formatSelfSignalCandidatesForJudge(existing)}`,
+  ].join("\n");
+}
+
+function buildRuleFallbackSelfSignalVerdict(text: string): AsukaSelfSignalVerdict | null {
+  if (!ASUKA_SELF_SIGNAL_RE.test(text) || !ASUKA_SELF_SIGNAL_STABLE_RE.test(text)) return null;
+  const category = deriveSelfSignalCategory(text);
+  if (!category) return null;
+  const continuityKind = deriveContinuityKind(text);
+  return {
+    action: "add",
+    continuityKind,
+    personalityCategory: category,
+    canonicalText: text,
+    confidence: 0.62,
+    targetMemoryIds: [],
+    reason: "strict rule fallback accepted stable self signal",
+    source: "rule_fallback",
+  };
+}
+
+async function requestSelfSignalVerdict(
+  context: AsukaPeerContext,
+  text: string,
+  existing: AsukaMemoryItem[],
+): Promise<AsukaSelfSignalVerdict | null> {
+  const mock = process.env.ASUKA_SELF_SIGNAL_TEST_VERDICT?.trim();
+  if (mock) {
+    return parseSelfSignalVerdict(mock, "mock") ?? {
+      action: "ignore",
+      continuityKind: "emotional_continuity",
+      personalityCategory: "communication_style",
+      canonicalText: "",
+      confidence: 0,
+      targetMemoryIds: [],
+      reason: "invalid mock self signal verdict",
+      source: "invalid",
+    };
+  }
+
+  const resolved = resolveQQBotSceneInferenceConfig(context.accountId);
+  const models = [
+    { config: resolved.primary, source: "model" as const },
+    { config: resolved.fallback, source: "fallback_model" as const },
+  ].filter((item): item is { config: OpenAICompletionsModelConfig; source: "model" | "fallback_model" } => Boolean(item.config));
+  if (models.length === 0) return buildRuleFallbackSelfSignalVerdict(text);
+
+  const prompt = buildSelfSignalJudgePrompt(text, existing);
+  for (const model of models) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SELF_SIGNAL_MODEL_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${model.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${model.config.apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: model.config.model,
+          ...getOpenAICompletionsThinkingParams(model.config.model, "off"),
+          temperature: 0.1,
+          max_tokens: 260,
+          messages: [
+            {
+              role: "system",
+              content: "你只负责判断 Asuka 自己的长期人格记忆，必须只输出 JSON 对象。",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+      const detail = await response.text();
+      if (!response.ok) continue;
+      const parsed = parseSelfSignalVerdict(extractTextFromCompletionPayload(JSON.parse(detail)), model.source);
+      if (parsed) return parsed;
+    } catch {
+      // Try fallback model below.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  return buildRuleFallbackSelfSignalVerdict(text);
 }
 
 function hasTokenOverlap(text: string, queryTokens: Set<string>): boolean {
@@ -625,6 +1022,33 @@ function scoreMemory(item: AsukaMemoryItem, queryTokens: Set<string>, now: numbe
       : 0;
   const importanceBoost = item.importance === "important" ? 4 : 0;
   return item.salience + typeBoost + overlap * 2 + recency + item.confidence + importanceBoost;
+}
+
+function getSelfSignalCategory(item: AsukaMemoryItem): AsukaSelfSignalCategory | null {
+  return item.personalityCategory ?? deriveSelfSignalCategory(item.text) ?? deriveSelfSignalCategoryFromKey(item.key);
+}
+
+function formatSelfSignalCategoryLabel(category: AsukaSelfSignalCategory | null): string {
+  switch (category) {
+    case "attachment_style": return "亲近方式";
+    case "care_style": return "关心方式";
+    case "communication_style": return "说话气质";
+    case "commitment_style": return "认真感";
+    case "temperament": return "性情底色";
+    case "boundaries": return "自我边界";
+    case "vulnerabilities": return "脆弱点";
+    case "aesthetic_taste": return "审美倾向";
+    default: return "长期性格";
+  }
+}
+
+function formatSelfSignalMemoryGroup(title: string, items: AsukaMemoryItem[], limit: number): string[] {
+  const selected = items.slice(0, limit);
+  if (selected.length === 0) return [];
+  return [
+    `${title}:`,
+    ...selected.map((item) => `- ${formatSelfSignalCategoryLabel(getSelfSignalCategory(item))}: ${normalizePromptPerspective(item.text)}${formatMemoryFlags(item)}`),
+  ];
 }
 
 function formatMemoryFlags(item: AsukaMemoryItem): string {
@@ -737,13 +1161,15 @@ function formatListReply(memories: AsukaMemoryItem[]): string {
   const profile = sorted.filter((item) => item.type === "user_profile" || item.type === "explicit");
   const preferences = sorted.filter((item) => item.type === "preference" || item.type === "boundary");
   const relationship = sorted.filter((item) => item.type === "relationship");
-  const active = sorted.filter((item) => item.type === "active_thread" || item.type === "asuka_self_thread" || item.type === "asuka_self_signal");
+  const active = sorted.filter((item) => item.type === "active_thread" || item.type === "asuka_self_thread");
+  const personality = sorted.filter((item) => item.type === "asuka_self_signal");
   const lines = [
     "我现在记得这些：",
     ...formatMemoryGroup("关于你", profile, 4),
     ...formatMemoryGroup("偏好和边界", preferences, 4),
     ...formatMemoryGroup("我们聊过的事", relationship, 3),
     ...formatMemoryGroup("最近还没收尾的话题", active, 3),
+    ...formatMemoryGroup("我的长期性格和相处方式", personality, 4),
   ];
   return lines.join("\n");
 }
@@ -952,17 +1378,20 @@ export function buildAsukaLongTermMemoryPrompt(
   const userFacts = memories.filter((item) => item.type === "user_profile" || item.type === "boundary" || item.type === "preference" || item.type === "explicit");
   const relationship = memories.filter((item) => item.type === "relationship");
   const active = memories.filter((item) => item.type === "active_thread");
-  const selfThreads = memories.filter((item) => item.type === "asuka_self_thread" || item.type === "asuka_self_signal");
+  const selfThreads = memories.filter((item) => item.type === "asuka_self_thread");
+  const selfSignals = memories.filter((item) => item.type === "asuka_self_signal" && getSelfSignalCategory(item));
   const lines = [
     "【Asuka 长期记忆】",
     "- 这些记忆只用于当前私聊；不要在群聊或其他人面前透露。",
     "- 使用原则: 只在和本轮自然相关时轻轻带上，不要像背档案，也不要逐条复述。",
     "- 自我生活线只作为轻量连续性线索；不要把它扩写成完整履历、固定日程或无关新设定。",
-    "- 如果本轮涉及承诺/补救/用户明确请求，以承诺/补救/请求优先，自我生活线只能辅助语气。",
+    "- 长期性格只用于语气、选择和关系连续性；不要把它当成固定人设强行表演。",
+    "- 如果本轮涉及承诺/补救/用户明确请求，以承诺/补救/请求优先，自我生活线和长期性格只能辅助。",
     ...formatMemoryGroup("关于你", userFacts, 5),
     ...formatMemoryGroup("关系里的事", relationship, 3),
     ...formatMemoryGroup("未完话题", active, 2),
-    ...formatMemoryGroup("我的生活线和稳定偏好", selfThreads, 2),
+    ...formatMemoryGroup("我的最近生活线", selfThreads, 2),
+    ...formatSelfSignalMemoryGroup("我的长期性格和相处方式", selfSignals, 5),
   ];
 
   for (const item of memories.slice(0, 10)) {
@@ -986,7 +1415,7 @@ export function buildAsukaProactiveMemoryPrompt(
   if (!prompt) return "";
   return [
     prompt,
-    "- 主动触达时最多借用一条最相关的记忆作为温度；不要主动盘点、追问、复述档案，也不要说你查看了记忆。",
-    "- ambient/self_thread 主动触达可以轻轻延续一条最近自我生活线；如果存在承诺/补救内容，承诺/补救优先。",
+    "- 主动触达时可以自然承接多条相关记忆，像真的记得彼此近况一样组织语气；不要说你查看了记忆。",
+    "- ambient/self_thread 主动触达应更积极延续最近自我生活线，让时间、动作、地点或情绪自然往前走；如果存在承诺/补救内容，承诺/补救优先。",
   ].join("\n");
 }

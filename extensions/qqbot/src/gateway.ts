@@ -1307,6 +1307,7 @@ function resolveSelfieVisiblePayloadText(
   if (captionText) return captionText;
 
   return "";
+<<<<<<< HEAD
 }
 
 function resolveSelfieFlowContextText(
@@ -1318,6 +1319,8 @@ function resolveSelfieFlowContextText(
     || cleanOutgoingTextSegment(caption || "")
     || cleanOutgoingTextSegment(buildForcedSelfieUserText(userText))
     || DEFAULT_SELFIE_VISIBLE_REPLY;
+=======
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
 }
 
 function stripStructuredPayloadForVisibleText(text: string): string {
@@ -3952,6 +3955,11 @@ ${ttsHint}${sttHint}`;
                     userContent,
                   );
                   replyText = resolveTimeSafeVisibleReplyText(selfieVisibleText, { forceImage: true });
+                  if (!replyText) {
+                    log?.info(
+                      `[qqbot:${account.accountId}] Forced trailing-dash image turn had no safe natural visible text after stripping media tags; skipping deterministic image flow`
+                    );
+                  }
                   log?.info(
                     `[qqbot:${account.accountId}] Ignored model media tags in forced trailing-dash image turn; deterministic image flow will run after visible reply`
                   );
@@ -3978,7 +3986,7 @@ ${ttsHint}${sttHint}`;
                         const loggedPromises = recordAssistantReply(asukaPeerContext, postprocessReplyText, parsedPromises);
                         appendGatewayDiagnosticLine(account.accountId, `deliver postprocess record-assistant done logged=${loggedPromises.length}`);
                         appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory start");
-                        recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, postprocessReplyText);
+                        await recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, postprocessReplyText);
                         appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory done");
                         appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene start");
                         await refreshSceneState(asukaPeerContext, {
@@ -4461,6 +4469,7 @@ ${ttsHint}${sttHint}`;
                         recoveredVisibleText,
                         { forceImage: forceSelfieFromTrailingDash },
                       );
+<<<<<<< HEAD
                       const recoveredFlowText = resolveSelfieFlowContextText(
                         sentRecoveredVisibleText || recoveredVisibleText,
                         recoveredSelfie.payload.caption,
@@ -4468,6 +4477,11 @@ ${ttsHint}${sttHint}`;
                       );
                       if (!sentRecoveredVisibleText) {
                         log?.info(`[qqbot:${account.accountId}] Recovered selfie payload visible text not sent; continuing image flow with fallback context text`);
+=======
+                      if (!sentRecoveredVisibleText) {
+                        log?.info(`[qqbot:${account.accountId}] Recovered selfie payload skipped: no safe natural visible reply text`);
+                        return;
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                       }
                       const recoveredSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
@@ -4475,7 +4489,11 @@ ${ttsHint}${sttHint}`;
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
+<<<<<<< HEAD
                         recoveredFlowText,
+=======
+                        sentRecoveredVisibleText,
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                         event.senderId,
                         recoveredSelfieContext,
                       );
@@ -4595,6 +4613,7 @@ ${ttsHint}${sttHint}`;
                         selfieVisibleText,
                         { forceImage: forceSelfieFromTrailingDash },
                       );
+<<<<<<< HEAD
                       const selfieFlowText = resolveSelfieFlowContextText(
                         sentSelfieVisibleText || selfieVisibleText,
                         parsedPayload.caption,
@@ -4602,6 +4621,11 @@ ${ttsHint}${sttHint}`;
                       );
                       if (!sentSelfieVisibleText) {
                         log?.info(`[qqbot:${account.accountId}] Selfie payload visible text not sent; continuing image flow with fallback context text`);
+=======
+                      if (!sentSelfieVisibleText) {
+                        log?.info(`[qqbot:${account.accountId}] Selfie payload skipped: no safe natural visible reply text`);
+                        return;
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                       }
                       const payloadSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
@@ -4609,7 +4633,11 @@ ${ttsHint}${sttHint}`;
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
+<<<<<<< HEAD
                         selfieFlowText,
+=======
+                        sentSelfieVisibleText,
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                         event.senderId,
                         payloadSelfieContext,
                       );
@@ -4856,6 +4884,7 @@ ${ttsHint}${sttHint}`;
                     selfieVisibleText,
                     { forceImage: true },
                   );
+<<<<<<< HEAD
                   const selfieFlowText = resolveSelfieFlowContextText(
                     sentSelfieVisibleText || selfieVisibleText,
                     undefined,
@@ -4863,11 +4892,20 @@ ${ttsHint}${sttHint}`;
                   );
                   if (!sentSelfieVisibleText) {
                     log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image visible text not sent; continuing image flow with fallback context text`);
+=======
+                  if (!sentSelfieVisibleText) {
+                    log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image turn skipped: no safe natural visible reply text`);
+                    return;
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                   }
                   log?.info(`[qqbot:${account.accountId}] Building post-reply image prompt for trailing-dash request`);
                   const selfiePrompt = buildDirectSelfiePromptFromContext(
                     userContent,
+<<<<<<< HEAD
                     selfieFlowText,
+=======
+                    sentSelfieVisibleText,
+>>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                     event.senderId,
                     directSelfieContext,
                   );

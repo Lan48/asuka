@@ -68,7 +68,7 @@ try {
 
   const repairContext = directContext("user-repair", "repair-m-1");
   assert.equal(
-    recordAsukaLongTermMemoryFromAssistantReply(repairContext, "我今天在学校拍视频素材，晚点整理镜头。", base + 500),
+    await recordAsukaLongTermMemoryFromAssistantReply(repairContext, "我今天在学校拍视频素材，晚点整理镜头。", base + 500),
     true,
     "self-life memory should be available before repair priority check",
   );

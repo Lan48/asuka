@@ -40,6 +40,10 @@ function readMemoryState() {
   return JSON.parse(fs.readFileSync(memoryFile, "utf-8"));
 }
 
+function setSelfSignalVerdict(verdict) {
+  process.env.ASUKA_SELF_SIGNAL_TEST_VERDICT = JSON.stringify(verdict);
+}
+
 try {
   const {
     buildAsukaLongTermMemoryPrompt,
@@ -207,7 +211,7 @@ try {
   assertExcludes(thesisPrompt, "咖啡店|电影", "stale unrelated transient memories should be filtered");
 
   assert.equal(
-    recordAsukaLongTermMemoryFromAssistantReply(direct, "我今天准备在西湖边拍照，晚点再给你看。", base + 14_000),
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我今天准备在西湖边拍照，晚点再给你看。", base + 14_000),
     true,
     "assistant self-thread should be captured when concrete and current",
   );
@@ -223,8 +227,32 @@ try {
   assert.ok(selfThread.freshnessUntil > selfThread.updatedAt, "assistant self-thread should expose freshness metadata");
   assert.ok(selfThread.expiresAt > selfThread.freshnessUntil, "assistant self-thread should expose expiry metadata");
 
+  setSelfSignalVerdict({
+    action: "ignore",
+    continuityKind: "emotional_continuity",
+    personalityCategory: "communication_style",
+    canonicalText: "",
+    confidence: 0.1,
+    targetMemoryIds: [],
+    reason: "ordinary reply",
+  });
   assert.equal(
-    recordAsukaLongTermMemoryFromAssistantReply(direct, "我其实一直更喜欢安静一点地靠近你，会认真对你。", base + 15_500),
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "好，我知道了。", base + 14_500),
+    false,
+    "ordinary direct assistant reply should go through personality verdict and be ignored when it has no stable signal",
+  );
+
+  setSelfSignalVerdict({
+    action: "add",
+    continuityKind: "emotional_continuity",
+    personalityCategory: "attachment_style",
+    canonicalText: "我更习惯慢慢靠近你，不想把距离拉得太硬。",
+    confidence: 0.86,
+    targetMemoryIds: [],
+    reason: "stable attachment style",
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我其实一直更喜欢安静一点地靠近你，会认真对你。", base + 15_500),
     true,
     "assistant self signal should be captured when stable and bounded",
   );
@@ -232,24 +260,139 @@ try {
   const selfSignal = Object.values(selfSignalState.memories).find((item) => item.type === "asuka_self_signal");
   assert.ok(selfSignal, "assistant self signal should be persisted");
   assert.equal(selfSignal.source, "assistant_self_signal", "assistant self signal should preserve source");
-  assert.equal(selfSignal.continuityKind, "preference", "assistant self signal should derive continuity kind");
-  assert.match(selfSignal.key, /asuka:preference:closeness/, "assistant self signal should derive a stable key");
-  assert.ok(selfSignal.expiresAt > selfSignal.updatedAt, "assistant self signal should stay bounded by expiry");
+  assert.equal(selfSignal.continuityKind, "emotional_continuity", "assistant self signal should preserve verdict continuity kind");
+  assert.equal(selfSignal.personalityCategory, "attachment_style", "assistant self signal should preserve personality category");
+  assert.equal(selfSignal.key, `asuka:attachment_style:${selfSignal.id}`, "assistant self signal should use per-entry personality key");
+  assert.ok(selfSignal.expiresAt >= base + 15_500 + 179 * dayMs, "assistant self signal should use long personality TTL");
   const selfhoodPrompt = buildAsukaLongTermMemoryPrompt(direct, "你喜欢怎么靠近我", base + 15_600);
-  assertIncludes(selfhoodPrompt, "我的生活线和稳定偏好", "direct prompt should label selfhood context explicitly");
-  assertIncludes(selfhoodPrompt, "靠近你", "direct prompt should include relevant self signal");
+  assertIncludes(selfhoodPrompt, "我的长期性格和相处方式", "direct prompt should label personality context explicitly");
+  assertIncludes(selfhoodPrompt, "慢慢靠近你", "direct prompt should include relevant self signal");
   assertIncludes(selfhoodPrompt, "自我生活线只作为轻量连续性线索", "direct prompt should bound selfhood usage");
   assertIncludes(selfhoodPrompt, "承诺/补救", "direct prompt should preserve promise repair priority guidance");
 
+  setSelfSignalVerdict({
+    action: "add",
+    continuityKind: "preference",
+    personalityCategory: "communication_style",
+    canonicalText: "我更喜欢把话说得自然一点，不想像机械回复。",
+    confidence: 0.82,
+    targetMemoryIds: [],
+    reason: "stable communication style",
+  });
   assert.equal(
-    recordAsukaLongTermMemoryFromAssistantReply(group, "我今天在学校拍视频素材，晚点整理镜头。", base + 15_800),
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我一直更喜欢把话说得自然一点，不想像机械回复。", base + 15_650),
+    true,
+    "same category should allow multiple non-conflicting personality memories",
+  );
+  const multiSignalState = readMemoryState();
+  const activeSignalsAfterAdd = Object.values(multiSignalState.memories)
+    .filter((item) => item.type === "asuka_self_signal" && (item.status ?? "active") === "active");
+  assert.ok(activeSignalsAfterAdd.length >= 2, "personality memory should allow multiple active entries");
+
+  setSelfSignalVerdict({
+    action: "ignore",
+    continuityKind: "emotional_continuity",
+    personalityCategory: "vulnerabilities",
+    canonicalText: "",
+    confidence: 0.2,
+    targetMemoryIds: [],
+    reason: "temporary mood",
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我现在有点怕你不理我。", base + 15_700),
+    false,
+    "temporary self emotion should not be persisted",
+  );
+
+  const beforeUpdateState = readMemoryState();
+  const attachmentBeforeUpdate = Object.values(beforeUpdateState.memories)
+    .find((item) => item.type === "asuka_self_signal" && item.personalityCategory === "attachment_style" && (item.status ?? "active") === "active");
+  assert.ok(attachmentBeforeUpdate, "attachment personality target should exist before update");
+  setSelfSignalVerdict({
+    action: "update",
+    continuityKind: "emotional_continuity",
+    personalityCategory: "attachment_style",
+    canonicalText: "我习惯慢慢靠近你，也会认真照顾我们之间的距离。",
+    confidence: 0.9,
+    targetMemoryIds: [attachmentBeforeUpdate.id],
+    reason: "same attachment facet",
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我还是习惯慢慢靠近你，也会认真照顾距离。", base + 15_800),
+    true,
+    "update verdict should merge an existing personality memory",
+  );
+  const afterUpdateState = readMemoryState();
+  const attachmentAfterUpdate = afterUpdateState.memories[attachmentBeforeUpdate.id];
+  assert.match(attachmentAfterUpdate.text, /认真照顾/, "update verdict should rewrite target memory");
+  assert.ok(attachmentAfterUpdate.expiresAt >= base + 15_800 + 179 * dayMs, "update verdict should refresh TTL");
+
+  setSelfSignalVerdict({
+    action: "replace",
+    continuityKind: "emotional_continuity",
+    personalityCategory: "attachment_style",
+    canonicalText: "我现在更愿意保持一点距离，把靠近放慢。",
+    confidence: 0.88,
+    targetMemoryIds: [attachmentBeforeUpdate.id],
+    reason: "conflicting attachment style",
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我一直更愿意保持一点距离，把靠近放慢。", base + 15_900),
+    true,
+    "replace verdict should supersede conflicting personality memory",
+  );
+  const afterReplaceState = readMemoryState();
+  assert.equal(afterReplaceState.memories[attachmentBeforeUpdate.id].status, "superseded", "replace verdict should supersede old target");
+  assert.ok(
+    Object.values(afterReplaceState.memories).some((item) => item.type === "asuka_self_signal" && item.text.includes("保持一点距离") && (item.status ?? "active") === "active"),
+    "replace verdict should add the new active personality memory",
+  );
+
+  setSelfSignalVerdict({
+    action: "update",
+    continuityKind: "preference",
+    personalityCategory: "communication_style",
+    canonicalText: "我会更新一条不存在的记忆。",
+    confidence: 0.7,
+    targetMemoryIds: ["missing-memory-id"],
+    reason: "invalid target",
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(direct, "我一直更喜欢更新一条不存在的记忆。", base + 15_950),
+    false,
+    "update verdict without a valid target should not create a new personality memory",
+  );
+
+  for (let i = 0; i < 5; i++) {
+    setSelfSignalVerdict({
+      action: "add",
+      continuityKind: "preference",
+      personalityCategory: "communication_style",
+      canonicalText: `我更喜欢自然一点说话的第 ${i} 个稳定侧面。`,
+      confidence: 0.7 + i / 100,
+      targetMemoryIds: [],
+      reason: "category cap fixture",
+    });
+    assert.equal(
+      await recordAsukaLongTermMemoryFromAssistantReply(direct, `我一直更喜欢自然一点说话的第 ${i} 个稳定侧面。`, base + 16_000 + i),
+      true,
+      "category cap fixture should add candidate personality memory",
+    );
+  }
+  const cappedSignalState = readMemoryState();
+  const activeCommunicationSignals = Object.values(cappedSignalState.memories)
+    .filter((item) => item.type === "asuka_self_signal" && item.personalityCategory === "communication_style" && (item.status ?? "active") === "active");
+  assert.ok(activeCommunicationSignals.length <= 3, "personality memories should be capped per category");
+
+  assert.equal(
+    await recordAsukaLongTermMemoryFromAssistantReply(group, "我今天在学校拍视频素材，晚点整理镜头。", base + 15_800),
     false,
     "group context should not persist assistant self-life state",
   );
 
   for (let i = 0; i < 20; i++) {
     assert.equal(
-      recordAsukaLongTermMemoryFromAssistantReply(
+      await recordAsukaLongTermMemoryFromAssistantReply(
         direct,
         `我今天在学校拍视频素材 ${i}，晚点整理镜头。`,
         base + 16_000 + i,
@@ -262,11 +405,15 @@ try {
   const activeSelfThreads = Object.values(cappedSelfState.memories)
     .filter((item) => item.type === "asuka_self_thread" && (item.status ?? "active") === "active");
   assert.ok(activeSelfThreads.length <= 12, "assistant self-thread records should stay capped per peer");
+  delete process.env.ASUKA_SELF_SIGNAL_TEST_VERDICT;
 
   const proactivePrompt = buildAsukaProactiveMemoryPrompt(direct, "上海天气", base + 16_000);
   assertIncludes(proactivePrompt, "主动触达", "proactive prompt should include proactive guidance");
+  assertIncludes(proactivePrompt, "多条相关记忆", "proactive prompt should allow naturally combining relevant memories");
   assertIncludes(proactivePrompt, "ambient/self_thread", "proactive prompt should include selfhood-specific guidance");
+  assertIncludes(proactivePrompt, "更积极延续最近自我生活线", "proactive prompt should strengthen selfhood continuity");
   assertIncludes(proactivePrompt, "承诺/补救优先", "proactive prompt should keep promise repair priority");
+  assertExcludes(proactivePrompt, "最多借用一条|主动盘点", "proactive prompt should not over-limit memory usage");
   assertIncludes(proactivePrompt, "上海", "proactive prompt should include safe direct memory context");
   assert.equal(
     buildAsukaProactiveMemoryPrompt(group, "上海天气", base + 16_000),
