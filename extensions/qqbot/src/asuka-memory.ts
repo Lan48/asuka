@@ -94,11 +94,14 @@ const STRUCTURED_ARTIFACT_RE = /Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi;
 const MEDIA_TAG_RE = /<(?:qqimg|qqvoice|qqvideo|qqfile)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi;
 const INTERNAL_LEAK_RE = /(asuka-selfie|Q{1,2}BOT_(?:PAYLOAD|CRON)|任务完成总结[:：]|提醒已发送|根据任务描述|工具调用|调试信息|API 调用|脚本|进程状态|通道规则|读取\s*(?:skill|技能)\s*文件|skill\s*文件|(?:imagegen|asuka-selfie|qqbot-media)\s+skill|⚠️?\s*Cron job\s+"[^"]+"\s+failed|cron:\s*job interrupted by gateway restart)/i;
 const SECRET_RE = /(密码|口令|验证码|token|api[_-]?key|secret|密钥|身份证|银行卡|信用卡|私钥|助记词|cookie|authorization)/i;
-const EXPLICIT_MEMORY_RE = /(记住|记得|别忘|帮我记|你要记|以后你要记得|以后记得|这点很重要|这个很重要)/;
-const USER_PROFILE_RE = /(我叫|叫我|我的名字|我是|生日|纪念日|时区|城市|住在|在.*工作|在.*上学)/;
-const PREFERENCE_RE = /(我喜欢|我偏好|我更喜欢|我希望|我想要|我习惯|对我来说.*重要|可以多|最好)/;
-const BOUNDARY_RE = /(我不喜欢|我讨厌|不要|别再|别叫|不想|雷点|介意|不舒服|别提|不要再)/;
-const RELATIONSHIP_RE = /(我们|上次|那次|之前|一起|约定|拉钩|纪念|吵架|和好|想你|喜欢你|爱你)/;
+const EXPLICIT_MEMORY_COMMAND_RE = /^(?:(?:请|麻烦)(?:你)?[，,:：\s]*)?(?:(?:你)?帮我记(?:一下)?|记住|记下|记好|记得(?=(?:我|我们|以后|明天|后天|下周|下月|每))|别忘(?:了|记)?|你要记(?:住|得)|以后(?:你)?(?:要)?记得)/;
+const EXPLICIT_REMINDER_RE = /^(?:(?:请|麻烦)(?:你)?|你)[，,:：\s]*记得/;
+const EXPLICIT_IMPORTANCE_RE = /(?:这点|这个|这件事)(?:真的|非常)?很?重要(?=[，,:：。！!\s]|$)/;
+const LOW_INFORMATION_MEMORY_REPLY_RE = /^(?:[嗯哦噢啊诶唉哈]+[，,\s]*)?(?:不(?:太)?记得(?:了)?|记不(?:太)?清(?:了)?|没有(?:吧|啊|呢)?|没(?:有)?(?:吧|呢)?|不知道|不清楚)[。！？!?~～…\s]*$/;
+const USER_PROFILE_RE = /(我叫|叫我|我的名字|我的生日|生日是|纪念日是|我的时区|我的城市|我住在|我的住所|我家在|我在[^。！？!?]{0,40}(?:工作|上学))/;
+const PREFERENCE_RE = /(我喜欢|我偏好|我更喜欢|我习惯|我希望(?:你|以后|回复)|对我来说[^。！？!?]{0,40}重要)/;
+const BOUNDARY_RE = /(我不喜欢|我讨厌|我不想被|我介意|我的雷点|让我不舒服|别再|不要再|别叫我)/;
+const RELATIONSHIP_RE = /(同居|恋人|情侣|夫妻|结婚|在一起|分手|和好|我们约定|我们拉钩|纪念日|我爱你|我喜欢你)/;
 const ACTIVE_THREAD_RE = /(最近|这几天|这周|今天|明天|回头|继续|下次|等会|一会|待会|正在|准备|计划)/;
 const RESIDENCE_RE = /(住在|住所|家在|宿舍|暂住|临时住|短住|借住|搬到|搬家|现在在|目前在|此刻在)/;
 const ASUKA_SELF_THREAD_RE = /(我(最近|这几天|这周|今天|明天|现在|刚刚|等会|准备|正在).*(上课|自习|作业|课题|拍照|拍视频|剪视频|咖啡|宿舍|学校|校园|西湖|湖滨|运河|雨|散步|电影|音乐|练舞|整理|复习|画面|镜头|照片))/;
@@ -202,6 +205,13 @@ function shouldSkipMemory(text: string): boolean {
   return false;
 }
 
+function isExplicitMemoryRequest(text: string): boolean {
+  const normalized = text.trim().replace(/^(?:Asuka|明日香)[，,:：\s]*/i, "");
+  return EXPLICIT_MEMORY_COMMAND_RE.test(normalized)
+    || EXPLICIT_REMINDER_RE.test(normalized)
+    || (!/[?？]/.test(normalized) && EXPLICIT_IMPORTANCE_RE.test(normalized));
+}
+
 function classifyUserMemory(text: string, at: number): {
   type: AsukaMemoryType;
   source: AsukaMemorySource;
@@ -209,7 +219,10 @@ function classifyUserMemory(text: string, at: number): {
   confidence: number;
   expiresAt?: number;
 } | null {
-  const explicit = EXPLICIT_MEMORY_RE.test(text);
+  const explicit = isExplicitMemoryRequest(text);
+  if (!explicit && /[?？]|(?:还记得|记不记得|知道不知道|你知道).*(?:吗|呢|么)/.test(text)) {
+    return null;
+  }
   if (BOUNDARY_RE.test(text)) {
     return { type: "boundary", source: explicit ? "user_explicit" : "user_inferred", salience: explicit ? 10 : 8, confidence: explicit ? 0.95 : 0.78 };
   }
@@ -751,6 +764,7 @@ export function recordAsukaLongTermMemoryFromUserMessage(
 ): boolean {
   const text = sanitizeMemoryText(userText);
   if (shouldSkipMemory(text)) return false;
+  if (LOW_INFORMATION_MEMORY_REPLY_RE.test(text)) return false;
   const classified = classifyUserMemory(text, at);
   if (!classified) return false;
   const steering = deriveInlineSteering(text, at);

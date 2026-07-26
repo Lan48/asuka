@@ -11,7 +11,8 @@ const dayMs = 24 * 60 * 60 * 1000;
 const base = Date.UTC(2026, 3, 26, 0, 0, 0);
 const memoryFile = path.join(tmpHome, ".openclaw", "qqbot", "data", "asuka-memory", "memory.json");
 const memoryWikiDir = path.join(tmpHome, "Asuka", "Memory");
-const compiledEntityFile = path.join(memoryWikiDir, "entities", "asuka-memory-context.md");
+const compiledResidenceFile = path.join(memoryWikiDir, "entities", "residence-location-timeline.md");
+const compiledRelationshipFile = path.join(memoryWikiDir, "entities", "relationship-state.md");
 const compiledSourceFile = path.join(memoryWikiDir, "sources", "asuka-memory-jsonl.md");
 process.env.ASUKA_MEMORY_WIKI_DIR = memoryWikiDir;
 
@@ -89,6 +90,51 @@ try {
     buildAsukaLongTermMemoryPrompt(direct, "", base + 3_000),
     "sk-test-secret|token",
     "secret-like text should not appear in prompts",
+  );
+
+  const memoryCountBeforeLowSignal = Object.keys(readMemoryState().memories).length;
+  for (const [index, lowSignal] of [
+    "不记得了",
+    "没有吧",
+    "我看看你还记不记得",
+    "只记得昨天喝了很多，后面忘了",
+    "你还记得我住在哪里吗？",
+    "你知道我喜欢什么吗？",
+  ].entries()) {
+    assert.equal(
+      recordAsukaLongTermMemoryFromUserMessage(direct, lowSignal, base + 3_100 + index),
+      false,
+      `low-information recollection should not become durable memory: ${lowSignal}`,
+    );
+  }
+  assert.equal(
+    Object.keys(readMemoryState().memories).length,
+    memoryCountBeforeLowSignal,
+    "low-information recollection must not change the memory store",
+  );
+  assert.doesNotMatch(
+    readWikiClaims().map((claim) => claim.value).join("\n"),
+    /不记得了|没有吧|还记不记得|只记得昨天/,
+    "low-information recollection must not enter Memory Wiki claims",
+  );
+  assert.equal(
+    recordAsukaLongTermMemoryFromUserMessage(direct, "请记得我不喜欢被叫老板。", base + 3_200),
+    true,
+    "clear positive memory instruction should still be captured",
+  );
+  const explicitBoundary = Object.values(readMemoryState().memories)
+    .find((item) => item.text.includes("不喜欢被叫老板"));
+  assert.equal(explicitBoundary?.type, "boundary", "explicit stable boundary should retain its semantic type");
+  assert.equal(explicitBoundary?.source, "user_explicit", "positive memory instruction should remain explicit");
+  assert.equal(
+    recordAsukaLongTermMemoryFromUserMessage(direct, "明日香，记得我的项目代号是 Aurora。", base + 3_300),
+    true,
+    "sentence-initial 记得 command should be captured",
+  );
+  assert.equal(
+    recordAsukaLongTermMemoryFromUserMessage(direct, "别忘了我下周要复诊。", base + 3_400),
+    true,
+    "别忘了 command should be captured",
   );
 
   assert.equal(
@@ -181,13 +227,14 @@ try {
     "future move should be a planned claim",
   );
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我们已经开始同居。", base + 10_350), true);
-  const compiledEntityBeforeNotes = fs.readFileSync(compiledEntityFile, "utf-8");
-  assertIncludes(compiledEntityBeforeNotes, "pageType: entity", "wiki bridge should write a compilable entity page");
-  assertIncludes(compiledEntityBeforeNotes, "claims:", "wiki claims must live in structured frontmatter");
-  assertIncludes(compiledEntityBeforeNotes, "source\\.asuka-memory-jsonl", "compiled entity should declare page-level provenance");
-  assertIncludes(compiledEntityBeforeNotes, "user\\.residence \\[home-base\\].*上海", "compiled page should expose the current residence claim");
-  assertIncludes(compiledEntityBeforeNotes, "relationship\\.relationship \\[general\\].*同居", "compiled page should expose the cohabitation claim");
-  assertIncludes(compiledEntityBeforeNotes, "evidence:", "compiled claims should retain structured evidence");
+  const compiledResidence = fs.readFileSync(compiledResidenceFile, "utf-8");
+  const compiledRelationshipBeforeNotes = fs.readFileSync(compiledRelationshipFile, "utf-8");
+  assertIncludes(compiledResidence, "pageType: entity", "wiki bridge should write compilable topic pages");
+  assertIncludes(compiledResidence, "claims:", "wiki claims must live in structured frontmatter");
+  assertIncludes(compiledResidence, "source\\.asuka-memory-jsonl", "compiled topics should declare page-level provenance");
+  assertIncludes(compiledResidence, "user\\.residence \\[home-base\\].*上海", "residence topic should expose the current residence claim");
+  assertIncludes(compiledRelationshipBeforeNotes, "relationship\\.relationship \\[general\\].*同居", "relationship topic should expose the cohabitation claim");
+  assertIncludes(compiledRelationshipBeforeNotes, "evidence:", "compiled claims should retain structured evidence");
   assertIncludes(fs.readFileSync(compiledSourceFile, "utf-8"), "pageType: source", "wiki bridge should write the referenced source page");
 
   const claimsMarkdown = path.join(memoryWikiDir, "Claims.md");
@@ -197,8 +244,8 @@ try {
   );
   fs.writeFileSync(claimsMarkdown, withManualNotes, "utf-8");
   fs.writeFileSync(
-    compiledEntityFile,
-    compiledEntityBeforeNotes.replace(
+    compiledRelationshipFile,
+    compiledRelationshipBeforeNotes.replace(
       "<!-- openclaw:human:start -->\n",
       "<!-- openclaw:human:start -->\n这段 OpenClaw 人工笔记也必须保留。\n",
     ),
@@ -207,7 +254,7 @@ try {
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢茉莉花茶。", base + 10_400), true);
   assertIncludes(fs.readFileSync(claimsMarkdown, "utf-8"), "这段人工笔记必须保留", "wiki sync must preserve manual Notes");
   assertIncludes(
-    fs.readFileSync(compiledEntityFile, "utf-8"),
+    fs.readFileSync(compiledRelationshipFile, "utf-8"),
     "这段 OpenClaw 人工笔记也必须保留",
     "compilable Wiki page must preserve OpenClaw human Notes",
   );

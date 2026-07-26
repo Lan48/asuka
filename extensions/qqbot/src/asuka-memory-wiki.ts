@@ -18,6 +18,8 @@ export interface AsukaMemoryWikiItem {
   updatedAt: number;
   expiresAt?: number;
   confidence: number;
+  salience?: number;
+  temporary?: boolean;
   key?: string;
   status?: "active" | "superseded" | "forgotten";
   supersededBy?: string;
@@ -37,7 +39,11 @@ export interface AsukaMemoryWikiClaim {
   observedAt: string;
   updatedAt: string;
   source: string;
+  sourceKind?: string;
+  memoryType?: string;
   confidence: number;
+  salience?: number;
+  temporary?: boolean;
   supersedes: string[];
 }
 
@@ -47,7 +53,47 @@ const NOTES_START = "<!-- ASUKA_MEMORY_NOTES_START -->";
 const NOTES_END = "<!-- ASUKA_MEMORY_NOTES_END -->";
 const OPENCLAW_HUMAN_START = "<!-- openclaw:human:start -->";
 const OPENCLAW_HUMAN_END = "<!-- openclaw:human:end -->";
+const LEGACY_REDIRECT_MARKER = "<!-- asuka-memory:legacy-redirect -->";
 const PENDING_FILE = ".asuka-memory-pending";
+
+interface CompiledTopic {
+  slug: string;
+  title: string;
+  entityType: string;
+}
+
+const COMPILED_TOPICS: CompiledTopic[] = [
+  {
+    slug: "residence-location-timeline",
+    title: "Residence and Location Timeline",
+    entityType: "location-timeline",
+  },
+  {
+    slug: "relationship-state",
+    title: "Relationship State",
+    entityType: "relationship-context",
+  },
+  {
+    slug: "preferences-boundaries",
+    title: "Preferences and Boundaries",
+    entityType: "preference-profile",
+  },
+  {
+    slug: "commitments-todos",
+    title: "Commitments and Todos",
+    entityType: "task-context",
+  },
+  {
+    slug: "user-basics",
+    title: "User Basics",
+    entityType: "person-profile",
+  },
+  {
+    slug: "asuka-self-state",
+    title: "Asuka Self State",
+    entityType: "agent-state",
+  },
+];
 
 function iso(value: number | undefined): string | null {
   return typeof value === "number" && Number.isFinite(value)
@@ -80,6 +126,7 @@ function deriveSubject(item: AsukaMemoryWikiItem): AsukaMemoryWikiClaim["subject
 
 function deriveProperty(item: AsukaMemoryWikiItem, scope: AsukaMemoryWikiScope): string {
   if (scope !== "general") return "residence";
+  if (item.type === "active_thread") return "active_thread";
   if (item.key) return item.key.replace(/^(?:user|asuka):/, "");
   return item.type;
 }
@@ -107,7 +154,11 @@ function toClaim(item: AsukaMemoryWikiItem, allItems: AsukaMemoryWikiItem[]): As
     observedAt: iso(item.createdAt)!,
     updatedAt: iso(item.updatedAt)!,
     source: item.sourceMessageId ?? item.source,
+    sourceKind: item.source,
+    memoryType: item.type,
     confidence: item.confidence,
+    salience: item.salience,
+    temporary: item.temporary,
     supersedes: allItems
       .filter((candidate) => candidate.supersededBy === item.id)
       .map((candidate) => candidate.id),
@@ -193,6 +244,10 @@ function claimEvidenceNote(claim: AsukaMemoryWikiClaim): string {
     observedAt: claim.observedAt,
     supersedes: claim.supersedes,
     sourceStatus: claim.status,
+    sourceKind: claim.sourceKind,
+    memoryType: claim.memoryType,
+    salience: claim.salience,
+    temporary: claim.temporary,
   });
 }
 
@@ -203,23 +258,114 @@ function extractHumanNotes(current: string): string {
   return current.slice(start + OPENCLAW_HUMAN_START.length, end).trim();
 }
 
-function renderCompiledEntityPage(claims: AsukaMemoryWikiClaim[], current: string): string {
+function mergeHumanNotes(...notes: string[]): string {
+  let merged = "";
+  for (const candidate of notes.map((note) => note.trim()).filter(Boolean)) {
+    if (!merged) {
+      merged = candidate;
+    } else if (!merged.includes(candidate)) {
+      merged = candidate.includes(merged) ? candidate : `${merged}\n\n${candidate}`;
+    }
+  }
+  return merged;
+}
+
+function topicForClaim(claim: AsukaMemoryWikiClaim): string {
+  if (
+    claim.scope !== "general"
+    || claim.property === "residence"
+    || claim.property === "location"
+  ) {
+    return "residence-location-timeline";
+  }
+  if (claim.subject === "relationship" || claim.property === "relationship") {
+    return "relationship-state";
+  }
+  if (
+    claim.property === "preference"
+    || claim.property.startsWith("preference:")
+    || claim.property === "boundary"
+    || claim.property.startsWith("boundary:")
+  ) {
+    return "preferences-boundaries";
+  }
+  if (claim.property === "active_thread") return "commitments-todos";
+  if (claim.subject === "asuka") return "asuka-self-state";
+  return "user-basics";
+}
+
+const LOW_INFORMATION_CLAIM_RE = /^(?:[嗯哦噢啊诶唉哈]+[，,\s]*)?(?:不(?:太)?记得(?:了)?|记不(?:太)?清(?:了)?|没有(?:吧|啊|呢)?|没(?:有)?(?:吧|呢)?|不知道|不清楚)[。！？!?~～…\s]*$/;
+const STABLE_USER_PROFILE_RE = /(我叫|叫我|我的名字|生日|纪念日|时区|城市|住在|住所|家在|工作|上学|学校|公司)/;
+const STABLE_PREFERENCE_RE = /(我喜欢|我偏好|我更喜欢|我习惯|我希望|对我来说[^。！？!?]{0,40}重要)/;
+const STABLE_BOUNDARY_RE = /(我不喜欢|我讨厌|我不想被|我介意|我的雷点|让我不舒服|别再|不要再|别叫我)/;
+const STABLE_RELATIONSHIP_RE = /(同居|恋人|情侣|夫妻|结婚|在一起|分手|和好|我们约定|我们拉钩|纪念日|我爱你|我喜欢你)/;
+const ACTIONABLE_THREAD_RE = /(计划|准备|打算|约定|答应|承诺|提醒|待办|下次|回头|继续|要做|记得|别忘)/;
+const EXPLICIT_MEMORY_COMMAND_RE = /^(?:(?:请|麻烦)(?:你)?[，,:：\s]*)?(?:(?:你)?帮我记(?:一下)?|记住|记下|记好|记得|别忘(?:记)?|你要记(?:住|得)?|以后(?:你)?(?:要)?记得)/;
+
+function isSubstantiveExplicitClaim(value: string): boolean {
+  if (/[？?]/.test(value)) return false;
+  const content = value.replace(EXPLICIT_MEMORY_COMMAND_RE, "").replace(/^[，,:：。\s]+/, "").trim();
+  return EXPLICIT_MEMORY_COMMAND_RE.test(value) && content.length >= 2;
+}
+
+export function isDurableClaim(claim: AsukaMemoryWikiClaim): boolean {
+  if (
+    claim.status === "forgotten"
+    || claim.status === "expired"
+    || claim.temporary
+    || LOW_INFORMATION_CLAIM_RE.test(claim.value.trim())
+  ) return false;
+  const topic = topicForClaim(claim);
+  if (claim.memoryType === "active_thread" || claim.property === "active_thread") {
+    return ACTIONABLE_THREAD_RE.test(claim.value);
+  }
+  if (claim.memoryType === "asuka_self_signal" || claim.property === "asuka_self_signal") {
+    return claim.confidence >= 0.75;
+  }
+  if (claim.subject === "asuka") return false;
+  if (topic === "residence-location-timeline") return claim.subject === "user";
+  if (claim.memoryType === "explicit" || claim.property === "explicit") {
+    return isSubstantiveExplicitClaim(claim.value);
+  }
+  if (claim.sourceKind === "user_explicit" || claim.source === "user_explicit") {
+    return true;
+  }
+  if (claim.memoryType === "user_profile" || topic === "user-basics") {
+    return STABLE_USER_PROFILE_RE.test(claim.value);
+  }
+  if (claim.memoryType === "preference" || claim.property.startsWith("preference")) {
+    return STABLE_PREFERENCE_RE.test(claim.value);
+  }
+  if (claim.memoryType === "boundary" || claim.property.startsWith("boundary")) {
+    return STABLE_BOUNDARY_RE.test(claim.value);
+  }
+  if (claim.memoryType === "relationship" || topic === "relationship-state") {
+    return STABLE_RELATIONSHIP_RE.test(claim.value);
+  }
+  return false;
+}
+
+function renderCompiledEntityPage(
+  topic: CompiledTopic,
+  claims: AsukaMemoryWikiClaim[],
+  notes: string,
+): string {
   const updatedAt = claims.reduce(
     (latest, claim) => claim.updatedAt > latest ? claim.updatedAt : latest,
     new Date(0).toISOString(),
   );
   const frontmatter = [
     "pageType: entity",
-    "entityType: relationship-context",
-    "id: entity.asuka-memory-context",
-    "canonicalId: asuka-memory-context",
-    "title: Asuka Memory Context",
+    `entityType: ${topic.entityType}`,
+    `id: entity.asuka-memory-${topic.slug}`,
+    `canonicalId: asuka-memory-${topic.slug}`,
+    `title: ${topic.title}`,
     "privacyTier: local-private",
     "sourceIds:",
     "  - source.asuka-memory-jsonl",
     `updatedAt: ${yamlScalar(updatedAt)}`,
     `lastRefreshedAt: ${yamlScalar(updatedAt)}`,
-    "claims:",
+    claims.length ? "claims:" : "claims: []",
     ...claims.flatMap((claim) => [
       `  - id: ${yamlScalar(claim.id)}`,
       `    text: ${yamlScalar(`${claim.subject}.${claim.property} [${claim.scope}]: ${claim.value}`)}`,
@@ -234,16 +380,14 @@ function renderCompiledEntityPage(claims: AsukaMemoryWikiClaim[], current: strin
       `        updatedAt: ${yamlScalar(claim.updatedAt)}`,
     ]),
   ];
-  const notes = extractHumanNotes(current);
   return [
     "---",
     ...frontmatter,
     "---",
     "",
-    "# Asuka Memory Context",
+    `# ${topic.title}`,
     "",
-    renderGeneratedClaims(claims),
-    "",
+    ...(claims.length ? [renderGeneratedClaims(claims), ""] : []),
     "## Notes",
     OPENCLAW_HUMAN_START,
     notes,
@@ -277,6 +421,28 @@ function renderSourcePage(updatedAt: string, current: string): string {
   ].join("\n");
 }
 
+function renderLegacyRedirect(current: string): string {
+  if (current.includes(LEGACY_REDIRECT_MARKER)) return current;
+  const archived = current
+    .split(/\r?\n/)
+    .map((line) => `    ${line}`)
+    .join("\n");
+  return [
+    LEGACY_REDIRECT_MARKER,
+    "# Asuka Memory Context (Migrated)",
+    "",
+    "The generated memory view has moved to [[user-basics]] and the other topic pages in this folder.",
+    "",
+    "<details>",
+    "<summary>Preserved pre-migration page</summary>",
+    "",
+    archived,
+    "",
+    "</details>",
+    "",
+  ].join("\n");
+}
+
 function readExistingClaims(file: string): AsukaMemoryWikiClaim[] {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf-8")
@@ -299,7 +465,8 @@ export function syncAsukaMemoryWiki(items: AsukaMemoryWikiItem[]): void {
     fs.mkdirSync(targetDir, { recursive: true });
     const jsonlFile = path.join(targetDir, "claims.jsonl");
     const markdownFile = path.join(targetDir, "Claims.md");
-    const entityFile = path.join(targetDir, "entities", "asuka-memory-context.md");
+    const entitiesDir = path.join(targetDir, "entities");
+    const legacyEntityFile = path.join(entitiesDir, "asuka-memory-context.md");
     const sourceFile = path.join(targetDir, "sources", "asuka-memory-jsonl.md");
     const claimsById = new Map(readExistingClaims(jsonlFile).map((claim) => [claim.id, claim]));
     for (const claim of items.map((item) => toClaim(item, items))) {
@@ -310,9 +477,28 @@ export function syncAsukaMemoryWiki(items: AsukaMemoryWikiItem[]): void {
     atomicWrite(jsonlFile, jsonl ? `${jsonl}\n` : "");
     const currentMarkdown = fs.existsSync(markdownFile) ? fs.readFileSync(markdownFile, "utf-8") : "";
     atomicWrite(markdownFile, renderMarkdown(claims, currentMarkdown));
-    fs.mkdirSync(path.dirname(entityFile), { recursive: true });
-    const currentEntity = fs.existsSync(entityFile) ? fs.readFileSync(entityFile, "utf-8") : "";
-    atomicWrite(entityFile, renderCompiledEntityPage(claims, currentEntity));
+    fs.mkdirSync(entitiesDir, { recursive: true });
+    const legacyContent = fs.existsSync(legacyEntityFile)
+      ? fs.readFileSync(legacyEntityFile, "utf-8")
+      : "";
+    const legacyNotes = extractHumanNotes(legacyContent);
+    for (const topic of COMPILED_TOPICS) {
+      const topicFile = path.join(entitiesDir, `${topic.slug}.md`);
+      const current = fs.existsSync(topicFile) ? fs.readFileSync(topicFile, "utf-8") : "";
+      const notes = mergeHumanNotes(
+        extractHumanNotes(current),
+        topic.slug === "user-basics" ? legacyNotes : "",
+      );
+      const topicClaims = claims.filter(
+        (claim) => isDurableClaim(claim) && topicForClaim(claim) === topic.slug,
+      );
+      if (!topicClaims.length && !notes) {
+        if (fs.existsSync(topicFile)) fs.unlinkSync(topicFile);
+        continue;
+      }
+      atomicWrite(topicFile, renderCompiledEntityPage(topic, topicClaims, notes));
+    }
+    if (legacyContent) atomicWrite(legacyEntityFile, renderLegacyRedirect(legacyContent));
     fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
     const currentSource = fs.existsSync(sourceFile) ? fs.readFileSync(sourceFile, "utf-8") : "";
     const updatedAt = claims.reduce(
