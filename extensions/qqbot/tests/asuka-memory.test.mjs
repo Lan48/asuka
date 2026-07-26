@@ -819,6 +819,11 @@ try {
   assertIncludes(selfhoodPrompt, "慢慢靠近你", "direct prompt should include relevant self signal");
   assertIncludes(selfhoodPrompt, "自我生活线只作为轻量连续性线索", "direct prompt should bound selfhood usage");
   assertIncludes(selfhoodPrompt, "承诺/补救", "direct prompt should preserve promise repair priority guidance");
+  assertIncludes(
+    buildAsukaLongTermMemoryPrompt(direct, "你自己有什么习惯", base + 15_601),
+    "慢慢靠近你",
+    "generic self-recall should include recent self signals without exact token overlap",
+  );
 
   setSelfSignalVerdict({
     action: "add",
@@ -984,15 +989,20 @@ try {
     "utf-8",
   );
   fs.rmSync(path.join(memoryWikiDir, ".asuka-memory-pending"));
-  assert.equal(
+  assertIncludes(
     buildAsukaLongTermMemoryPrompt(direct, "上海天气", base + 16_500),
-    "",
-    "primary Memory Wiki mode should suppress legacy reply prompt injection",
+    "上海",
+    "primary Memory Wiki mode should keep structured local recall available when active-memory misses",
+  );
+  assertIncludes(
+    buildAsukaProactiveMemoryPrompt(direct, "上海天气", base + 16_500),
+    "主动触达",
+    "primary Memory Wiki mode should keep proactive local recall available when active-memory misses",
   );
   assert.equal(
-    buildAsukaProactiveMemoryPrompt(direct, "上海天气", base + 16_500),
-    "",
-    "primary Memory Wiki mode should suppress legacy proactive prompt injection",
+    fs.existsSync(path.join(memoryWikiDir, ".asuka-memory-pending")),
+    false,
+    "recall metadata updates must not schedule a Wiki compile or Git sync",
   );
   assert.equal(
     recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢白桃乌龙。", base + 16_600),

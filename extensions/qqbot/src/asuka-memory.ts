@@ -5,7 +5,7 @@ import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
 import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
 import { getQQBotDataDir } from "./utils/platform.js";
-import { isAsukaMemoryWikiPrimary, syncAsukaMemoryWiki } from "./asuka-memory-wiki.js";
+import { syncAsukaMemoryWiki } from "./asuka-memory-wiki.js";
 
 type AsukaMemoryType =
   | "user_profile"
@@ -188,6 +188,7 @@ const MEMORY_MARK_IMPORTANT_RE = /(标为重要|设为重要|当成重要|标记
 const MEMORY_MARK_TEMPORARY_RE = /(标为临时|设为临时|当成临时|临时记|暂时记|短期记|只是临时|先记一阵)/;
 const MEMORY_CLEAR_IMPORTANCE_RE = /(取消重要|不重要了|不用特别记|别当成重要|不算重要|不是重点)/;
 const MEMORY_CONTROL_PREFIX_RE = /^sudo(?:\s+|[：:]\s*)([\s\S]*)$/i;
+const GENERIC_SELF_MEMORY_RECALL_RE = /你[^。！？!?]{0,24}(?:有什么|有哪些|什么)[^。！？!?]{0,24}(?:习惯|特点|性格|相处方式|说过)/;
 const LOW_SIGNAL_RETRIEVAL_TOKENS = new Set([
   "今天",
   "明天",
@@ -237,7 +238,7 @@ function loadState(): AsukaMemoryStateFile {
   }
 }
 
-function saveState(): void {
+function saveState(options: { syncWiki?: boolean } = {}): void {
   if (!cache.state) return;
   try {
     fs.mkdirSync(MEMORY_DIR, { recursive: true });
@@ -245,7 +246,9 @@ function saveState(): void {
   } catch (error) {
     console.error(`[asuka-memory] Failed to save memory: ${error}`);
   }
-  syncAsukaMemoryWiki(Object.values(cache.state.memories));
+  if (options.syncWiki !== false) {
+    syncAsukaMemoryWiki(Object.values(cache.state.memories));
+  }
 }
 
 function sanitizeMemoryText(text: string | undefined): string {
@@ -1760,7 +1763,7 @@ export function handleAsukaMemoryControlMessage(
 
   if (intent.action === "list") {
     const memories = getActivePeerMemories(state, peerKey, at);
-    saveState();
+    saveState({ syncWiki: false });
     return {
       handled: true,
       action: "list",
@@ -1843,7 +1846,7 @@ export function handleAsukaMemoryControlMessage(
   }
 
   if (!intent.query) {
-    saveState();
+    saveState({ syncWiki: false });
     return {
       handled: true,
       action: "forget",
@@ -1870,17 +1873,20 @@ export function buildAsukaLongTermMemoryPrompt(
   now = Date.now(),
 ): string {
   if (context.peerKind !== "direct") return "";
-  if (isAsukaMemoryWikiPrimary()) return "";
   const state = loadState();
   const peerKey = makePeerKey(context);
   maintainPeerMemories(state, peerKey, now);
   const queryTokens = new Set(tokenize(currentUserText));
+  const genericSelfRecall = GENERIC_SELF_MEMORY_RECALL_RE.test(currentUserText);
   const memories = getActivePeerMemories(state, peerKey, now)
-    .filter((item) => shouldIncludeMemoryInPrompt(item, queryTokens, now))
+    .filter((item) =>
+      shouldIncludeMemoryInPrompt(item, queryTokens, now)
+      || (genericSelfRecall && item.type === "asuka_self_signal")
+    )
     .sort((a, b) => scoreMemory(b, queryTokens, now) - scoreMemory(a, queryTokens, now));
 
   if (memories.length === 0) {
-    saveState();
+    saveState({ syncWiki: false });
     return "";
   }
 
@@ -1891,6 +1897,7 @@ export function buildAsukaLongTermMemoryPrompt(
   const selfSignals = memories.filter((item) => item.type === "asuka_self_signal" && getSelfSignalCategory(item));
   const lines = [
     "【Asuka 长期记忆】",
+    "- 这是当前运行时权威快照；若与历史摘要或 Wiki 历史声明冲突，以这里 active、未过期的记忆为准。",
     "- 这些记忆只用于当前私聊；不要在群聊或其他人面前透露。",
     "- 使用原则: 只在和本轮自然相关时轻轻带上，不要像背档案，也不要逐条复述。",
     "- 自我生活线只作为轻量连续性线索；不要把它扩写成完整履历、固定日程或无关新设定。",
@@ -1900,13 +1907,13 @@ export function buildAsukaLongTermMemoryPrompt(
     ...formatMemoryGroup("关系里的事", relationship, 3),
     ...formatMemoryGroup("未完话题", active, 2),
     ...formatMemoryGroup("我的最近生活线", selfThreads, 2),
-    ...formatSelfSignalMemoryGroup("我的长期性格和相处方式", selfSignals, 5),
+    ...formatSelfSignalMemoryGroup("我的长期性格和相处方式", selfSignals, 2),
   ];
 
   for (const item of memories.slice(0, 10)) {
     item.lastUsedAt = now;
   }
-  saveState();
+  saveState({ syncWiki: false });
 
   const prompt = lines.join("\n");
   return prompt.length > MAX_PROMPT_CHARS
