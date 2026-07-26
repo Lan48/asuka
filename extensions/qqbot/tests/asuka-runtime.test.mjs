@@ -10,6 +10,7 @@ process.env.USERPROFILE = tmpHome;
 const {
   buildLocalRuntimeHealthReport,
   formatLocalRuntimeHealthReport,
+  getDefaultInstalledOpenClawCronTargets,
   validateCronPatchText,
   validateRuntimeCronPatch,
 } = await import("../dist/src/runtime-diagnostics.js");
@@ -95,6 +96,64 @@ assert.equal(installedBadReport.targets[1].status, "fail", "bad installed bundle
 assert.ok(
   installedBadReport.targets[1].reasons.some((reason) => reason.startsWith("missing-snippet:")),
   "bad installed bundle should include missing snippet reasons"
+);
+
+const discoveredStateDir = path.join(fixtureDir, "discovered-state");
+const homeLibPackageRoot = path.join(discoveredStateDir, "lib", "node_modules", "openclaw");
+const toolsPackageRoot = path.join(discoveredStateDir, "tools", "node-v22.22.0", "lib", "node_modules", "openclaw");
+for (const packageRoot of [homeLibPackageRoot, toolsPackageRoot]) {
+  fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.7.1-2" }));
+}
+fs.writeFileSync(path.join(homeLibPackageRoot, "dist", "gateway-cli-home.js"), goodPatch);
+fs.writeFileSync(path.join(toolsPackageRoot, "dist", "isolated-agent-tools.js"), goodPatch);
+fs.writeFileSync(
+  path.join(toolsPackageRoot, "dist", "isolated-agent-wrapper.js"),
+  'export { runCronIsolatedAgentTurn } from "./isolated-agent-tools.js";\n'
+);
+
+const discoveredTargets = getDefaultInstalledOpenClawCronTargets(
+  tmpHome,
+  { OPENCLAW_STATE_DIR: discoveredStateDir },
+  path.join(fixtureDir, "unrelated-bin", "node")
+);
+assert.deepEqual(
+  discoveredTargets.map((target) => target.kind).sort(),
+  ["home_lib_openclaw", "tools_openclaw"],
+  "runtime discovery should include both compatibility home and actual tools OpenClaw packages"
+);
+assert.equal(
+  discoveredTargets.find((target) => target.kind === "tools_openclaw")?.bundlePaths.length,
+  1,
+  "runtime discovery should select the cron implementation bundle and ignore re-export wrappers"
+);
+
+const discoveredReport = validateRuntimeCronPatch({
+  vendoredRunnerPath: vendoredGood,
+  includeInstalled: true,
+  homeDir: tmpHome,
+  env: { OPENCLAW_STATE_DIR: discoveredStateDir },
+  execPath: path.join(fixtureDir, "unrelated-bin", "node"),
+});
+assert.equal(discoveredReport.status, "pass", "discovered home and tools runtime bundles should both validate");
+assert.equal(discoveredReport.targets.length, 3, "report should include vendored, home, and tools cron implementations");
+
+const unsupportedPackageRoot = path.join(fixtureDir, "unsupported-openclaw");
+fs.mkdirSync(path.join(unsupportedPackageRoot, "dist"), { recursive: true });
+fs.writeFileSync(path.join(unsupportedPackageRoot, "package.json"), JSON.stringify({ name: "openclaw", version: "future" }));
+fs.writeFileSync(path.join(unsupportedPackageRoot, "dist", "gateway-cli-future.js"), "export const unrelated = true;\n");
+const unsupportedDiscovery = validateRuntimeCronPatch({
+  vendoredRunnerPath: vendoredGood,
+  includeInstalled: true,
+  installedRequired: false,
+  homeDir: tmpHome,
+  env: { OPENCLAW_RUNTIME_ROOTS: unsupportedPackageRoot },
+  execPath: path.join(fixtureDir, "unrelated-bin", "node"),
+});
+assert.equal(unsupportedDiscovery.status, "fail", "a discovered OpenClaw package with unknown bundle anchors must fail closed");
+assert.ok(
+  unsupportedDiscovery.targets.some((target) => target.reasons.includes("cron-implementation-bundle-not-found")),
+  "unknown OpenClaw bundle layout should include an actionable discovery reason"
 );
 
 const realVendored = validateRuntimeCronPatch({ includeInstalled: false });

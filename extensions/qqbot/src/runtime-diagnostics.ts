@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export type RuntimeCronPatchTargetKind = "vendored_clawdbot" | "installed_openclaw";
+export type RuntimeCronPatchTargetKind =
+  | "vendored_clawdbot"
+  | "tools_openclaw"
+  | "home_lib_openclaw"
+  | "installed_openclaw";
 export type RuntimeCronPatchStatus = "pass" | "fail" | "missing";
 export type RuntimeCronPatchOverallStatus = "pass" | "fail";
 
@@ -28,7 +32,16 @@ export interface RuntimeCronPatchOptions {
   includeInstalled?: boolean;
   installedRequired?: boolean;
   homeDir?: string;
+  env?: Record<string, string | undefined>;
+  execPath?: string;
   now?: Date;
+}
+
+export interface InstalledOpenClawCronTarget {
+  kind: Exclude<RuntimeCronPatchTargetKind, "vendored_clawdbot">;
+  label: string;
+  packageRoot: string;
+  bundlePaths: string[];
 }
 
 export type LocalRuntimeHealthStatus = "pass" | "warn" | "fail";
@@ -114,7 +127,10 @@ const REQUIRED_CRON_PATCH_SNIPPETS: PatchSnippet[] = [
   { id: "payload-validator", pattern: /validateCronPayloadText/ },
   { id: "exact-forward-extractor", pattern: /extractExactForwardMessage/ },
   { id: "direct-forward-branch", pattern: /exactForward\.matched/ },
-  { id: "direct-output-delivery", pattern: /payloads:\s*\[\{\s*text:\s*outputText\s*\}\]/ },
+  {
+    id: "direct-output-delivery",
+    pattern: /(?:deliveryPayloads|payloads):\s*\[\{\s*text:\s*outputText\s*\}\]/,
+  },
 ];
 
 function getPackageRoot(): string {
@@ -141,13 +157,100 @@ export function getDefaultVendoredCronRunnerPath(): string {
   );
 }
 
-export function getDefaultInstalledGatewayBundlePaths(homeDir = os.homedir()): string[] {
-  const distDir = path.join(homeDir, ".openclaw", "lib", "node_modules", "openclaw", "dist");
+const OPENCLAW_PACKAGE_RELATIVE_PATHS = [
+  ["lib", "node_modules", "openclaw"],
+  ["node_modules", "openclaw"],
+];
+const OPENCLAW_BUNDLE_NAME_RE = /^(?:gateway-cli|isolated-agent)-.*\.js$/;
+const OPENCLAW_RUN_FUNCTION_RE = /(?:export\s+)?async function runCronIsolatedAgentTurn\(params\) \{/;
+
+function addOpenClawRootsUnderTools(roots: Set<string>, toolsDir: string): void {
+  if (!fs.existsSync(toolsDir)) return;
+  for (const relativeParts of OPENCLAW_PACKAGE_RELATIVE_PATHS) {
+    roots.add(path.join(toolsDir, ...relativeParts));
+  }
+  for (const entry of fs.readdirSync(toolsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    for (const relativeParts of OPENCLAW_PACKAGE_RELATIVE_PATHS) {
+      roots.add(path.join(toolsDir, entry.name, ...relativeParts));
+    }
+  }
+}
+
+function findCronImplementationBundles(packageRootPath: string): string[] {
+  const distDir = path.join(packageRootPath, "dist");
   if (!fs.existsSync(distDir)) return [];
   return fs.readdirSync(distDir)
-    .filter((entry) => /^gateway-cli-.*\.js$/.test(entry))
+    .filter((entry) => OPENCLAW_BUNDLE_NAME_RE.test(entry))
     .sort()
-    .map((entry) => path.join(distDir, entry));
+    .map((entry) => path.join(distDir, entry))
+    .filter((bundlePath) => {
+      try {
+        return OPENCLAW_RUN_FUNCTION_RE.test(fs.readFileSync(bundlePath, "utf8"));
+      } catch {
+        return false;
+      }
+    });
+}
+
+export function getDefaultInstalledOpenClawCronTargets(
+  homeDir = os.homedir(),
+  env: Record<string, string | undefined> = process.env,
+  execPath = process.execPath
+): InstalledOpenClawCronTarget[] {
+  const stateDir = env.OPENCLAW_STATE_DIR?.trim() || path.join(homeDir, ".openclaw");
+  const homeLibRoot = path.join(stateDir, "lib", "node_modules", "openclaw");
+  const toolsRoots = new Set<string>();
+  addOpenClawRootsUnderTools(toolsRoots, env.OPENCLAW_TOOLS_DIR?.trim() || path.join(stateDir, "tools"));
+
+  const executableDir = path.dirname(execPath);
+  for (const relativeParts of OPENCLAW_PACKAGE_RELATIVE_PATHS) {
+    toolsRoots.add(path.join(executableDir, ...relativeParts));
+  }
+  toolsRoots.add(path.resolve(executableDir, "..", "lib", "node_modules", "openclaw"));
+
+  const explicitRoots = String(env.OPENCLAW_RUNTIME_ROOTS ?? "")
+    .split(path.delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const candidates: Array<{
+    kind: InstalledOpenClawCronTarget["kind"];
+    label: string;
+    packageRoot: string;
+  }> = [
+    { kind: "home_lib_openclaw", label: "OpenClaw compatibility home runtime", packageRoot: homeLibRoot },
+    ...[...toolsRoots].map((packageRoot) => ({
+      kind: "tools_openclaw" as const,
+      label: "OpenClaw tools runtime",
+      packageRoot,
+    })),
+    ...explicitRoots.map((packageRoot) => ({
+      kind: "installed_openclaw" as const,
+      label: "Explicit OpenClaw runtime",
+      packageRoot,
+    })),
+  ];
+
+  const seen = new Set<string>();
+  return candidates
+    .filter((candidate) => fs.existsSync(path.join(candidate.packageRoot, "package.json")))
+    .filter((candidate) => {
+      const normalized = path.resolve(candidate.packageRoot);
+      if (seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    })
+    .map((candidate) => ({
+      ...candidate,
+      bundlePaths: findCronImplementationBundles(candidate.packageRoot),
+    }))
+    .sort((left, right) => left.packageRoot.localeCompare(right.packageRoot));
+}
+
+export function getDefaultInstalledGatewayBundlePaths(homeDir = os.homedir()): string[] {
+  return getDefaultInstalledOpenClawCronTargets(homeDir)
+    .flatMap((target) => target.bundlePaths);
 }
 
 function getDefaultOpenClawConfigCandidatePaths(env: Record<string, string | undefined>): string[] {
@@ -515,32 +618,60 @@ export function validateRuntimeCronPatch(options: RuntimeCronPatchOptions = {}):
   ];
 
   if (includeInstalled) {
-    const installedPaths = options.installedGatewayPaths ?? getDefaultInstalledGatewayBundlePaths(options.homeDir);
-    if (installedPaths.length === 0) {
+    const explicitInstalledPaths = options.installedGatewayPaths;
+    const discoveredTargets = explicitInstalledPaths !== undefined
+      ? explicitInstalledPaths.length > 0
+        ? [{
+            kind: "installed_openclaw" as const,
+            label: "Installed OpenClaw gateway bundle",
+            packageRoot: "",
+            bundlePaths: explicitInstalledPaths,
+          }]
+        : []
+      : getDefaultInstalledOpenClawCronTargets(
+          options.homeDir,
+          options.env ?? process.env,
+          options.execPath ?? process.execPath
+        );
+    if (discoveredTargets.length === 0) {
       targets.push({
         kind: "installed_openclaw",
-        label: "Installed OpenClaw gateway bundle",
+        label: "Installed OpenClaw cron bundle",
         path: path.join(
           options.homeDir ?? os.homedir(),
           ".openclaw",
-          "lib",
+          "{tools,lib}",
+          "**",
           "node_modules",
           "openclaw",
           "dist",
-          "gateway-cli-*.js"
+          "{gateway-cli,isolated-agent}-*.js"
         ),
         required: installedRequired,
         status: "missing",
         reasons: ["optional-installed-bundle-missing"],
       });
     } else {
-      for (const gatewayPath of installedPaths) {
-        targets.push(validateCronPatchFile(
-          "installed_openclaw",
-          "Installed OpenClaw gateway bundle",
-          gatewayPath,
-          installedRequired
-        ));
+      for (const discovered of discoveredTargets) {
+        if (discovered.bundlePaths.length === 0) {
+          targets.push({
+            kind: discovered.kind,
+            label: discovered.label,
+            path: path.join(discovered.packageRoot, "dist", "{gateway-cli,isolated-agent}-*.js"),
+            required: true,
+            status: "fail",
+            reasons: ["cron-implementation-bundle-not-found"],
+          });
+          continue;
+        }
+        for (const bundlePath of discovered.bundlePaths) {
+          targets.push(validateCronPatchFile(
+            discovered.kind,
+            discovered.label,
+            bundlePath,
+            installedRequired
+          ));
+        }
       }
     }
   }

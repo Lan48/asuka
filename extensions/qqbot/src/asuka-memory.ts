@@ -5,6 +5,7 @@ import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
 import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
 import { getQQBotDataDir } from "./utils/platform.js";
+import { isAsukaMemoryWikiPrimary, syncAsukaMemoryWiki } from "./asuka-memory-wiki.js";
 
 type AsukaMemoryType =
   | "user_profile"
@@ -99,6 +100,7 @@ const PREFERENCE_RE = /(我喜欢|我偏好|我更喜欢|我希望|我想要|我
 const BOUNDARY_RE = /(我不喜欢|我讨厌|不要|别再|别叫|不想|雷点|介意|不舒服|别提|不要再)/;
 const RELATIONSHIP_RE = /(我们|上次|那次|之前|一起|约定|拉钩|纪念|吵架|和好|想你|喜欢你|爱你)/;
 const ACTIVE_THREAD_RE = /(最近|这几天|这周|今天|明天|回头|继续|下次|等会|一会|待会|正在|准备|计划)/;
+const RESIDENCE_RE = /(住在|住所|家在|宿舍|暂住|临时住|短住|借住|搬到|搬家|现在在|目前在|此刻在)/;
 const ASUKA_SELF_THREAD_RE = /(我(最近|这几天|这周|今天|明天|现在|刚刚|等会|准备|正在).*(上课|自习|作业|课题|拍照|拍视频|剪视频|咖啡|宿舍|学校|校园|西湖|湖滨|运河|雨|散步|电影|音乐|练舞|整理|复习|画面|镜头|照片))/;
 const ASUKA_SELF_SIGNAL_RE = /我(其实|还是|一直|会|更|不太|有点|真的)?[^。！？!?]{0,80}(喜欢|更喜欢|愿意|更愿意|不喜欢|习惯|在意|怕|介意|想靠近|想离你近|会想你|想陪着你|不想敷衍|想认真对你)/;
 const ASUKA_SELF_SIGNAL_STABLE_RE = /(一直|总是|通常|习惯|更喜欢|不喜欢|不太喜欢|不想|不会|会认真|不想敷衍|认真对你|慢慢|稳定|每次|以后)/;
@@ -176,6 +178,7 @@ function saveState(): void {
   } catch (error) {
     console.error(`[asuka-memory] Failed to save memory: ${error}`);
   }
+  syncAsukaMemoryWiki(Object.values(cache.state.memories));
 }
 
 function sanitizeMemoryText(text: string | undefined): string {
@@ -210,7 +213,7 @@ function classifyUserMemory(text: string, at: number): {
   if (BOUNDARY_RE.test(text)) {
     return { type: "boundary", source: explicit ? "user_explicit" : "user_inferred", salience: explicit ? 10 : 8, confidence: explicit ? 0.95 : 0.78 };
   }
-  if (USER_PROFILE_RE.test(text)) {
+  if (USER_PROFILE_RE.test(text) || RESIDENCE_RE.test(text)) {
     return { type: "user_profile", source: explicit ? "user_explicit" : "user_inferred", salience: explicit ? 10 : 8, confidence: explicit ? 0.95 : 0.76 };
   }
   if (PREFERENCE_RE.test(text)) {
@@ -458,7 +461,11 @@ function deriveMemoryKey(type: AsukaMemoryType, text: string): string | undefine
     if (/生日/.test(text)) return "user:birthday";
     if (/纪念日/.test(text)) return "user:anniversary";
     if (/时区/.test(text)) return "user:timezone";
-    if (/(城市|住在|在.*工作|在.*上学|学校|公司)/.test(text)) return "user:location";
+    if (/(计划|准备|打算|将要|未来|下月|之后).*(搬|住)/.test(text)) return "user:residence:plan";
+    if (/(暂住|临时住|短住|借住|住一阵|暑假.*住)/.test(text)) return "user:residence:temporary-stay";
+    if (/(?:现在|目前|此刻|刚刚?)在(?!.*(?:住|宿舍|家))/.test(text)) return "user:residence:current-presence";
+    if (/(住在|住所|家在|搬到|宿舍)/.test(text)) return "user:residence:home-base";
+    if (/(城市|在.*工作|在.*上学|学校|公司)/.test(text)) return "user:location";
   }
   if (type === "preference") {
     if (/(称呼|叫我|名字)/.test(text)) return "preference:address";
@@ -1204,7 +1211,9 @@ function forgetMatchingMemories(state: AsukaMemoryStateFile, peerKey: string, qu
     .slice(0, 5);
 
   for (const { item } of matches) {
-    delete state.memories[item.id];
+    item.status = "forgotten";
+    item.forgottenAt = now;
+    item.updatedAt = now;
   }
   return matches.length;
 }
@@ -1323,7 +1332,9 @@ export function handleAsukaMemoryControlMessage(
   if (intent.all) {
     const active = getActivePeerMemories(state, peerKey, at);
     for (const item of active) {
-      delete state.memories[item.id];
+      item.status = "forgotten";
+      item.forgottenAt = at;
+      item.updatedAt = at;
     }
     saveState();
     return {
@@ -1362,6 +1373,7 @@ export function buildAsukaLongTermMemoryPrompt(
   now = Date.now(),
 ): string {
   if (context.peerKind !== "direct") return "";
+  if (isAsukaMemoryWikiPrimary()) return "";
   const state = loadState();
   const peerKey = makePeerKey(context);
   maintainPeerMemories(state, peerKey, now);

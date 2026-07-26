@@ -10,6 +10,8 @@ process.env.USERPROFILE = tmpHome;
 const dayMs = 24 * 60 * 60 * 1000;
 const base = Date.UTC(2026, 3, 26, 0, 0, 0);
 const memoryFile = path.join(tmpHome, ".openclaw", "qqbot", "data", "asuka-memory", "memory.json");
+const memoryWikiDir = path.join(tmpHome, "Asuka", "Memory");
+process.env.ASUKA_MEMORY_WIKI_DIR = memoryWikiDir;
 
 const direct = {
   accountId: "acct-test",
@@ -38,6 +40,14 @@ function assertExcludes(value, fragment, label) {
 
 function readMemoryState() {
   return JSON.parse(fs.readFileSync(memoryFile, "utf-8"));
+}
+
+function readWikiClaims() {
+  return fs.readFileSync(path.join(memoryWikiDir, "claims.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 function setSelfSignalVerdict(verdict) {
@@ -133,12 +143,50 @@ try {
     "热美式",
     "forgotten memory should not be recalled",
   );
+  const forgottenCoffee = readWikiClaims().find((claim) => claim.value.includes("热美式"));
+  assert.equal(forgottenCoffee?.status, "forgotten", "forgotten memory should be retained as a wiki claim");
 
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我住在杭州。", base + 9_000), true);
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我住在上海。", base + 10_000), true);
   const locationPrompt = buildAsukaLongTermMemoryPrompt(direct, "你还记得我住哪吗", base + 11_000);
   assertIncludes(locationPrompt, "上海", "newer location should be recalled");
   assertExcludes(locationPrompt, "杭州", "superseded location should not be recalled");
+  const residenceClaims = readWikiClaims().filter((claim) => claim.property === "residence");
+  const hangzhouClaim = residenceClaims.find((claim) => claim.value.includes("杭州"));
+  const shanghaiClaim = residenceClaims.find((claim) => claim.value.includes("上海"));
+  assert.equal(hangzhouClaim?.scope, "home-base", "ordinary residence should use home-base scope");
+  assert.equal(hangzhouClaim?.status, "superseded", "old home-base should remain in residence history");
+  assert.equal(shanghaiClaim?.status, "current", "new home-base should be current");
+  assert.deepEqual(shanghaiClaim?.supersedes, [hangzhouClaim?.id], "new home-base should link to the superseded claim");
+
+  assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我暑假暂住苏州。", base + 10_100), true);
+  assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我现在在南京。", base + 10_200), true);
+  assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我计划下月搬到北京。", base + 10_300), true);
+  const scopedResidenceClaims = readWikiClaims().filter((claim) => claim.property === "residence");
+  assert.equal(
+    scopedResidenceClaims.find((claim) => claim.value.includes("苏州"))?.scope,
+    "temporary-stay",
+    "temporary residence should not replace home-base",
+  );
+  assert.equal(
+    scopedResidenceClaims.find((claim) => claim.value.includes("南京"))?.scope,
+    "current-presence",
+    "current presence should stay separate from residence",
+  );
+  assert.equal(
+    scopedResidenceClaims.find((claim) => claim.value.includes("北京"))?.status,
+    "planned",
+    "future move should be a planned claim",
+  );
+
+  const claimsMarkdown = path.join(memoryWikiDir, "Claims.md");
+  const withManualNotes = fs.readFileSync(claimsMarkdown, "utf-8").replace(
+    "<!-- ASUKA_MEMORY_NOTES_START -->\n",
+    "<!-- ASUKA_MEMORY_NOTES_START -->\n这段人工笔记必须保留。\n",
+  );
+  fs.writeFileSync(claimsMarkdown, withManualNotes, "utf-8");
+  assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢茉莉花茶。", base + 10_400), true);
+  assertIncludes(fs.readFileSync(claimsMarkdown, "utf-8"), "这段人工笔记必须保留", "wiki sync must preserve manual Notes");
 
   assert.equal(
     handleAsukaMemoryControlMessage(direct, "看看记忆分类", base + 11_200).handled,
@@ -420,6 +468,72 @@ try {
     "",
     "group proactive prompt must not include direct memory",
   );
+
+  process.env.ASUKA_MEMORY_WIKI_PRIMARY = "1";
+  assertIncludes(
+    buildAsukaLongTermMemoryPrompt(direct, "上海天气", base + 16_500),
+    "上海",
+    "pending Wiki compilation should keep the legacy prompt as an immediate fallback",
+  );
+  fs.mkdirSync(path.join(memoryWikiDir, ".openclaw-wiki", "cache"), { recursive: true });
+  fs.writeFileSync(
+    path.join(memoryWikiDir, ".openclaw-wiki", "cache", "agent-digest.json"),
+    "{}\n",
+    "utf-8",
+  );
+  fs.rmSync(path.join(memoryWikiDir, ".asuka-memory-pending"));
+  assert.equal(
+    buildAsukaLongTermMemoryPrompt(direct, "上海天气", base + 16_500),
+    "",
+    "primary Memory Wiki mode should suppress legacy reply prompt injection",
+  );
+  assert.equal(
+    buildAsukaProactiveMemoryPrompt(direct, "上海天气", base + 16_500),
+    "",
+    "primary Memory Wiki mode should suppress legacy proactive prompt injection",
+  );
+  assert.equal(
+    recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢白桃乌龙。", base + 16_600),
+    true,
+    "primary Memory Wiki mode should keep writing legacy memory",
+  );
+  assert.ok(
+    Object.values(readMemoryState().memories).some((item) => item.text.includes("白桃乌龙")),
+    "primary Memory Wiki mode should retain the legacy memory.json rollback copy",
+  );
+  assert.ok(
+    readWikiClaims().some((claim) => claim.value.includes("白桃乌龙")),
+    "primary Memory Wiki mode should continue writing Wiki claims",
+  );
+  assertIncludes(
+    buildAsukaLongTermMemoryPrompt(direct, "白桃乌龙", base + 16_650),
+    "白桃乌龙",
+    "a new pending Wiki write should immediately fall back to legacy recall until compile",
+  );
+  delete process.env.ASUKA_MEMORY_WIKI_PRIMARY;
+
+  const invalidWikiTarget = path.join(tmpHome, "wiki-target-is-a-file");
+  fs.writeFileSync(invalidWikiTarget, "not a directory", "utf-8");
+  process.env.ASUKA_MEMORY_WIKI_DIR = invalidWikiTarget;
+  process.env.ASUKA_MEMORY_WIKI_PRIMARY = "1";
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    assertIncludes(
+      buildAsukaLongTermMemoryPrompt(direct, "白桃乌龙", base + 16_700),
+      "白桃乌龙",
+      "invalid Wiki directory should fall back to legacy prompt injection",
+    );
+    assert.equal(
+      recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢桂花茶。", base + 17_000),
+      true,
+      "wiki write failure must not block the legacy memory write or QQ reply path",
+    );
+  } finally {
+    console.error = originalConsoleError;
+    process.env.ASUKA_MEMORY_WIKI_DIR = memoryWikiDir;
+    delete process.env.ASUKA_MEMORY_WIKI_PRIMARY;
+  }
 
   console.log("[qqbot:test] asuka-memory fixtures passed");
 } finally {

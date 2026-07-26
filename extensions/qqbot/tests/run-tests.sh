@@ -34,6 +34,7 @@ node tests/asuka-repair.test.mjs
 node tests/asuka-scene-v2.test.mjs
 node tests/asuka-scene-continuity.test.mjs
 node tests/asuka-runtime.test.mjs
+node tests/runtime-cron-patch.test.mjs
 node tests/asuka-tts.test.mjs
 node tests/asuka-vision.test.mjs
 node tests/asuka-search.test.mjs
