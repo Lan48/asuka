@@ -457,7 +457,7 @@ function renderLegacyRedirect(current: string): string {
     LEGACY_REDIRECT_MARKER,
     "# Asuka Memory Context (Migrated)",
     "",
-    "The generated memory view has moved to the [[index|memory topic index]] in this folder.",
+    "The generated memory view has moved to the topic pages in this folder.",
     "",
     "<details>",
     "<summary>Preserved pre-migration page</summary>",
