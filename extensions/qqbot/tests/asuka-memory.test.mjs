@@ -15,6 +15,28 @@ const compiledResidenceFile = path.join(memoryWikiDir, "entities", "residence-lo
 const compiledRelationshipFile = path.join(memoryWikiDir, "entities", "relationship-state.md");
 const compiledSourceFile = path.join(memoryWikiDir, "sources", "asuka-memory-jsonl.md");
 process.env.ASUKA_MEMORY_WIKI_DIR = memoryWikiDir;
+process.env.ASUKA_USER_MEMORY_TEST_TIMEOUT_MS = "10";
+process.env.OPENCLAW_CONFIG_PATH = path.join(tmpHome, "openclaw.json");
+fs.writeFileSync(process.env.OPENCLAW_CONFIG_PATH, JSON.stringify({
+  models: {
+    providers: {
+      test: {
+        baseUrl: "https://memory-model.invalid/v1",
+        apiKey: "test-only",
+        api: "openai-completions",
+        models: [{ id: "test-memory-model" }],
+      },
+    },
+  },
+  channels: {
+    qqbot: {
+      sceneInference: {
+        primaryModel: "test/test-memory-model",
+        fallbackModel: "test/test-memory-model",
+      },
+    },
+  },
+}), "utf-8");
 
 const direct = {
   accountId: "acct-test",
@@ -64,6 +86,7 @@ try {
     handleAsukaMemoryControlMessage,
     recordAsukaLongTermMemoryFromAssistantReply,
     recordAsukaLongTermMemoryFromUserMessage,
+    recordAsukaLongTermMemoryFromUserMessageWithModel,
   } = await import("../dist/src/asuka-memory.js");
 
   assert.equal(
@@ -136,6 +159,414 @@ try {
     true,
     "别忘了 command should be captured",
   );
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [
+      {
+        action: "add",
+        type: "user_profile",
+        slot: "residence_temporary",
+        canonicalText: "用户接下来一段时间暂住成都。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: true,
+        confidence: 0.91,
+        targetMemoryIds: [],
+        evidence: "接下来一段时间我落脚成都",
+      },
+      {
+        action: "add",
+        type: "preference",
+        slot: "preference_reply_style",
+        canonicalText: "用户希望回复简短一些。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: false,
+        confidence: 0.9,
+        targetMemoryIds: [],
+        evidence: "回消息短一点就好",
+      },
+    ],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(
+      direct,
+      "接下来一段时间我落脚成都，回消息短一点就好。",
+      base + 3_500,
+    ),
+    true,
+    "model extraction should capture multiple naturally phrased facts",
+  );
+  const modelMemories = Object.values(readMemoryState().memories);
+  assert.ok(modelMemories.some((item) => item.text === "用户接下来一段时间暂住成都。"), "natural residence paraphrase should be stored");
+  assert.ok(modelMemories.some((item) => item.text === "用户希望回复简短一些。"), "second fact in one message should be stored");
+  const temporaryResidence = modelMemories.find((item) => item.text === "用户接下来一段时间暂住成都。");
+  const replyPreference = modelMemories.find((item) => item.text === "用户希望回复简短一些。");
+  assert.equal(temporaryResidence?.userMemorySlot, "residence_temporary");
+  assert.equal(temporaryResidence?.userMemoryEvidence, "接下来一段时间我落脚成都");
+  assert.equal(temporaryResidence?.extractionVersion, 2);
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "replace",
+      type: "user_profile",
+      slot: "residence_temporary",
+      canonicalText: "用户接下来一段时间暂住重庆。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: true,
+      confidence: 0.91,
+      targetMemoryIds: [replyPreference.id],
+      evidence: "改去重庆落脚",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "后来改去重庆落脚。", base + 3_510),
+    false,
+    "replace target must belong to the same structured slot",
+  );
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "add",
+      type: "user_profile",
+      slot: "residence_temporary",
+      canonicalText: "用户接下来一段时间暂住重庆。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: true,
+      confidence: 0.91,
+      targetMemoryIds: [],
+      evidence: "改去重庆落脚",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "后来改去重庆落脚。", base + 3_520),
+    false,
+    "add must not silently supersede an existing structured slot",
+  );
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "replace",
+      type: "user_profile",
+      slot: "residence_temporary",
+      canonicalText: "用户接下来一段时间暂住重庆。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: true,
+      confidence: 0.91,
+      targetMemoryIds: [temporaryResidence.id],
+      evidence: "改去重庆落脚",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "后来改去重庆落脚。", base + 3_530),
+    true,
+    "high-confidence replace should supersede the matching structured slot",
+  );
+  const afterResidenceReplace = Object.values(readMemoryState().memories);
+  assert.equal(afterResidenceReplace.find((item) => item.id === temporaryResidence.id)?.status, "superseded");
+  assert.ok(afterResidenceReplace.some((item) => item.text === "用户接下来一段时间暂住重庆。"));
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "update",
+      type: "preference",
+      slot: "preference_reply_style",
+      canonicalText: "用户希望回复再精简一点。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: false,
+      confidence: 0.83,
+      targetMemoryIds: [replyPreference.id],
+      evidence: "回复再精简一点",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "以后回复再精简一点。", base + 3_540),
+    true,
+  );
+  assert.equal(
+    Object.values(readMemoryState().memories).find((item) => item.id === replyPreference.id)?.confidence,
+    0.83,
+    "update confidence should describe the new extracted fact rather than inherit an old score",
+  );
+
+  const locationDirect = { ...direct, peerId: "location-peer", senderId: "location-peer" };
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "add",
+      type: "user_profile",
+      slot: "current_location",
+      canonicalText: "用户当前在江边。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: false,
+      confidence: 0.9,
+      targetMemoryIds: [],
+      evidence: "我现在在江边",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(locationDirect, "我现在在江边。", base + 3_550),
+    true,
+  );
+  const currentLocation = Object.values(readMemoryState().memories)
+    .find((item) => item.peerId === "location-peer" && item.userMemorySlot === "current_location");
+  assert.equal(currentLocation?.temporary, true, "current location must be temporary even if the model says otherwise");
+  assert.ok(currentLocation?.expiresAt > base + 3_550);
+
+  for (const [index, sample] of [
+    ["我朋友搬到青岛了。", "我朋友搬到青岛了"],
+    ["我已经不住厦门了。", "不住厦门了"],
+  ].entries()) {
+    process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({ memories: [] });
+    const countBefore = Object.keys(readMemoryState().memories).length;
+    assert.equal(
+      await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, sample[0], base + 3_600 + index),
+      false,
+      `third-person or negated non-fact should be ignored: ${sample[1]}`,
+    );
+    assert.equal(Object.keys(readMemoryState().memories).length, countBefore);
+  }
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "add",
+      type: "unknown_type",
+      slot: "residence_home",
+      canonicalText: "用户常住西安。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: false,
+      confidence: 0.99,
+      targetMemoryIds: [],
+      evidence: "西安",
+    }],
+  });
+  const countBeforeInvalidVerdict = Object.keys(readMemoryState().memories).length;
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "最近搬到了西安。", base + 3_700),
+    false,
+    "invalid model schema must not be accepted",
+  );
+  assert.equal(Object.keys(readMemoryState().memories).length, countBeforeInvalidVerdict);
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "add",
+      type: "user_profile",
+      slot: "residence_home",
+      canonicalText: "我住西安。",
+      explicitIntent: false,
+      importance: "normal",
+      temporary: false,
+      confidence: 0.99,
+      targetMemoryIds: [],
+      evidence: "我住西安",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "我住西安。", base + 3_710),
+    false,
+    "canonical user facts must not use Asuka's first-person perspective",
+  );
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [{
+      action: "add",
+      type: "user_profile",
+      slot: "workplace",
+      canonicalText: "用户在星河实验室工作。",
+      explicitIntent: true,
+      importance: "normal",
+      temporary: false,
+      confidence: 0.6,
+      targetMemoryIds: [],
+      evidence: "最近在星河实验室工作",
+    }],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(
+      direct,
+      "最近在星河实验室工作。",
+      base + 3_750,
+    ),
+    false,
+    "model must not lower the threshold by inventing explicit intent",
+  );
+
+  const batchDirect = { ...direct, peerId: "batch-peer", senderId: "batch-peer" };
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [
+      {
+        action: "add",
+        type: "user_profile",
+        slot: "residence_home",
+        canonicalText: "用户常住甲地。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: false,
+        confidence: 0.9,
+        targetMemoryIds: [],
+        evidence: "甲地和乙地",
+      },
+      {
+        action: "add",
+        type: "user_profile",
+        slot: "residence_home",
+        canonicalText: "用户常住乙地。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: false,
+        confidence: 0.9,
+        targetMemoryIds: [],
+        evidence: "甲地和乙地",
+      },
+    ],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(batchDirect, "甲地和乙地是我两种说法。", base + 3_760),
+    true,
+  );
+  assert.equal(
+    Object.values(readMemoryState().memories)
+      .filter((item) => item.peerId === "batch-peer" && item.userMemorySlot === "residence_home" && item.status === "active")
+      .length,
+    1,
+    "one model batch must not create duplicate active values for a single-value slot",
+  );
+
+  const multiDirect = { ...direct, peerId: "multi-peer", senderId: "multi-peer" };
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = JSON.stringify({
+    memories: [
+      {
+        action: "add",
+        type: "active_thread",
+        slot: "active_commitment",
+        canonicalText: "用户准备续签证件。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: false,
+        confidence: 0.9,
+        targetMemoryIds: [],
+        evidence: "续签证件和预约体检",
+      },
+      {
+        action: "add",
+        type: "active_thread",
+        slot: "active_commitment",
+        canonicalText: "用户准备预约体检。",
+        explicitIntent: false,
+        importance: "normal",
+        temporary: false,
+        confidence: 0.9,
+        targetMemoryIds: [],
+        evidence: "续签证件和预约体检",
+      },
+    ],
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(multiDirect, "我要续签证件和预约体检。", base + 3_770),
+    true,
+  );
+  assert.equal(
+    Object.values(readMemoryState().memories)
+      .filter((item) => item.peerId === "multi-peer" && item.userMemorySlot === "active_commitment" && item.status === "active")
+      .length,
+    2,
+    "multi-value slots should retain distinct commitments",
+  );
+
+  process.env.ASUKA_USER_MEMORY_TEST_VERDICT = "__UNAVAILABLE__";
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "最近咖啡喝得有点多。", base + 3_800),
+    false,
+    "model failure must not fall back to broad implicit rules",
+  );
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "请记住我的项目代号是 Borealis。", base + 3_900),
+    true,
+    "model failure may use the narrow explicit-command fallback",
+  );
+  delete process.env.ASUKA_USER_MEMORY_TEST_VERDICT;
+  const originalFetch = globalThis.fetch;
+  let activeModelRequests = 0;
+  let maxActiveModelRequests = 0;
+  let modelRequestCount = 0;
+  globalThis.fetch = async () => {
+    modelRequestCount += 1;
+    activeModelRequests += 1;
+    maxActiveModelRequests = Math.max(maxActiveModelRequests, activeModelRequests);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    activeModelRequests -= 1;
+    return {
+      ok: true,
+      text: async () => JSON.stringify({
+        choices: [{ message: { content: "{\"memories\":[]}" } }],
+      }),
+    };
+  };
+  const queuedResults = await Promise.all([
+    recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "刚才路过江边。", base + 3_920),
+    recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "等会去买杯水。", base + 3_921),
+    recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "顺手买了本书。", base + 3_922),
+    recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "又看了一会窗外。", base + 3_923),
+  ]);
+  assert.equal(maxActiveModelRequests, 1, "model extraction must be serialized per peer");
+  assert.equal(modelRequestCount, 3, "implicit extraction queue should reject overflow instead of growing without bound");
+  assert.equal(queuedResults[3], false);
+
+  const raceDirect = { ...direct, peerId: "race-peer", senderId: "race-peer" };
+  globalThis.fetch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return {
+      ok: true,
+      text: async () => JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              memories: [{
+                action: "add",
+                type: "user_profile",
+                slot: "residence_home",
+                canonicalText: "用户常住海边。",
+                explicitIntent: false,
+                importance: "normal",
+                temporary: false,
+                confidence: 0.9,
+                targetMemoryIds: [],
+                evidence: "我现在住在海边",
+              }],
+            }),
+          },
+        }],
+      }),
+    };
+  };
+  const inFlightMemory = recordAsukaLongTermMemoryFromUserMessageWithModel(
+    raceDirect,
+    "我现在住在海边。",
+    base + 3_930,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.equal(handleAsukaMemoryControlMessage(raceDirect, "sudo 清空所有记忆", base + 3_931).handled, true);
+  assert.equal(await inFlightMemory, false, "forget control must invalidate in-flight memory extraction");
+  assert.equal(
+    Object.values(readMemoryState().memories).some((item) => item.peerId === "race-peer" && item.status === "active"),
+    false,
+  );
+
+  globalThis.fetch = async (_url, init) => await new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new Error("test timeout")), { once: true });
+  });
+  assert.equal(
+    await recordAsukaLongTermMemoryFromUserMessageWithModel(direct, "最近常常路过武汉。", base + 3_950),
+    false,
+    "model timeout must fail closed for an implicit memory candidate",
+  );
+  globalThis.fetch = originalFetch;
 
   assert.equal(
     handleAsukaMemoryControlMessage(direct, "你都记得我什么", base + 4_000).handled,

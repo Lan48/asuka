@@ -21,6 +21,9 @@ export interface AsukaMemoryWikiItem {
   salience?: number;
   temporary?: boolean;
   key?: string;
+  userMemorySlot?: string;
+  userMemoryEvidence?: string;
+  extractionVersion?: number;
   status?: "active" | "superseded" | "forgotten";
   supersededBy?: string;
   supersededAt?: number;
@@ -41,6 +44,9 @@ export interface AsukaMemoryWikiClaim {
   source: string;
   sourceKind?: string;
   memoryType?: string;
+  memorySlot?: string;
+  memoryEvidence?: string;
+  extractionVersion?: number;
   confidence: number;
   salience?: number;
   temporary?: boolean;
@@ -102,6 +108,10 @@ function iso(value: number | undefined): string | null {
 }
 
 function deriveScope(item: AsukaMemoryWikiItem): AsukaMemoryWikiScope {
+  if (item.userMemorySlot === "residence_plan") return "plan";
+  if (item.userMemorySlot === "residence_temporary") return "temporary-stay";
+  if (item.userMemorySlot === "current_location") return "current-presence";
+  if (item.userMemorySlot === "residence_home") return "home-base";
   const text = item.text;
   if (item.key === "user:residence:plan" || /(计划|准备|打算|将要|未来|下月|之后).*(搬|住)/.test(text)) {
     return "plan";
@@ -125,6 +135,7 @@ function deriveSubject(item: AsukaMemoryWikiItem): AsukaMemoryWikiClaim["subject
 }
 
 function deriveProperty(item: AsukaMemoryWikiItem, scope: AsukaMemoryWikiScope): string {
+  if (item.userMemorySlot) return item.userMemorySlot;
   if (scope !== "general") return "residence";
   if (item.type === "active_thread") return "active_thread";
   if (item.key) return item.key.replace(/^(?:user|asuka):/, "");
@@ -156,6 +167,9 @@ function toClaim(item: AsukaMemoryWikiItem, allItems: AsukaMemoryWikiItem[]): As
     source: item.sourceMessageId ?? item.source,
     sourceKind: item.source,
     memoryType: item.type,
+    memorySlot: item.userMemorySlot,
+    memoryEvidence: item.userMemoryEvidence,
+    extractionVersion: item.extractionVersion,
     confidence: item.confidence,
     salience: item.salience,
     temporary: item.temporary,
@@ -246,6 +260,9 @@ function claimEvidenceNote(claim: AsukaMemoryWikiClaim): string {
     sourceStatus: claim.status,
     sourceKind: claim.sourceKind,
     memoryType: claim.memoryType,
+    memorySlot: claim.memorySlot,
+    memoryEvidence: claim.memoryEvidence,
+    extractionVersion: claim.extractionVersion,
     salience: claim.salience,
     temporary: claim.temporary,
   });
@@ -271,6 +288,17 @@ function mergeHumanNotes(...notes: string[]): string {
 }
 
 function topicForClaim(claim: AsukaMemoryWikiClaim): string {
+  if (claim.extractionVersion === 2 && claim.memorySlot) {
+    if (["residence_home", "residence_temporary", "current_location", "residence_plan", "workplace", "school"].includes(claim.memorySlot)) {
+      return "residence-location-timeline";
+    }
+    if (claim.memorySlot === "relationship_status") return "relationship-state";
+    if (claim.memorySlot.startsWith("preference_") || claim.memorySlot.startsWith("boundary_")) {
+      return "preferences-boundaries";
+    }
+    if (claim.memorySlot === "active_commitment") return "commitments-todos";
+    return "user-basics";
+  }
   if (claim.property === "explicit") {
     if (STABLE_RELATIONSHIP_RE.test(claim.value)) return "relationship-state";
     if (STABLE_RESIDENCE_RE.test(claim.value)) return "residence-location-timeline";
@@ -325,6 +353,11 @@ export function isDurableClaim(claim: AsukaMemoryWikiClaim): boolean {
     || LOW_INFORMATION_CLAIM_RE.test(claim.value.trim())
     || NON_ASSERTIVE_CLAIM_RE.test(claim.value)
   ) return false;
+  if (claim.extractionVersion === 2 && claim.memorySlot) {
+    if (claim.subject === "asuka") return false;
+    const threshold = claim.sourceKind === "user_explicit" ? 0.55 : 0.82;
+    return claim.confidence >= threshold;
+  }
   const topic = topicForClaim(claim);
   if (claim.memoryType === "active_thread" || claim.property === "active_thread") {
     return ACTIONABLE_THREAD_RE.test(claim.value);

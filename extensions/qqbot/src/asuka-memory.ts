@@ -33,6 +33,31 @@ type AsukaSelfSignalCategory =
   | "vulnerabilities"
   | "aesthetic_taste";
 type AsukaSelfSignalAction = "add" | "update" | "replace" | "ignore";
+type AsukaUserMemoryAction = "add" | "update" | "replace" | "ignore";
+type AsukaUserMemoryType = "user_profile" | "preference" | "boundary" | "relationship" | "active_thread" | "explicit";
+type AsukaUserMemorySlot =
+  | "name"
+  | "birthday"
+  | "anniversary"
+  | "timezone"
+  | "residence_home"
+  | "residence_temporary"
+  | "current_location"
+  | "residence_plan"
+  | "workplace"
+  | "school"
+  | "preference_address"
+  | "preference_reply_style"
+  | "preference_image"
+  | "preference_voice"
+  | "preference_timing"
+  | "boundary_address"
+  | "boundary_image"
+  | "boundary_voice"
+  | "boundary_topic"
+  | "relationship_status"
+  | "active_commitment"
+  | "other";
 
 interface AsukaMemoryItem {
   id: string;
@@ -59,6 +84,9 @@ interface AsukaMemoryItem {
   importanceUpdatedAt?: number;
   privacy: AsukaMemoryPrivacy;
   key?: string;
+  userMemorySlot?: AsukaUserMemorySlot;
+  userMemoryEvidence?: string;
+  extractionVersion?: 2;
   status?: AsukaMemoryStatus;
   supersededBy?: string;
   supersededAt?: number;
@@ -108,6 +136,42 @@ const ASUKA_SELF_THREAD_RE = /(我(最近|这几天|这周|今天|明天|现在|
 const ASUKA_SELF_SIGNAL_RE = /我(其实|还是|一直|会|更|不太|有点|真的)?[^。！？!?]{0,80}(喜欢|更喜欢|愿意|更愿意|不喜欢|习惯|在意|怕|介意|想靠近|想离你近|会想你|想陪着你|不想敷衍|想认真对你)/;
 const ASUKA_SELF_SIGNAL_STABLE_RE = /(一直|总是|通常|习惯|更喜欢|不喜欢|不太喜欢|不想|不会|会认真|不想敷衍|认真对你|慢慢|稳定|每次|以后)/;
 const SELF_SIGNAL_MODEL_TIMEOUT_MS = 8000;
+const USER_MEMORY_MODEL_TIMEOUT_MS = Math.max(10, Number(process.env.ASUKA_USER_MEMORY_TEST_TIMEOUT_MS) || 8000);
+const MAX_USER_MEMORY_VERDICTS = 3;
+const MAX_USER_MEMORY_CANONICAL_LENGTH = 140;
+const MAX_USER_MEMORY_EVIDENCE_LENGTH = 160;
+const USER_MEMORY_TYPES = new Set<AsukaUserMemoryType>([
+  "user_profile",
+  "preference",
+  "boundary",
+  "relationship",
+  "active_thread",
+  "explicit",
+]);
+const USER_MEMORY_SLOTS = new Set<AsukaUserMemorySlot>([
+  "name",
+  "birthday",
+  "anniversary",
+  "timezone",
+  "residence_home",
+  "residence_temporary",
+  "current_location",
+  "residence_plan",
+  "workplace",
+  "school",
+  "preference_address",
+  "preference_reply_style",
+  "preference_image",
+  "preference_voice",
+  "preference_timing",
+  "boundary_address",
+  "boundary_image",
+  "boundary_voice",
+  "boundary_topic",
+  "relationship_status",
+  "active_commitment",
+  "other",
+]);
 const SELF_SIGNAL_CATEGORIES = new Set<AsukaSelfSignalCategory>([
   "attachment_style",
   "care_style",
@@ -302,6 +366,20 @@ interface AsukaSelfSignalVerdict {
   source: "model" | "fallback_model" | "mock" | "rule_fallback" | "invalid" | "unavailable";
 }
 
+interface AsukaUserMemoryVerdict {
+  action: AsukaUserMemoryAction;
+  type: AsukaUserMemoryType;
+  slot: AsukaUserMemorySlot;
+  canonicalText: string;
+  explicitIntent: boolean;
+  importance: AsukaMemoryImportance;
+  temporary: boolean;
+  confidence: number;
+  targetMemoryIds: string[];
+  evidence: string;
+  source: "model" | "fallback_model" | "mock";
+}
+
 function classifyAssistantMemory(text: string, at: number): {
   type: AsukaMemoryType;
   source: AsukaMemorySource;
@@ -439,6 +517,109 @@ function parseSelfSignalVerdict(rawText: string, source: AsukaSelfSignalVerdict[
       reason: sanitizeMemoryText(String(parsed.reason ?? "")),
       source,
     };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeUserMemoryAction(value: unknown): AsukaUserMemoryAction | null {
+  return value === "add" || value === "update" || value === "replace" || value === "ignore" ? value : null;
+}
+
+function normalizeUserMemoryType(value: unknown): AsukaUserMemoryType | null {
+  return typeof value === "string" && USER_MEMORY_TYPES.has(value as AsukaUserMemoryType)
+    ? value as AsukaUserMemoryType
+    : null;
+}
+
+function normalizeUserMemorySlot(value: unknown): AsukaUserMemorySlot | null {
+  return typeof value === "string" && USER_MEMORY_SLOTS.has(value as AsukaUserMemorySlot)
+    ? value as AsukaUserMemorySlot
+    : null;
+}
+
+function isUserMemorySlotCompatible(type: AsukaUserMemoryType, slot: AsukaUserMemorySlot): boolean {
+  if (slot === "other") return type === "explicit";
+  if (slot === "relationship_status") return type === "relationship";
+  if (slot === "active_commitment") return type === "active_thread";
+  if (slot.startsWith("preference_")) return type === "preference";
+  if (slot.startsWith("boundary_")) return type === "boundary";
+  return type === "user_profile";
+}
+
+function parseUserMemoryVerdicts(
+  rawText: string,
+  originalText: string,
+  source: AsukaUserMemoryVerdict["source"],
+): AsukaUserMemoryVerdict[] | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as { memories?: unknown };
+    if (!Array.isArray(parsed.memories) || parsed.memories.length > MAX_USER_MEMORY_VERDICTS) return null;
+    const verdicts: AsukaUserMemoryVerdict[] = [];
+    for (const raw of parsed.memories) {
+      if (!raw || typeof raw !== "object") return null;
+      const item = raw as Record<string, unknown>;
+      const action = normalizeUserMemoryAction(item.action);
+      const type = normalizeUserMemoryType(item.type);
+      const slot = normalizeUserMemorySlot(item.slot);
+      const confidence = item.confidence;
+      const canonicalText = typeof item.canonicalText === "string" ? sanitizeMemoryText(item.canonicalText) : "";
+      const evidence = typeof item.evidence === "string" ? item.evidence.trim() : "";
+      const evidenceTokens = new Set(tokenize(evidence).filter((token) => token.length >= 2));
+      const hasGroundedContent = tokenize(canonicalText)
+        .some((token) => token.length >= 2 && evidenceTokens.has(token));
+      const hasCanonicalPerspective = type === "relationship"
+        ? /^用户(?:与|和)\s*Asuka\b/i.test(canonicalText)
+        : /^用户/.test(canonicalText);
+      if (
+        !action ||
+        !type ||
+        !slot ||
+        !isUserMemorySlotCompatible(type, slot) ||
+        typeof item.explicitIntent !== "boolean" ||
+        (item.importance !== "normal" && item.importance !== "important") ||
+        typeof item.temporary !== "boolean" ||
+        typeof confidence !== "number" ||
+        !Number.isFinite(confidence) ||
+        confidence < 0 ||
+        confidence > 1 ||
+        canonicalText.length > MAX_USER_MEMORY_CANONICAL_LENGTH ||
+        evidence.length === 0 ||
+        evidence.replace(/[，。！？,.!?\s]/g, "").length < 2 ||
+        evidence.length > MAX_USER_MEMORY_EVIDENCE_LENGTH ||
+        !originalText.includes(evidence) ||
+        !hasGroundedContent ||
+        !hasCanonicalPerspective
+      ) {
+        return null;
+      }
+      const targetMemoryIds = Array.isArray(item.targetMemoryIds) &&
+          item.targetMemoryIds.every((id) => typeof id === "string" && id.trim().length > 0)
+        ? item.targetMemoryIds.map((id) => (id as string).trim())
+        : null;
+      if (!targetMemoryIds || targetMemoryIds.length > 5 || new Set(targetMemoryIds).size !== targetMemoryIds.length) return null;
+      if (action !== "ignore" && (!canonicalText || shouldSkipMemory(canonicalText))) return null;
+      if (action === "add" && targetMemoryIds.length !== 0) return null;
+      if (action === "update" && targetMemoryIds.length !== 1) return null;
+      if (action === "replace" && targetMemoryIds.length === 0) return null;
+      if (action === "ignore" && targetMemoryIds.length !== 0) return null;
+      verdicts.push({
+        action,
+        type,
+        slot,
+        canonicalText,
+        explicitIntent: item.explicitIntent && isExplicitMemoryRequest(originalText),
+        importance: item.importance,
+        temporary: item.temporary,
+        confidence,
+        targetMemoryIds,
+        evidence,
+        source,
+      });
+    }
+    return verdicts;
   } catch {
     return null;
   }
@@ -757,6 +938,251 @@ function pruneAsukaSelfSignalsByCategory(state: AsukaMemoryStateFile, peerKey: s
   }
 }
 
+function keyForUserMemorySlot(slot: AsukaUserMemorySlot): string | undefined {
+  switch (slot) {
+    case "name": return "user:name";
+    case "birthday": return "user:birthday";
+    case "anniversary": return "user:anniversary";
+    case "timezone": return "user:timezone";
+    case "residence_home": return "user:residence:home-base";
+    case "residence_temporary": return "user:residence:temporary-stay";
+    case "current_location": return "user:residence:current-presence";
+    case "residence_plan": return "user:residence:plan";
+    case "workplace": return "user:workplace";
+    case "school": return "user:school";
+    case "preference_address": return "preference:address";
+    case "preference_reply_style": return "preference:reply_style";
+    case "preference_image": return "preference:image";
+    case "preference_voice": return "preference:voice";
+    case "preference_timing": return "preference:timing";
+    case "boundary_address": return "boundary:address";
+    case "boundary_image": return "boundary:image";
+    case "boundary_voice": return "boundary:voice";
+    case "boundary_topic": return "boundary:topic";
+    case "relationship_status": return "relationship:status";
+    case "active_commitment": return "thread:commitment";
+    case "other": return undefined;
+  }
+}
+
+function isSingleValueUserMemorySlot(slot: AsukaUserMemorySlot): boolean {
+  return [
+    "name",
+    "birthday",
+    "timezone",
+    "residence_home",
+    "residence_temporary",
+    "current_location",
+    "residence_plan",
+    "workplace",
+    "school",
+    "relationship_status",
+  ].includes(slot);
+}
+
+function formatUserMemoryCandidates(items: AsukaMemoryItem[]): string {
+  if (items.length === 0) return "none";
+  return items
+    .slice()
+    .sort((a, b) => (b.salience - a.salience) || (b.updatedAt - a.updatedAt))
+    .slice(0, 30)
+    .map((item) => `- id=${item.id} type=${item.type} slot=${item.userMemorySlot ?? "legacy"} slotKey=${item.key ?? "none"} text=${item.text}`)
+    .join("\n");
+}
+
+function buildUserMemoryJudgePrompt(text: string, existing: AsukaMemoryItem[]): string {
+  return [
+    "你是用户长期记忆提取器，只能输出一个 JSON 对象，不要解释。",
+    "从当前用户原话提取 0 到 3 条值得跨会话保留的结构化事实。一次消息可提取多条。",
+    "只记录说话者本人或用户与 Asuka 的关系；第三人的事实、提问、试探你是否记得、否定掉的旧事实、随口聊天和低信息回复不要记录。",
+    "区分常住地、暂住地、当前位置和未来搬家计划。更新同一事实用 update；明确冲突并替代旧事实用 replace；新侧面用 add。",
+    "type 只能选 user_profile, preference, boundary, relationship, active_thread, explicit。",
+    "slot 只能选 name, birthday, anniversary, timezone, residence_home, residence_temporary, current_location, residence_plan, workplace, school, preference_address, preference_reply_style, preference_image, preference_voice, preference_timing, boundary_address, boundary_image, boundary_voice, boundary_topic, relationship_status, active_commitment, other。",
+    "other 只能搭配 explicit；relationship_status 只能搭配 relationship；active_commitment 只能搭配 active_thread；preference_* 和 boundary_* 必须搭配对应 type；其余 slot 搭配 user_profile。",
+    "canonicalText 是自然、独立、无歧义的中文事实句，不超过 140 字。evidence 必须逐字复制用户原话中的一个连续片段，不超过 160 字。",
+    "explicitIntent 仅在用户明确要求记住时为 true。importance 只能 normal 或 important。temporary 必须是布尔值。",
+    "置信度门槛: 明确要求记住至少 0.55；普通隐式事实至少 0.82；replace 至少 0.88。不够就返回空数组。",
+    "update 必须指定恰好一个当前记忆 id；replace 至少一个；add 和 ignore 不得指定 id。不要编造 id。",
+    "输出格式: {\"memories\":[{\"action\":\"add|update|replace|ignore\",\"type\":\"...\",\"slot\":\"...\",\"canonicalText\":\"...\",\"explicitIntent\":false,\"importance\":\"normal|important\",\"temporary\":false,\"confidence\":0.0,\"targetMemoryIds\":[],\"evidence\":\"用户原文连续片段\"}]}",
+    `用户原话: ${text}`,
+    `当前有效用户记忆:\n${formatUserMemoryCandidates(existing)}`,
+  ].join("\n");
+}
+
+function userMemoryVerdictMeetsThreshold(verdict: AsukaUserMemoryVerdict): boolean {
+  if (verdict.action === "ignore") return false;
+  if (verdict.action === "replace") return verdict.confidence >= 0.88;
+  return verdict.confidence >= (verdict.explicitIntent ? 0.55 : 0.82);
+}
+
+async function requestUserMemoryVerdicts(
+  context: AsukaPeerContext,
+  text: string,
+  existing: AsukaMemoryItem[],
+): Promise<AsukaUserMemoryVerdict[] | null> {
+  const mock = process.env.ASUKA_USER_MEMORY_TEST_VERDICT?.trim();
+  if (mock) {
+    if (mock === "__UNAVAILABLE__") return null;
+    return parseUserMemoryVerdicts(mock, text, "mock");
+  }
+
+  const resolved = resolveQQBotSceneInferenceConfig(context.accountId);
+  const models = [
+    { config: resolved.primary, source: "model" as const },
+    { config: resolved.fallback, source: "fallback_model" as const },
+  ].filter((item): item is { config: OpenAICompletionsModelConfig; source: "model" | "fallback_model" } => Boolean(item.config));
+  if (models.length === 0) return null;
+
+  const prompt = buildUserMemoryJudgePrompt(text, existing);
+  for (const model of models) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), USER_MEMORY_MODEL_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${model.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${model.config.apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: model.config.model,
+          ...getOpenAICompletionsThinkingParams(model.config.model, "off"),
+          temperature: 0.1,
+          max_tokens: 700,
+          messages: [
+            {
+              role: "system",
+              content: "你只负责提取用户长期记忆，必须只输出符合约束的 JSON 对象。",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+      const detail = await response.text();
+      if (!response.ok) continue;
+      const verdicts = parseUserMemoryVerdicts(extractTextFromCompletionPayload(JSON.parse(detail)), text, model.source);
+      if (verdicts) return verdicts;
+    } catch {
+      // Try fallback model below.
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return null;
+}
+
+function applyUserMemoryVerdicts(
+  context: AsukaPeerContext,
+  verdicts: AsukaUserMemoryVerdict[],
+  at: number,
+): boolean {
+  const accepted = verdicts.filter(userMemoryVerdictMeetsThreshold);
+  if (accepted.length === 0) return false;
+  const state = loadState();
+  const peerKey = makePeerKey(context);
+  maintainPeerMemories(state, peerKey, at);
+  const activeById = new Map(
+    getActivePeerMemories(state, peerKey, at)
+      .filter((item) => item.source === "user_explicit" || item.source === "user_inferred")
+      .map((item) => [item.id, item]),
+  );
+  const matchesSlot = (item: AsukaMemoryItem, verdict: AsukaUserMemoryVerdict): boolean => {
+    const key = keyForUserMemorySlot(verdict.slot);
+    if (item.userMemorySlot) return item.userMemorySlot === verdict.slot;
+    if (key) return item.key === key;
+    return verdict.slot === "other" && item.type === "explicit" && !item.key;
+  };
+  let changed = false;
+  for (const verdict of accepted) {
+    const targets = verdict.targetMemoryIds.map((id) => activeById.get(id));
+    if (targets.some((item) => !item || !matchesSlot(item, verdict))) continue;
+    if (
+      verdict.action === "add"
+      && [...activeById.values()].some((item) =>
+        matchesSlot(item, verdict)
+        && (
+          isSingleValueUserMemorySlot(verdict.slot)
+          || normalizeForDedup(item.text) === normalizeForDedup(verdict.canonicalText)
+        )
+      )
+    ) continue;
+    const source: AsukaMemorySource = verdict.explicitIntent ? "user_explicit" : "user_inferred";
+    const key = keyForUserMemorySlot(verdict.slot);
+    const temporary = verdict.temporary
+      || verdict.slot === "current_location"
+      || verdict.slot === "residence_temporary";
+    const expiresAt = temporary
+      ? at + TEMPORARY_MEMORY_TTL_MS
+      : verdict.type === "active_thread"
+        ? at + ACTIVE_THREAD_TTL_MS
+        : undefined;
+    if (verdict.action === "update") {
+      const target = activeById.get(verdict.targetMemoryIds[0]!)!;
+      target.type = verdict.type;
+      target.text = verdict.canonicalText;
+      target.source = source;
+      target.sourceMessageId = context.messageId;
+      target.updatedAt = at;
+      target.salience = verdict.importance === "important" ? 10 : Math.max(target.salience, verdict.explicitIntent ? 9 : 7);
+      target.confidence = verdict.confidence;
+      target.expiresAt = expiresAt;
+      target.importance = verdict.importance;
+      target.temporary = temporary || undefined;
+      target.importanceUpdatedAt = verdict.importance === "important" ? at : undefined;
+      target.key = key;
+      target.userMemorySlot = verdict.slot;
+      target.userMemoryEvidence = verdict.evidence;
+      target.extractionVersion = 2;
+      target.status = "active";
+      changed = true;
+      continue;
+    }
+
+    const id = randomUUID();
+    state.memories[id] = {
+      id,
+      accountId: context.accountId,
+      peerKey,
+      peerKind: context.peerKind,
+      peerId: context.peerId,
+      type: verdict.type,
+      text: verdict.canonicalText,
+      source,
+      sourceMessageId: context.messageId,
+      createdAt: at,
+      updatedAt: at,
+      salience: verdict.importance === "important" ? 10 : verdict.explicitIntent ? 9 : 7,
+      confidence: verdict.confidence,
+      expiresAt,
+      importance: verdict.importance,
+      temporary: temporary || undefined,
+      importanceUpdatedAt: verdict.importance === "important" ? at : undefined,
+      privacy: "direct_only",
+      key,
+      userMemorySlot: verdict.slot,
+      userMemoryEvidence: verdict.evidence,
+      extractionVersion: 2,
+      status: "active",
+    };
+    if (verdict.action === "replace") {
+      for (const targetId of verdict.targetMemoryIds) {
+        supersedeMemory(activeById.get(targetId)!, id, at);
+        activeById.delete(targetId);
+      }
+    }
+    activeById.set(id, state.memories[id]!);
+    changed = true;
+  }
+  if (!changed) return false;
+  maintainPeerMemories(state, peerKey, at);
+  saveState();
+  return true;
+}
+
 export function recordAsukaLongTermMemoryFromUserMessage(
   context: AsukaPeerContext,
   userText: string,
@@ -775,6 +1201,62 @@ export function recordAsukaLongTermMemoryFromUserMessage(
     text,
     at,
   });
+}
+
+const userMemoryModelQueue = new Map<string, Promise<boolean>>();
+const userMemoryQueueDepth = new Map<string, number>();
+const userMemoryMutationGeneration = new Map<string, number>();
+
+function invalidatePendingUserMemoryExtraction(peerKey: string): void {
+  userMemoryMutationGeneration.set(peerKey, (userMemoryMutationGeneration.get(peerKey) ?? 0) + 1);
+}
+
+async function recordAsukaLongTermMemoryFromUserMessageWithModelOnce(
+  context: AsukaPeerContext,
+  userText: string,
+  at = Date.now(),
+  expectedGeneration = 0,
+): Promise<boolean> {
+  if (context.peerKind !== "direct") return false;
+  const peerKey = makePeerKey(context);
+  if ((userMemoryMutationGeneration.get(peerKey) ?? 0) !== expectedGeneration) return false;
+  const text = sanitizeMemoryText(userText);
+  if (shouldSkipMemory(text) || LOW_INFORMATION_MEMORY_REPLY_RE.test(text)) return false;
+  const state = loadState();
+  maintainPeerMemories(state, peerKey, at);
+  const existing = getActivePeerMemories(state, peerKey, at)
+    .filter((item) => item.source === "user_explicit" || item.source === "user_inferred");
+  const verdicts = await requestUserMemoryVerdicts(context, text, existing);
+  if ((userMemoryMutationGeneration.get(peerKey) ?? 0) !== expectedGeneration) return false;
+  if (verdicts) return applyUserMemoryVerdicts(context, verdicts, at);
+  if (!isExplicitMemoryRequest(text)) return false;
+  return recordAsukaLongTermMemoryFromUserMessage(context, text, at);
+}
+
+export async function recordAsukaLongTermMemoryFromUserMessageWithModel(
+  context: AsukaPeerContext,
+  userText: string,
+  at = Date.now(),
+): Promise<boolean> {
+  const peerKey = makePeerKey(context);
+  const depth = userMemoryQueueDepth.get(peerKey) ?? 0;
+  const explicit = isExplicitMemoryRequest(sanitizeMemoryText(userText));
+  if (depth >= (explicit ? 6 : 3)) return false;
+  userMemoryQueueDepth.set(peerKey, depth + 1);
+  const generation = userMemoryMutationGeneration.get(peerKey) ?? 0;
+  const previous = userMemoryModelQueue.get(peerKey) ?? Promise.resolve(false);
+  const queued = previous
+    .catch(() => false)
+    .then(() => recordAsukaLongTermMemoryFromUserMessageWithModelOnce(context, userText, at, generation));
+  userMemoryModelQueue.set(peerKey, queued);
+  try {
+    return await queued;
+  } finally {
+    if (userMemoryModelQueue.get(peerKey) === queued) userMemoryModelQueue.delete(peerKey);
+    const remaining = (userMemoryQueueDepth.get(peerKey) ?? 1) - 1;
+    if (remaining > 0) userMemoryQueueDepth.set(peerKey, remaining);
+    else userMemoryQueueDepth.delete(peerKey);
+  }
 }
 
 function getActiveSelfSignalsForPeer(state: AsukaMemoryStateFile, peerKey: string, now: number): AsukaMemoryItem[] {
@@ -1273,6 +1755,7 @@ export function handleAsukaMemoryControlMessage(
 
   const state = loadState();
   const peerKey = makePeerKey(context);
+  if (intent.action !== "list") invalidatePendingUserMemoryExtraction(peerKey);
   maintainPeerMemories(state, peerKey, at);
 
   if (intent.action === "list") {

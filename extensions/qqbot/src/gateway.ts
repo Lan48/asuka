@@ -24,7 +24,7 @@ import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summariz
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, clearAmbientScheduledJobs, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
-import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessage } from "./asuka-memory.js";
+import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessageWithModel } from "./asuka-memory.js";
 import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
@@ -3006,7 +3006,9 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           ? { handled: false }
           : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
         if (!proactiveNudge.isNudge && !memoryControl.handled) {
-          recordAsukaLongTermMemoryFromUserMessage(asukaPeerContext, userContent);
+          void recordAsukaLongTermMemoryFromUserMessageWithModel(asukaPeerContext, userContent).catch((error) => {
+            log?.error(`[qqbot:${account.accountId}] User memory extraction failed: ${error}`);
+          });
         }
         const cancelledPromises = proactiveNudge.isNudge
           ? { cancelledPromises: [], cronJobIds: [] }

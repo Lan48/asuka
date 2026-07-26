@@ -54,6 +54,8 @@ const topicById = new Map([
   ["todo", "commitments-todos"],
   ["user", "user-basics"],
   ["asuka", "asuka-self-state"],
+  ["structured-residence", "residence-location-timeline"],
+  ["structured-preference", "preferences-boundaries"],
 ]);
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-wiki-pages-"));
@@ -161,6 +163,33 @@ try {
       text: "你还记得我住在哪里吗？",
       source: "user_inferred",
     }),
+    memory({
+      id: "structured-residence",
+      type: "user_profile",
+      text: "用户的新收件地点是海棠公寓。",
+      source: "user_inferred",
+      confidence: 0.9,
+      userMemorySlot: "residence_home",
+      extractionVersion: 2,
+    }),
+    memory({
+      id: "structured-preference",
+      type: "preference",
+      text: "用户希望回答更精炼。",
+      source: "user_inferred",
+      confidence: 0.88,
+      userMemorySlot: "preference_reply_style",
+      extractionVersion: 2,
+    }),
+    memory({
+      id: "noise-structured-low-confidence",
+      type: "user_profile",
+      text: "用户似乎在北方生活。",
+      source: "user_inferred",
+      confidence: 0.7,
+      userMemorySlot: "residence_home",
+      extractionVersion: 2,
+    }),
   ];
 
   syncAsukaMemoryWiki(items);
@@ -180,12 +209,15 @@ try {
   }
 
   const indexedIds = [];
-  for (const [claimId, slug] of topicById) {
+  for (const slug of new Set(topicById.values())) {
     const file = path.join(wikiDir, "entities", `${slug}.md`);
     assert.equal(fs.existsSync(file), true, `${slug} should be generated`);
     const content = fs.readFileSync(file, "utf-8");
     const ids = frontmatterClaimIds(content);
-    assert.deepEqual(ids, [claimId], `${claimId} should route only to ${slug}`);
+    const expectedIds = [...topicById]
+      .filter(([, expectedSlug]) => expectedSlug === slug)
+      .map(([claimId]) => claimId);
+    assert.deepEqual(new Set(ids), new Set(expectedIds), `${slug} should contain only its routed claims`);
     assert.equal(occurrenceCount(content.split("---")[1], "    evidence:"), ids.length);
     assert.match(content, /kind: "asuka-memory"/);
     assert.match(content, /sourceId: "message-/);
@@ -209,6 +241,7 @@ try {
   assert.equal(indexedIds.includes("noise-asuka-residence"), false);
   assert.equal(indexedIds.includes("noise-old-location"), false);
   assert.equal(indexedIds.includes("noise-old-profile-question"), false);
+  assert.equal(indexedIds.includes("noise-structured-low-confidence"), false);
 
   const userBasicsFile = path.join(wikiDir, "entities", "user-basics.md");
   let userBasics = fs.readFileSync(userBasicsFile, "utf-8");
