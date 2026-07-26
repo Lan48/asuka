@@ -271,6 +271,13 @@ function mergeHumanNotes(...notes: string[]): string {
 }
 
 function topicForClaim(claim: AsukaMemoryWikiClaim): string {
+  if (claim.property === "explicit") {
+    if (STABLE_RELATIONSHIP_RE.test(claim.value)) return "relationship-state";
+    if (STABLE_RESIDENCE_RE.test(claim.value)) return "residence-location-timeline";
+    if (STABLE_PREFERENCE_RE.test(claim.value) || STABLE_BOUNDARY_RE.test(claim.value)) {
+      return "preferences-boundaries";
+    }
+  }
   if (
     claim.scope !== "general"
     || claim.property === "residence"
@@ -295,7 +302,9 @@ function topicForClaim(claim: AsukaMemoryWikiClaim): string {
 }
 
 const LOW_INFORMATION_CLAIM_RE = /^(?:[嗯哦噢啊诶唉哈]+[，,\s]*)?(?:不(?:太)?记得(?:了)?|记不(?:太)?清(?:了)?|没有(?:吧|啊|呢)?|没(?:有)?(?:吧|呢)?|不知道|不清楚)[。！？!?~～…\s]*$/;
-const STABLE_USER_PROFILE_RE = /(我叫|叫我|我的名字|生日|纪念日|时区|城市|住在|住所|家在|工作|上学|学校|公司)/;
+const NON_ASSERTIVE_CLAIM_RE = /[?？]|(?:还记得|记不记得|知道不知道|你知道).*(?:吗|呢|么)/;
+const STABLE_USER_PROFILE_RE = /(我叫|我的名字|(?:^|[，,:：])(?:请)?叫我|生日|纪念日|时区|城市|住在|住所|家在|工作|上学|学校|公司)/;
+const STABLE_RESIDENCE_RE = /(住在|住所|家在|宿舍|暂住|临时住|短住|借住|搬到|搬家|同居)/;
 const STABLE_PREFERENCE_RE = /(我喜欢|我偏好|我更喜欢|我习惯|我希望|对我来说[^。！？!?]{0,40}重要)/;
 const STABLE_BOUNDARY_RE = /(我不喜欢|我讨厌|我不想被|我介意|我的雷点|让我不舒服|别再|不要再|别叫我)/;
 const STABLE_RELATIONSHIP_RE = /(同居|恋人|情侣|夫妻|结婚|在一起|分手|和好|我们约定|我们拉钩|纪念日|我爱你|我喜欢你)/;
@@ -314,6 +323,7 @@ export function isDurableClaim(claim: AsukaMemoryWikiClaim): boolean {
     || claim.status === "expired"
     || claim.temporary
     || LOW_INFORMATION_CLAIM_RE.test(claim.value.trim())
+    || NON_ASSERTIVE_CLAIM_RE.test(claim.value)
   ) return false;
   const topic = topicForClaim(claim);
   if (claim.memoryType === "active_thread" || claim.property === "active_thread") {
@@ -323,7 +333,10 @@ export function isDurableClaim(claim: AsukaMemoryWikiClaim): boolean {
     return claim.confidence >= 0.75;
   }
   if (claim.subject === "asuka") return false;
-  if (topic === "residence-location-timeline") return claim.subject === "user";
+  if (topic === "residence-location-timeline") {
+    return claim.subject === "user"
+      && (claim.scope !== "general" || STABLE_RESIDENCE_RE.test(claim.value));
+  }
   if (claim.memoryType === "explicit" || claim.property === "explicit") {
     return isSubstantiveExplicitClaim(claim.value);
   }
@@ -428,6 +441,19 @@ function renderLegacyRedirect(current: string): string {
     .map((line) => `    ${line}`)
     .join("\n");
   return [
+    "---",
+    "pageType: entity",
+    "entityType: migration-redirect",
+    "id: entity.asuka-memory-context-legacy",
+    "canonicalId: asuka-memory-context-legacy",
+    "title: Asuka Memory Context (Migrated)",
+    "privacyTier: local-private",
+    "sourceIds:",
+    "  - source.asuka-memory-jsonl",
+    `updatedAt: ${yamlScalar(new Date().toISOString())}`,
+    "claims: []",
+    "---",
+    "",
     LEGACY_REDIRECT_MARKER,
     "# Asuka Memory Context (Migrated)",
     "",

@@ -148,6 +148,19 @@ try {
       source: "assistant_self_thread",
       confidence: 0.9,
     }),
+    memory({
+      id: "noise-old-location",
+      type: "user_profile",
+      text: "没有，同事先走了。剩我一个和几个老师还在工作",
+      source: "user_inferred",
+      key: "user:location",
+    }),
+    memory({
+      id: "noise-old-profile-question",
+      type: "user_profile",
+      text: "你还记得我住在哪里吗？",
+      source: "user_inferred",
+    }),
   ];
 
   syncAsukaMemoryWiki(items);
@@ -194,6 +207,8 @@ try {
   assert.equal(indexedIds.includes("noise-explicit-question"), false);
   assert.equal(indexedIds.includes("noise-temporary-residence"), false);
   assert.equal(indexedIds.includes("noise-asuka-residence"), false);
+  assert.equal(indexedIds.includes("noise-old-location"), false);
+  assert.equal(indexedIds.includes("noise-old-profile-question"), false);
 
   const userBasicsFile = path.join(wikiDir, "entities", "user-basics.md");
   let userBasics = fs.readFileSync(userBasicsFile, "utf-8");
@@ -202,6 +217,7 @@ try {
   const legacyRedirect = fs.readFileSync(legacyFile, "utf-8");
   assert.match(legacyRedirect, /Asuka Memory Context \(Migrated\)/);
   assert.match(legacyRedirect, /Preserved pre-migration page/);
+  assert.match(legacyRedirect, /claims: \[\]/);
   assert.equal(frontmatterClaimIds(legacyRedirect).length, 0, "legacy redirect must not duplicate claims");
 
   const relationshipFile = path.join(wikiDir, "entities", "relationship-state.md");
