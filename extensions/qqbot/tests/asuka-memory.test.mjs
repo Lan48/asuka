@@ -11,6 +11,8 @@ const dayMs = 24 * 60 * 60 * 1000;
 const base = Date.UTC(2026, 3, 26, 0, 0, 0);
 const memoryFile = path.join(tmpHome, ".openclaw", "qqbot", "data", "asuka-memory", "memory.json");
 const memoryWikiDir = path.join(tmpHome, "Asuka", "Memory");
+const compiledEntityFile = path.join(memoryWikiDir, "entities", "asuka-memory-context.md");
+const compiledSourceFile = path.join(memoryWikiDir, "sources", "asuka-memory-jsonl.md");
 process.env.ASUKA_MEMORY_WIKI_DIR = memoryWikiDir;
 
 const direct = {
@@ -178,6 +180,15 @@ try {
     "planned",
     "future move should be a planned claim",
   );
+  assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我们已经开始同居。", base + 10_350), true);
+  const compiledEntityBeforeNotes = fs.readFileSync(compiledEntityFile, "utf-8");
+  assertIncludes(compiledEntityBeforeNotes, "pageType: entity", "wiki bridge should write a compilable entity page");
+  assertIncludes(compiledEntityBeforeNotes, "claims:", "wiki claims must live in structured frontmatter");
+  assertIncludes(compiledEntityBeforeNotes, "source\\.asuka-memory-jsonl", "compiled entity should declare page-level provenance");
+  assertIncludes(compiledEntityBeforeNotes, "user\\.residence \\[home-base\\].*上海", "compiled page should expose the current residence claim");
+  assertIncludes(compiledEntityBeforeNotes, "relationship\\.relationship \\[general\\].*同居", "compiled page should expose the cohabitation claim");
+  assertIncludes(compiledEntityBeforeNotes, "evidence:", "compiled claims should retain structured evidence");
+  assertIncludes(fs.readFileSync(compiledSourceFile, "utf-8"), "pageType: source", "wiki bridge should write the referenced source page");
 
   const claimsMarkdown = path.join(memoryWikiDir, "Claims.md");
   const withManualNotes = fs.readFileSync(claimsMarkdown, "utf-8").replace(
@@ -185,8 +196,21 @@ try {
     "<!-- ASUKA_MEMORY_NOTES_START -->\n这段人工笔记必须保留。\n",
   );
   fs.writeFileSync(claimsMarkdown, withManualNotes, "utf-8");
+  fs.writeFileSync(
+    compiledEntityFile,
+    compiledEntityBeforeNotes.replace(
+      "<!-- openclaw:human:start -->\n",
+      "<!-- openclaw:human:start -->\n这段 OpenClaw 人工笔记也必须保留。\n",
+    ),
+    "utf-8",
+  );
   assert.equal(recordAsukaLongTermMemoryFromUserMessage(direct, "记住我喜欢茉莉花茶。", base + 10_400), true);
   assertIncludes(fs.readFileSync(claimsMarkdown, "utf-8"), "这段人工笔记必须保留", "wiki sync must preserve manual Notes");
+  assertIncludes(
+    fs.readFileSync(compiledEntityFile, "utf-8"),
+    "这段 OpenClaw 人工笔记也必须保留",
+    "compilable Wiki page must preserve OpenClaw human Notes",
+  );
 
   assert.equal(
     handleAsukaMemoryControlMessage(direct, "看看记忆分类", base + 11_200).handled,

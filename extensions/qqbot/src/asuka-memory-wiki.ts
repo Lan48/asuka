@@ -45,6 +45,8 @@ const GENERATED_START = "<!-- ASUKA_MEMORY_GENERATED_START -->";
 const GENERATED_END = "<!-- ASUKA_MEMORY_GENERATED_END -->";
 const NOTES_START = "<!-- ASUKA_MEMORY_NOTES_START -->";
 const NOTES_END = "<!-- ASUKA_MEMORY_NOTES_END -->";
+const OPENCLAW_HUMAN_START = "<!-- openclaw:human:start -->";
+const OPENCLAW_HUMAN_END = "<!-- openclaw:human:end -->";
 const PENDING_FILE = ".asuka-memory-pending";
 
 function iso(value: number | undefined): string | null {
@@ -169,6 +171,112 @@ function renderMarkdown(claims: AsukaMemoryWikiClaim[], current: string): string
   ].join("\n");
 }
 
+function yamlScalar(value: string): string {
+  return JSON.stringify(value);
+}
+
+function compiledClaimStatus(status: AsukaMemoryWikiClaim["status"]): string {
+  if (status === "current") return "supported";
+  if (status === "planned") return "proposed";
+  if (status === "expired") return "stale";
+  if (status === "forgotten") return "refuted";
+  return status;
+}
+
+function claimEvidenceNote(claim: AsukaMemoryWikiClaim): string {
+  return JSON.stringify({
+    subject: claim.subject,
+    property: claim.property,
+    scope: claim.scope,
+    validFrom: claim.validFrom,
+    validTo: claim.validTo,
+    observedAt: claim.observedAt,
+    supersedes: claim.supersedes,
+    sourceStatus: claim.status,
+  });
+}
+
+function extractHumanNotes(current: string): string {
+  const start = current.indexOf(OPENCLAW_HUMAN_START);
+  const end = current.indexOf(OPENCLAW_HUMAN_END);
+  if (start < 0 || end < start) return "";
+  return current.slice(start + OPENCLAW_HUMAN_START.length, end).trim();
+}
+
+function renderCompiledEntityPage(claims: AsukaMemoryWikiClaim[], current: string): string {
+  const updatedAt = claims.reduce(
+    (latest, claim) => claim.updatedAt > latest ? claim.updatedAt : latest,
+    new Date(0).toISOString(),
+  );
+  const frontmatter = [
+    "pageType: entity",
+    "entityType: relationship-context",
+    "id: entity.asuka-memory-context",
+    "canonicalId: asuka-memory-context",
+    "title: Asuka Memory Context",
+    "privacyTier: local-private",
+    "sourceIds:",
+    "  - source.asuka-memory-jsonl",
+    `updatedAt: ${yamlScalar(updatedAt)}`,
+    `lastRefreshedAt: ${yamlScalar(updatedAt)}`,
+    "claims:",
+    ...claims.flatMap((claim) => [
+      `  - id: ${yamlScalar(claim.id)}`,
+      `    text: ${yamlScalar(`${claim.subject}.${claim.property} [${claim.scope}]: ${claim.value}`)}`,
+      `    status: ${yamlScalar(compiledClaimStatus(claim.status))}`,
+      `    confidence: ${claim.confidence}`,
+      `    updatedAt: ${yamlScalar(claim.updatedAt)}`,
+      "    evidence:",
+      `      - kind: ${yamlScalar("asuka-memory")}`,
+      `        sourceId: ${yamlScalar(claim.source)}`,
+      `        privacyTier: ${yamlScalar("local-private")}`,
+      `        note: ${yamlScalar(claimEvidenceNote(claim))}`,
+      `        updatedAt: ${yamlScalar(claim.updatedAt)}`,
+    ]),
+  ];
+  const notes = extractHumanNotes(current);
+  return [
+    "---",
+    ...frontmatter,
+    "---",
+    "",
+    "# Asuka Memory Context",
+    "",
+    renderGeneratedClaims(claims),
+    "",
+    "## Notes",
+    OPENCLAW_HUMAN_START,
+    notes,
+    OPENCLAW_HUMAN_END,
+    "",
+  ].join("\n");
+}
+
+function renderSourcePage(updatedAt: string, current: string): string {
+  const notes = extractHumanNotes(current);
+  return [
+    "---",
+    "pageType: source",
+    "id: source.asuka-memory-jsonl",
+    "title: Asuka Memory JSONL Source",
+    "sourceType: asuka-memory-jsonl",
+    "provenanceMode: local-private",
+    "sourcePath: claims.jsonl",
+    `updatedAt: ${yamlScalar(updatedAt)}`,
+    "---",
+    "",
+    "# Asuka Memory JSONL Source",
+    "",
+    "This page records the provenance of structured claims generated from Asuka's local long-term memory.",
+    "",
+    "## Notes",
+    OPENCLAW_HUMAN_START,
+    notes,
+    OPENCLAW_HUMAN_END,
+    "",
+  ].join("\n");
+}
+
 function readExistingClaims(file: string): AsukaMemoryWikiClaim[] {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf-8")
@@ -191,6 +299,8 @@ export function syncAsukaMemoryWiki(items: AsukaMemoryWikiItem[]): void {
     fs.mkdirSync(targetDir, { recursive: true });
     const jsonlFile = path.join(targetDir, "claims.jsonl");
     const markdownFile = path.join(targetDir, "Claims.md");
+    const entityFile = path.join(targetDir, "entities", "asuka-memory-context.md");
+    const sourceFile = path.join(targetDir, "sources", "asuka-memory-jsonl.md");
     const claimsById = new Map(readExistingClaims(jsonlFile).map((claim) => [claim.id, claim]));
     for (const claim of items.map((item) => toClaim(item, items))) {
       claimsById.set(claim.id, claim);
@@ -200,6 +310,16 @@ export function syncAsukaMemoryWiki(items: AsukaMemoryWikiItem[]): void {
     atomicWrite(jsonlFile, jsonl ? `${jsonl}\n` : "");
     const currentMarkdown = fs.existsSync(markdownFile) ? fs.readFileSync(markdownFile, "utf-8") : "";
     atomicWrite(markdownFile, renderMarkdown(claims, currentMarkdown));
+    fs.mkdirSync(path.dirname(entityFile), { recursive: true });
+    const currentEntity = fs.existsSync(entityFile) ? fs.readFileSync(entityFile, "utf-8") : "";
+    atomicWrite(entityFile, renderCompiledEntityPage(claims, currentEntity));
+    fs.mkdirSync(path.dirname(sourceFile), { recursive: true });
+    const currentSource = fs.existsSync(sourceFile) ? fs.readFileSync(sourceFile, "utf-8") : "";
+    const updatedAt = claims.reduce(
+      (latest, claim) => claim.updatedAt > latest ? claim.updatedAt : latest,
+      new Date(0).toISOString(),
+    );
+    atomicWrite(sourceFile, renderSourcePage(updatedAt, currentSource));
     atomicWrite(path.join(targetDir, PENDING_FILE), `${new Date().toISOString()}\n`);
   } catch (error) {
     console.error(`[asuka-memory] Failed to sync Memory Wiki: ${error}`);
