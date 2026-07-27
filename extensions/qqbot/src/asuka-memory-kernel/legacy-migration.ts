@@ -352,6 +352,10 @@ function scopePeerKind(scope: LegacyMigrationScope): MemoryPeerKind {
   return scope.peerKind ?? "direct";
 }
 
+function scopePeerKey(scope: LegacyMigrationScope): string {
+  return `${scope.accountId}:${scopePeerKind(scope)}:${scope.peerId}`;
+}
+
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
@@ -396,7 +400,6 @@ function collectMemoryRecords(
       text: modelText(item, preferredText),
       occurredAt: timestampValue(record?.createdAt ?? record?.updatedAt),
       metadata: {
-        legacyRecord: item,
         legacyStatus: record?.status,
         legacySource: source,
       },
@@ -445,7 +448,9 @@ function collectClaimRecords(
       occurredAt: timestampValue(
         claim?.observedAt ?? claim?.createdAt ?? claim?.updatedAt,
       ),
-      metadata: { legacyClaim: value },
+      metadata: {
+        legacyMemoryType: memoryType,
+      },
       auditedNonImport: value === null
         ? auditedNonImport("empty_record")
         : !claim
@@ -464,31 +469,91 @@ function collectClaimRecords(
   });
 }
 
+function assertExactScopeMetadata(
+  value: unknown,
+  scope: LegacyMigrationScope,
+  label: string,
+): void {
+  const record = objectRecord(value);
+  if (!record) return;
+  if (!matchesScope(record, scope)) {
+    throw new Error(`${label} has conflicting scope metadata`);
+  }
+  const peerKey = textValue(record.peerKey, 500);
+  if (peerKey && peerKey !== scopePeerKey(scope)) {
+    throw new Error(`${label} has conflicting scope metadata`);
+  }
+}
+
 function collectSnapshotRecord(
   file: string | undefined,
   sourceKind: "state" | "digest",
+  scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
   const value = readJson(file);
   if (!file || value === undefined) return [];
-  const sourceContent = canonicalSourceContent(value);
+  const root = objectRecord(value);
+  if (!root) {
+    throw new Error(`legacy ${sourceKind} source has an unsupported parsed shape: ${file}`);
+  }
+  const peerKey = scopePeerKey(scope);
+  let scopedValue: Record<string, unknown>;
+  let occurredAt = fs.statSync(file).mtimeMs;
+  if (sourceKind === "state") {
+    const peers = objectRecord(root.peers);
+    const peer = peers?.[peerKey];
+    if (peer === undefined) {
+      throw new Error(`legacy state source does not contain exact scope ${peerKey}`);
+    }
+    assertExactScopeMetadata(peer, scope, "legacy state peer");
+    const promises = objectRecord(root.promises) ?? {};
+    const scopedPromises = Object.fromEntries(
+      Object.entries(promises).filter(([, promise]) => {
+        const record = objectRecord(promise);
+        if (!record) return false;
+        const promisePeerKey = textValue(record.peerKey, 500);
+        if (promisePeerKey) return promisePeerKey === peerKey;
+        return matchesScope(record, scope);
+      }),
+    );
+    for (const promise of Object.values(scopedPromises)) {
+      assertExactScopeMetadata(promise, scope, "legacy state promise");
+    }
+    scopedValue = {
+      peerKey,
+      peer,
+      promises: scopedPromises,
+    };
+  } else {
+    const digests = objectRecord(root.digests);
+    const digest = digests?.[peerKey];
+    if (digest === undefined) {
+      throw new Error(`legacy digest source does not contain exact scope ${peerKey}`);
+    }
+    assertExactScopeMetadata(digest, scope, "legacy digest");
+    scopedValue = { peerKey, digest };
+    const digestRecord = objectRecord(digest);
+    occurredAt = timestampValue(
+      digestRecord?.updatedAt ?? digestRecord?.coveredUntil,
+      occurredAt,
+    );
+  }
+  const sourceContent = canonicalSourceContent(scopedValue);
   return [{
     sourceKind,
     sourcePath: file,
-    sourceRecordId: `${sourceKind}:snapshot`,
+    sourceRecordId: `${sourceKind}:${peerKey}`,
     sourceContent,
-    legacyId: path.basename(file),
+    legacyId: `${path.basename(file)}:${peerKey}`,
     actor: "system",
-    text: modelText(value),
-    occurredAt: fs.statSync(file).mtimeMs,
+    text: modelText(scopedValue),
+    occurredAt,
     metadata: {
-      snapshot: value,
+      legacyPeerKey: peerKey,
       migrationRole: sourceKind === "state"
         ? "relationship_commitment_scene_projection"
         : "conversation_digest_projection",
     },
-    auditedNonImport: value === null
-      ? auditedNonImport("empty_record")
-      : undefined,
   }];
 }
 
@@ -505,12 +570,17 @@ function collectRefIndexRecords(
 ): LegacyMigrationRecord[] {
   if (!file) return [];
   return readJsonLines(file).flatMap(({ value, lineNumber }) => {
-    if (!matchesScope(value, scope)) return [];
-    const record = objectRecord(value);
-    const text = record
-      ? textValue(record.content ?? record.text ?? record.summary)
-      : "";
-    const attachments = Array.isArray(record?.attachments) ? record.attachments : [];
+    const envelope = objectRecord(value);
+    const logicalId = envelope ? textValue(envelope.k, 300) : "";
+    const record = envelope ? objectRecord(envelope.v) : undefined;
+    if (!envelope || !logicalId || !record || !("t" in envelope)) {
+      throw new Error(
+        `legacy ref-index row ${file}:${lineNumber} must use the production {k,v,t} schema`,
+      );
+    }
+    if (!matchesScope(record, scope)) return [];
+    const text = textValue(record.content ?? record.text ?? record.summary);
+    const attachments = Array.isArray(record.attachments) ? record.attachments : [];
     const attachmentText = attachments
       .map((attachment) => textValue(attachment, 1_000))
       .filter(Boolean)
@@ -522,20 +592,17 @@ function collectRefIndexRecords(
       sourcePath: file,
       sourceRecordId: `ref_index:line-${lineNumber}`,
       sourceContent,
-      legacyId: record
-        ? textValue(record.msgIdx ?? record.id, 300) || `line-${lineNumber}`
-        : `line-${lineNumber}`,
-      actor: record ? inferRefActor(record, scope) : "system",
+      legacyId: logicalId,
+      actor: inferRefActor(record, scope),
       text: modelText(value, combined),
-      occurredAt: timestampValue(record?.timestamp),
-      metadata: { legacyRefIndex: value },
-      auditedNonImport: value === null
-        ? auditedNonImport("empty_record")
-        : !record
-          ? auditedNonImport("unsupported_record_shape")
-          : combined
-            ? undefined
-            : auditedNonImport("no_supported_text"),
+      occurredAt: timestampValue(record.timestamp ?? envelope.t),
+      metadata: {
+        legacyRefIndexKey: logicalId,
+        legacyRefIndexTimestamp: envelope.t,
+      },
+      auditedNonImport: combined
+        ? undefined
+        : auditedNonImport("no_supported_text"),
     }];
   });
 }
@@ -567,7 +634,11 @@ function qqDirectSessionIds(
     const session = value as Record<string, unknown>;
     if (!matchesScope(session, scope)) continue;
     const sessionId = textValue(session.sessionId, 200);
-    if (sessionId) ids.push(sessionId);
+    if (!sessionId) continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(sessionId)) {
+      throw new Error(`invalid legacy session id for ${key}`);
+    }
+    ids.push(sessionId);
   }
   return [...new Set(ids)];
 }
@@ -582,9 +653,18 @@ function collectSessionRecords(
     throw new Error(`legacy sessions directory does not exist: ${sessionsDirectory}`);
   }
   const sessionIds = qqDirectSessionIds(indexFile, scope);
+  const sessionsRoot = path.resolve(sessionsDirectory);
   const records: LegacyMigrationRecord[] = [];
   for (const sessionId of sessionIds) {
-    const file = path.join(sessionsDirectory, `${sessionId}.jsonl`);
+    const file = path.resolve(sessionsRoot, `${sessionId}.jsonl`);
+    const relative = path.relative(sessionsRoot, file);
+    if (
+      relative.startsWith(`..${path.sep}`)
+      || relative === ".."
+      || path.isAbsolute(relative)
+    ) {
+      throw new Error(`invalid legacy session id: ${sessionId}`);
+    }
     for (const { value, lineNumber } of readJsonLines(file)) {
       const row = objectRecord(value);
       const message = row?.type === "message"
@@ -593,7 +673,6 @@ function collectSessionRecords(
       const role = message?.role;
       const preferredText = message ? sessionText(message) : "";
       const sourceContent = canonicalSourceContent(value);
-      const internalSystemRecord = /^\[(?:cron|system):/i.test(preferredText);
       records.push({
         sourceKind: "session",
         sourcePath: file,
@@ -606,15 +685,12 @@ function collectSessionRecords(
         text: modelText(value, preferredText),
         occurredAt: timestampValue(message?.timestamp ?? row?.timestamp),
         metadata: {
-          legacyRecord: value,
           sessionId,
           sourceLine: lineNumber,
           messageId: row?.id,
           role,
         },
-        auditedNonImport: internalSystemRecord
-          ? auditedNonImport("filtered_system_record")
-          : !message || (role !== "user" && role !== "assistant")
+        auditedNonImport: !message || (role !== "user" && role !== "assistant")
             ? auditedNonImport("unsupported_session_record")
             : preferredText
               ? undefined
@@ -632,8 +708,8 @@ export function collectLegacyMigrationRecords(
   return [
     ...collectMemoryRecords(sources.memoryJson, scope),
     ...collectClaimRecords(sources.claimsJsonl, scope),
-    ...collectSnapshotRecord(sources.stateJson, "state"),
-    ...collectSnapshotRecord(sources.digestJson, "digest"),
+    ...collectSnapshotRecord(sources.stateJson, "state", scope),
+    ...collectSnapshotRecord(sources.digestJson, "digest", scope),
     ...collectRefIndexRecords(sources.refIndexJsonl, scope),
     ...collectSessionRecords(
       sources.sessionsIndexJson,
@@ -675,11 +751,11 @@ function eventInputForRecord(
     metadata: {
       ...record.metadata,
       legacySourceKind: record.sourceKind,
+      legacySourcePath: record.sourcePath,
       legacyId: record.legacyId,
       legacySourceRecordId: physicalRecordId,
       legacyContentHash: contentHash,
       legacyAuditedNonImport: record.auditedNonImport,
-      provisional: record.provisional,
     },
   };
 }

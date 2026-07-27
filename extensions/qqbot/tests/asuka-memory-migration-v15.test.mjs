@@ -21,10 +21,40 @@ const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-v15-"));
 const memoryFile = path.join(fixtureRoot, "memory.json");
 const claimsFile = path.join(fixtureRoot, "claims.jsonl");
 const stateFile = path.join(fixtureRoot, "state.json");
+const digestFile = path.join(fixtureRoot, "digest.json");
 const refIndexFile = path.join(fixtureRoot, "ref-index.jsonl");
 const sessionsDirectory = path.join(fixtureRoot, "sessions");
 const sessionsIndexFile = path.join(sessionsDirectory, "sessions.json");
+const targetPeerKey = "default:direct:user-1";
+const otherPeerKey = "default:direct:user-2";
+const targetSessionId = "11111111-1111-4111-8111-111111111111";
+const otherSessionId = "22222222-2222-4222-8222-222222222222";
 fs.mkdirSync(sessionsDirectory, { recursive: true });
+
+function digestFixture(peerKey, marker, updatedAt) {
+  return {
+    version: 2,
+    peerKey,
+    window: "7d",
+    updatedAt,
+    coveredUntil: updatedAt,
+    timeZone: "Asia/Shanghai",
+    weekly: {
+      relationshipContinuity: marker,
+      recentEmotionalArc: "",
+      currentOpenLoops: [],
+      userPreferences: [],
+      temporaryDirectives: [],
+      asukaSelfContinuity: "",
+      sceneContinuity: "",
+      importantRecentFacts: [],
+      thingsToAvoid: [],
+      lastSalientTurns: [],
+      evidenceNotes: [],
+    },
+    daily: [],
+  };
+}
 
 fs.writeFileSync(memoryFile, JSON.stringify({
   version: 1,
@@ -62,28 +92,85 @@ fs.writeFileSync(claimsFile, `${JSON.stringify({
   observedAt: "2026-01-01T00:00:00Z",
 })}\n`);
 fs.writeFileSync(stateFile, JSON.stringify({
+  version: 1,
   peers: {
-    "default:direct:user-1": {
-      relationship: { phase: "close" },
-      promises: [{ id: "promise-1", text: "稍后提醒" }],
+    [targetPeerKey]: {
+      accountId: "default",
+      peerKey: targetPeerKey,
+      peerKind: "direct",
+      peerId: "user-1",
+      marker: "target-state",
+    },
+    [otherPeerKey]: {
+      accountId: "default",
+      peerKey: otherPeerKey,
+      peerKind: "direct",
+      peerId: "user-2",
+      marker: "other-state-must-not-import",
+    },
+  },
+  promises: {
+    "promise-target": {
+      id: "promise-target",
+      accountId: "default",
+      peerKey: targetPeerKey,
+      peerKind: "direct",
+      peerId: "user-1",
+      marker: "target-promise",
+    },
+    "promise-other": {
+      id: "promise-other",
+      accountId: "default",
+      peerKey: otherPeerKey,
+      peerKind: "direct",
+      peerId: "user-2",
+      marker: "other-promise-must-not-import",
     },
   },
 }));
-fs.writeFileSync(refIndexFile, `${JSON.stringify({
-  id: "ref-1",
-  peerId: "user-1",
-  senderId: "user-1",
-  content: "最近在准备搬家",
-  timestamp: 300,
-})}\n`);
+fs.writeFileSync(digestFile, JSON.stringify({
+  version: 2,
+  digests: {
+    [targetPeerKey]: digestFixture(targetPeerKey, "target-digest", 400),
+    [otherPeerKey]: digestFixture(otherPeerKey, "other-digest-must-not-import", 500),
+  },
+}));
+fs.writeFileSync(refIndexFile, [
+  JSON.stringify({
+    k: "REFIDX_TARGET",
+    v: {
+      content: "target-ref-content",
+      senderId: "user-1",
+      peerId: "user-1",
+      timestamp: 300,
+      attachments: [{ type: "voice", transcript: "target-ref-transcript" }],
+    },
+    t: 301,
+  }),
+  JSON.stringify({
+    k: "REFIDX_OTHER",
+    v: {
+      content: "other-ref-must-not-import",
+      senderId: "user-2",
+      peerId: "user-2",
+      timestamp: 302,
+    },
+    t: 303,
+  }),
+].join("\n"));
 fs.writeFileSync(sessionsIndexFile, JSON.stringify({
   "agent:main:qqbot:direct:user-1": {
-    sessionId: "session-1",
+    sessionId: targetSessionId,
+    channel: "qqbot",
+    chatType: "direct",
+  },
+  "agent:main:qqbot:direct:user-2": {
+    sessionId: otherSessionId,
     channel: "qqbot",
     chatType: "direct",
   },
 }));
-fs.writeFileSync(path.join(sessionsDirectory, "session-1.jsonl"), [
+fs.writeFileSync(path.join(sessionsDirectory, `${targetSessionId}.jsonl`), [
   JSON.stringify({
     type: "message",
     id: "session-user",
@@ -103,11 +190,21 @@ fs.writeFileSync(path.join(sessionsDirectory, "session-1.jsonl"), [
     },
   }),
 ].join("\n"));
+fs.writeFileSync(path.join(sessionsDirectory, `${otherSessionId}.jsonl`), `${JSON.stringify({
+  type: "message",
+  id: "other-session-message",
+  timestamp: "2026-01-02T00:00:02Z",
+  message: {
+    role: "user",
+    content: [{ type: "text", text: "other-session-must-not-import" }],
+  },
+})}\n`);
 
 const sources = {
   memoryJson: memoryFile,
   claimsJsonl: claimsFile,
   stateJson: stateFile,
+  digestJson: digestFile,
   refIndexJsonl: refIndexFile,
   sessionsIndexJson: sessionsIndexFile,
   sessionsDirectory,
@@ -116,12 +213,30 @@ const scope = { accountId: "default", peerId: "user-1" };
 const records = collectLegacyMigrationRecords(sources, scope);
 assert.deepEqual(
   Object.fromEntries(
-    ["memory", "claim", "state", "ref_index", "session"].map((kind) => [
+    ["memory", "claim", "state", "digest", "ref_index", "session"].map((kind) => [
       kind,
       records.filter((record) => record.sourceKind === kind).length,
     ]),
   ),
-  { memory: 2, claim: 1, state: 1, ref_index: 1, session: 2 },
+  { memory: 2, claim: 1, state: 1, digest: 1, ref_index: 1, session: 2 },
+);
+const scopedState = JSON.parse(records.find((record) => record.sourceKind === "state").sourceContent);
+assert.equal(scopedState.peerKey, targetPeerKey);
+assert.equal(scopedState.peer.marker, "target-state");
+assert.deepEqual(Object.keys(scopedState.promises), ["promise-target"]);
+assert.doesNotMatch(JSON.stringify(scopedState), /other-.*-must-not-import/);
+const scopedDigest = JSON.parse(records.find((record) => record.sourceKind === "digest").sourceContent);
+assert.equal(scopedDigest.peerKey, targetPeerKey);
+assert.equal(scopedDigest.digest.weekly.relationshipContinuity, "target-digest");
+assert.doesNotMatch(JSON.stringify(scopedDigest), /other-digest-must-not-import/);
+const scopedRefIndex = records.find((record) => record.sourceKind === "ref_index");
+assert.equal(scopedRefIndex.legacyId, "REFIDX_TARGET");
+assert.match(scopedRefIndex.text, /target-ref-content/);
+assert.match(scopedRefIndex.text, /target-ref-transcript/);
+assert.doesNotMatch(scopedRefIndex.sourceContent, /other-ref-must-not-import/);
+assert.equal(
+  records.some((record) => record.text.includes("other-session-must-not-import")),
+  false,
 );
 const malformedClaimsFile = path.join(fixtureRoot, "malformed-claims.jsonl");
 fs.writeFileSync(malformedClaimsFile, "{\"id\":\n");
@@ -136,6 +251,66 @@ assert.throws(
   }, scope),
   /legacy source does not exist:/,
   "a missing configured source must not be treated as an empty source",
+);
+const missingScopeStateFile = path.join(fixtureRoot, "missing-scope-state.json");
+fs.writeFileSync(missingScopeStateFile, JSON.stringify({
+  version: 1,
+  peers: {
+    [otherPeerKey]: {
+      accountId: "default",
+      peerKey: otherPeerKey,
+      peerKind: "direct",
+      peerId: "user-2",
+    },
+  },
+  promises: {},
+}));
+assert.throws(
+  () => collectLegacyMigrationRecords({ stateJson: missingScopeStateFile }, scope),
+  /does not contain exact scope/i,
+  "a configured global state without the exact peer entry must fail closed",
+);
+const conflictingScopeDigestFile = path.join(fixtureRoot, "conflicting-scope-digest.json");
+fs.writeFileSync(conflictingScopeDigestFile, JSON.stringify({
+  version: 2,
+  digests: {
+    [targetPeerKey]: digestFixture(otherPeerKey, "conflicting-digest", 600),
+  },
+}));
+assert.throws(
+  () => collectLegacyMigrationRecords({ digestJson: conflictingScopeDigestFile }, scope),
+  /scope metadata/i,
+  "a digest stored under the target key with conflicting scope metadata must fail closed",
+);
+const flatRefIndexFile = path.join(fixtureRoot, "flat-ref-index.jsonl");
+fs.writeFileSync(flatRefIndexFile, `${JSON.stringify({
+  id: "legacy-flat-row",
+  peerId: "user-1",
+  content: "unsupported-flat-ref-index",
+  timestamp: 700,
+})}\n`);
+assert.throws(
+  () => collectLegacyMigrationRecords({ refIndexJsonl: flatRefIndexFile }, scope),
+  /ref-index.*\{k,v,t\}/i,
+  "unknown ref-index row schemas must fail closed",
+);
+const hostileSessionsDirectory = path.join(fixtureRoot, "hostile-sessions");
+const hostileSessionsIndex = path.join(hostileSessionsDirectory, "sessions.json");
+fs.mkdirSync(hostileSessionsDirectory, { recursive: true });
+fs.writeFileSync(hostileSessionsIndex, JSON.stringify({
+  "agent:main:qqbot:direct:user-1": {
+    sessionId: "../../outside",
+    channel: "qqbot",
+    chatType: "direct",
+  },
+}));
+assert.throws(
+  () => collectLegacyMigrationRecords({
+    sessionsIndexJson: hostileSessionsIndex,
+    sessionsDirectory: hostileSessionsDirectory,
+  }, scope),
+  /invalid legacy session id/i,
+  "a hostile session id must be rejected before any transcript path is read",
 );
 
 const sourceAccountingRegressionFailures = [];
@@ -152,12 +327,16 @@ function verifySourceAccountingRegression(name, run) {
 verifySourceAccountingRegression("full source content hash", () => {
   const collisionSessionsDirectory = path.join(fixtureRoot, "collision-sessions");
   const collisionSessionsIndex = path.join(collisionSessionsDirectory, "sessions.json");
-  const collisionSessionFile = path.join(collisionSessionsDirectory, "collision-session.jsonl");
+  const collisionSessionId = "33333333-3333-4333-8333-333333333333";
+  const collisionSessionFile = path.join(
+    collisionSessionsDirectory,
+    `${collisionSessionId}.jsonl`,
+  );
   const sharedPrefix = "相".repeat(8_000);
   fs.mkdirSync(collisionSessionsDirectory, { recursive: true });
   fs.writeFileSync(collisionSessionsIndex, JSON.stringify({
     "agent:main:qqbot:direct:user-1": {
-      sessionId: "collision-session",
+      sessionId: collisionSessionId,
       channel: "qqbot",
       chatType: "direct",
     },
@@ -190,11 +369,9 @@ verifySourceAccountingRegression("full source content hash", () => {
     assert.equal(firstReport.importedEvents, 1);
     const storedSource = collisionLedger.getEvent(firstReport.sourceMap[0].eventId);
     assert.equal(storedSource.text.length, 8_000);
-    assert.match(
-      JSON.stringify(storedSource.metadata.legacyRecord),
-      /尾部甲/,
-      "the ledger must retain complete source provenance outside model-facing text",
-    );
+    assert.equal(typeof storedSource.metadata.legacyContentHash, "string");
+    assert.equal("legacyRecord" in storedSource.metadata, false);
+    assert.doesNotMatch(JSON.stringify(storedSource.metadata), /尾部甲/);
 
     writeCollisionRow("尾部乙");
     const changedRecords = collectLegacyMigrationRecords(collisionSources, scope);
@@ -206,6 +383,57 @@ verifySourceAccountingRegression("full source content hash", () => {
     );
   } finally {
     collisionLedger.close();
+  }
+});
+
+verifySourceAccountingRegression("secret-bearing legacy payload is not persisted", () => {
+  const secret = "sk-phase23-secret-1234567890";
+  const secretMemoryFile = path.join(fixtureRoot, "secret-memory.json");
+  const secretDatabase = path.join(fixtureRoot, "secret-memory.sqlite");
+  fs.writeFileSync(secretMemoryFile, JSON.stringify({
+    version: 1,
+    memories: {
+      "secret-record": {
+        id: "secret-record",
+        accountId: "default",
+        peerKind: "direct",
+        peerId: "user-1",
+        type: "explicit",
+        text: `api_key=${secret}`,
+        source: "user_explicit",
+        nested: { rawSecret: secret },
+      },
+    },
+  }));
+  const secretRecords = collectLegacyMigrationRecords(
+    { memoryJson: secretMemoryFile },
+    scope,
+  );
+  const secretLedger = new AsukaMemoryLedger(secretDatabase);
+  try {
+    const secretEngine = new AsukaMemoryEngine(secretLedger);
+    const secretReport = migrateLegacyRecords(secretEngine, secretRecords, scope);
+    const secretEvent = secretLedger.getEvent(secretReport.sourceMap[0].eventId);
+    assert.equal(secretEvent.text, "[secret-bearing content omitted]");
+    assert.equal(secretEvent.metadata.secretRedacted, true);
+    assert.equal("legacyRecord" in secretEvent.metadata, false);
+    assert.equal(typeof secretEvent.metadata.legacyContentHash, "string");
+    assert.equal(secretEvent.metadata.legacySourcePath, secretMemoryFile);
+    assert.doesNotMatch(JSON.stringify(secretEvent.metadata), new RegExp(secret));
+  } finally {
+    secretLedger.close();
+  }
+  for (const sqlitePath of [
+    secretDatabase,
+    `${secretDatabase}-wal`,
+    `${secretDatabase}-shm`,
+  ]) {
+    if (!fs.existsSync(sqlitePath)) continue;
+    assert.equal(
+      fs.readFileSync(sqlitePath).includes(Buffer.from(secret)),
+      false,
+      `plaintext secret must not remain in ${path.basename(sqlitePath)}`,
+    );
   }
 });
 
@@ -331,19 +559,19 @@ const database = path.join(fixtureRoot, "memory-ledger.sqlite.next");
 const ledger = new AsukaMemoryLedger(database);
 const engine = new AsukaMemoryEngine(ledger);
 const firstMigration = migrateLegacyRecords(engine, records, scope);
-assert.equal(firstMigration.discoveredRecords, 7);
-assert.equal(firstMigration.importedEvents, 7);
+assert.equal(firstMigration.discoveredRecords, 8);
+assert.equal(firstMigration.importedEvents, 8);
 assert.equal(firstMigration.skippedRecords, 0);
 assert.equal(firstMigration.provisionalCandidates, 3);
 assert.equal(ledger.listClaims({ states: ["active"] }).length, 0, "legacy claims must not become active without rejudgement");
 assert.equal(ledger.listClaims({ states: ["candidate"] }).length, 3);
-assert.equal(ledger.listJobs("pending").length, 7);
+assert.equal(ledger.listJobs("pending").length, 8);
 assert.ok(firstMigration.sourceMap.every((item) => item.eventId), "every imported legacy id must map to an event");
 
 const secondMigration = migrateLegacyRecords(engine, records, scope);
 assert.equal(secondMigration.importedEvents, 0);
-assert.equal(secondMigration.duplicateEvents, 7, "migration must be safely resumable");
-assert.equal(ledger.listEvents().length, 7);
+assert.equal(secondMigration.duplicateEvents, 8, "migration must be safely resumable");
+assert.equal(ledger.listEvents().length, 8);
 const untrackedLegacyEvent = engine.ingestMemoryEvent({
   accountId: "default",
   peerKind: "direct",
