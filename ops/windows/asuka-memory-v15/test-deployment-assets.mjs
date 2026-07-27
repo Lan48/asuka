@@ -569,15 +569,50 @@ try {
     common,
     /function Get-AsukaDirectoryIntegrity[\s\S]*?Sort-Object path[\s\S]*?function Write-AsukaBackupIntegrity/,
   );
+  assert.match(
+    common,
+    /Get-ChildItem -LiteralPath \$root -File -Recurse -Force -ErrorAction Stop[\s\S]*?\$ExcludeReparsePoints[\s\S]*?\[IO\.FileAttributes\]::ReparsePoint/,
+  );
+  assert.match(
+    common,
+    /\$sourceIntegrity = Get-AsukaDirectoryIntegrity -Path \$source\s+`?\s*-ExcludeReparsePoints/,
+  );
+  assert.match(
+    deploy,
+    /\$sourceIntegrity = Get-AsukaDirectoryIntegrity -Path \(\[string\]\$_\.source\)\s+`?\s*-ExcludeReparsePoints/,
+  );
+  assert.match(
+    deploy,
+    /\$backupIntegrity = Get-AsukaDirectoryIntegrity -Path \(\[string\]\$_\.backup\)/,
+  );
   assert.match(common, /unmanifested protected file/);
   assert.match(common, /byte total is invalid/);
   assert.match(common, /tree hash is invalid/);
+  const backupVerifier = common.match(
+    /function Test-AsukaBackupIntegrity[\s\S]*?function Read-AsukaManifest/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(backupVerifier, /Get-AsukaSha256 -Path \$file/);
+  assert.doesNotMatch(backupVerifier, /\$records \+=/);
+  assert.match(backupVerifier, /\$actualPaths\[\$pathKey\] = \$entry/);
+  assert.match(backupVerifier, /Protected backup file is missing/);
+  assert.match(backupVerifier, /Protected backup file failed integrity verification/);
+  assert.match(common, /backup-complete\.marker\.pending/);
+  assert.match(
+    common,
+    /Test-AsukaBackupIntegrity -BackupPath \$backupRoot -PendingMarker[\s\S]*?Move-Item -LiteralPath \$pendingMarkerPath -Destination \$markerPath/,
+  );
+  assert.doesNotMatch(
+    deploy,
+    /Write-AsukaBackupIntegrity -BackupPath \$backupPath\s*\r?\n\s*\[void\]\(Test-AsukaBackupIntegrity/,
+  );
   assert.match(common, /Current file changed after freeze/);
   assert.match(common, /scheduled-tasks\\\$GatewayTaskName\.xml/);
   assert.match(common, /syncWorker integrity contract/);
   assert.match(common, /syncWorker does not match its opsFiles entry/);
   assert.match(common, /function ConvertFrom-AsukaTaskArguments/);
+  assert.match(common, /function Test-AsukaFullyQualifiedWindowsPath/);
   assert.match(common, /function Test-AsukaPowerShellFileAction/);
+  assert.match(common, /\$rawWorkingDirectory\.Equals/);
   assert.match(common, /CommandLineToArgvW/);
   assert.match(common, /LocalFree/);
   assert.doesNotMatch(common, /ExpandEnvironmentVariables/);
@@ -585,22 +620,22 @@ try {
   assert.match(preflight, /expectedInstalledSha256\s*=\s*\$expectedSyncScriptHash/);
   assert.match(
     preflight,
-    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\] -ScriptPath \$gatewayScript/,
+    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\][\s\S]*?-ScriptPath \$gatewayScript -AllowedWorkingDirectory \$AppRoot/,
   );
   assert.match(
     preflight,
-    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\] -ScriptPath \$syncScript/,
+    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\][\s\S]*?-ScriptPath \$syncScript -AllowedWorkingDirectory \$AppRoot/,
   );
   assert.match(verify, /Persisted migration report is missing/);
   assert.match(verify, /Installed sync worker does not match the release integrity contract/);
   assert.match(verify, /\$installedSyncScriptHash\s+-ne\s+\$expectedSyncScriptHash/);
   assert.match(
     verify,
-    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\] -ScriptPath \$gatewayScript/,
+    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\][\s\S]*?-ScriptPath \$gatewayScript -AllowedWorkingDirectory \$AppRoot/,
   );
   assert.match(
     verify,
-    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\] -ScriptPath \$syncScript/,
+    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\][\s\S]*?-ScriptPath \$syncScript -AllowedWorkingDirectory \$AppRoot/,
   );
   assert.doesNotMatch(preflight, /syncScriptArgumentPattern/);
   assert.doesNotMatch(verify, /syncScriptArgumentPattern/);
@@ -639,6 +674,7 @@ try {
   assert.match(normalizeTaskActions, /Test-AsukaPowerShellFileAction/);
   assert.match(normalizeTaskActions, /Set-AsukaTaskFromSnapshot/);
   assert.match(normalizeTaskActions, /argumentsPreserved/);
+  assert.match(normalizeTaskActions, /workingDirectoryPreserved/);
 
   const configuredOpenClaw = path.join(fixtureRoot, "configured-openclaw.json");
   writeAbsolute(
@@ -925,12 +961,17 @@ try {
         `. '${commonScript}'`,
         "$target = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'Asuka Memory\\asuka-memory-sync.ps1'))",
         "$trustedHost = Join-Path $PSHOME 'powershell.exe'",
+        "$driveRelativeHost = $trustedHost.Substring(0, 2) + $trustedHost.Substring(3)",
+        "$rootRelativeHost = '\\' + $trustedHost.Substring(3)",
         "$validArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + $target + '\"'",
         "$cases = @(",
         "  @{ Name = 'bare host'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'valid absolute host'; Expected = $true; Execute = $trustedHost; Arguments = $validArguments },",
         "  @{ Name = 'valid absolute case difference'; Expected = $true; Execute = $trustedHost.ToUpperInvariant(); Arguments = '-File \"' + $target.ToUpperInvariant() + '\"' },",
         "  @{ Name = 'working directory'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments; WorkingDirectory = 'C:\\Temp' },",
+        "  @{ Name = 'drive-relative host'; Expected = $false; Execute = $driveRelativeHost; Arguments = $validArguments },",
+        "  @{ Name = 'root-relative host'; Expected = $false; Execute = $rootRelativeHost; Arguments = $validArguments },",
+        "  @{ Name = 'whitespace host'; Expected = $false; Execute = ' ' + $trustedHost + ' '; Arguments = $validArguments },",
         "  @{ Name = 'evil executable'; Expected = $false; Execute = 'evilpowershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'alternate executable'; Expected = $false; Execute = 'C:\\Temp\\powershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'relative executable'; Expected = $false; Execute = '.\\powershell.exe'; Arguments = $validArguments },",
@@ -956,6 +997,22 @@ try {
         "  $actual = Test-AsukaPowerShellFileAction -Action $action -ScriptPath $target",
         "  if ($actual -ne $case.Expected) { throw \"Task action validation case failed: $($case.Name)\" }",
         "}",
+        "$allowedWorkingDirectory = Split-Path -Parent $target",
+        "$allowedWorkingAction = [pscustomobject]@{ execute = $trustedHost; arguments = $validArguments; workingDirectory = $allowedWorkingDirectory }",
+        "if (-not (Test-AsukaPowerShellFileAction -Action $allowedWorkingAction -ScriptPath $target -AllowedWorkingDirectory $allowedWorkingDirectory)) { throw 'Allowed working directory was rejected.' }",
+        "if (Test-AsukaPowerShellFileAction -Action $allowedWorkingAction -ScriptPath $target -AllowedWorkingDirectory 'C:\\Temp') { throw 'Unexpected working directory was accepted.' }",
+        "$driveRelativeWorkingDirectory = $allowedWorkingDirectory.Substring(0, 2) + $allowedWorkingDirectory.Substring(3)",
+        "$rootRelativeWorkingDirectory = '\\' + $allowedWorkingDirectory.Substring(3)",
+        "foreach ($invalidWorkingDirectory in @($driveRelativeWorkingDirectory, $rootRelativeWorkingDirectory, (' ' + $allowedWorkingDirectory + ' '))) {",
+        "  $invalidWorkingAction = [pscustomobject]@{ execute = $trustedHost; arguments = $validArguments; workingDirectory = $invalidWorkingDirectory }",
+        "  if (Test-AsukaPowerShellFileAction -Action $invalidWorkingAction -ScriptPath $target -AllowedWorkingDirectory $allowedWorkingDirectory) { throw \"Invalid working directory was accepted: $invalidWorkingDirectory\" }",
+        "}",
+        "$trailingWorkingDirectory = $allowedWorkingDirectory.TrimEnd('\\') + '\\'",
+        "$trailingWorkingAction = [pscustomobject]@{ execute = $trustedHost; arguments = $validArguments; workingDirectory = $trailingWorkingDirectory }",
+        "if (-not (Test-AsukaPowerShellFileAction -Action $trailingWorkingAction -ScriptPath $target -AllowedWorkingDirectory $allowedWorkingDirectory)) { throw 'Equivalent trailing working directory was rejected.' }",
+        "$uncWorkingDirectory = '\\\\server\\share\\Asuka'",
+        "$uncWorkingAction = [pscustomobject]@{ execute = $trustedHost; arguments = $validArguments; workingDirectory = $uncWorkingDirectory }",
+        "if (-not (Test-AsukaPowerShellFileAction -Action $uncWorkingAction -ScriptPath $target -AllowedWorkingDirectory $uncWorkingDirectory)) { throw 'Fully qualified UNC working directory was rejected.' }",
         "$parsed = @(ConvertFrom-AsukaTaskArguments -Arguments '  -NoProfile   -File \"C:\\Asuka Memory\\worker.ps1\"  ')",
         "if ($parsed.Count -ne 3 -or $parsed[2] -ne 'C:\\Asuka Memory\\worker.ps1') { throw 'Quoted path parsing failed.' }",
         "$escaped = @(ConvertFrom-AsukaTaskArguments -Arguments 'one\\\\\\\"two')",
@@ -983,9 +1040,13 @@ try {
         "  [IO.File]::WriteAllBytes((Join-Path $baseline 'payload\\data.bin'), [byte[]](1, 2, 3, 4))",
         "  [IO.File]::WriteAllBytes((Join-Path $baseline 'a\\child.bin'), [byte[]](5))",
         "  [IO.File]::WriteAllBytes((Join-Path $baseline 'a0.bin'), [byte[]](6))",
+        "  $hiddenSystem = Join-Path $baseline 'hidden-system.bin'",
+        "  [IO.File]::WriteAllBytes($hiddenSystem, [byte[]](7))",
+        "  [IO.File]::SetAttributes($hiddenSystem, [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)",
         "  Set-Content -LiteralPath (Join-Path $baseline 'backup-manifest.json') -Value '{}' -Encoding UTF8",
         "  Set-Content -LiteralPath (Join-Path $baseline 'BACKUP_COMPLETE') -Value 'complete' -Encoding ASCII",
         "  [void](Write-AsukaBackupIntegrity -BackupPath $baseline)",
+        "  if (Test-Path -LiteralPath (Join-Path $baseline 'backup-complete.marker.pending')) { throw 'pending backup marker remained after finalization' }",
         "  [void](Test-AsukaBackupIntegrity -BackupPath $baseline)",
         "  function Copy-IntegrityFixture {",
         "    param([string]$Name)",

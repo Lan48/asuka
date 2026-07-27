@@ -83,13 +83,16 @@ function Get-AsukaSha256 {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     throw "File does not exist: $Path"
   }
-  return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+  return (
+    Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop
+  ).Hash.ToLowerInvariant()
 }
 
 function Get-AsukaDirectoryIntegrity {
   param(
     [Parameter(Mandatory = $true)][string]$Path,
-    [string[]]$ExcludePaths = @()
+    [string[]]$ExcludePaths = @(),
+    [switch]$ExcludeReparsePoints
   )
 
   if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
@@ -102,7 +105,11 @@ function Get-AsukaDirectoryIntegrity {
     $excluded[$key] = $true
   }
   $files = @(
-    Get-ChildItem -LiteralPath $root -File -Recurse -Force |
+    Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction Stop |
+      Where-Object {
+        -not $ExcludeReparsePoints -or
+          -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+      } |
       ForEach-Object {
         $relative = $_.FullName.Substring($root.Length).TrimStart("\").Replace("\", "/")
         if (-not $excluded.ContainsKey($relative.ToLowerInvariant())) {
@@ -141,7 +148,8 @@ function Write-AsukaBackupIntegrity {
   $backupRoot = [IO.Path]::GetFullPath($BackupPath).TrimEnd("\")
   $manifestPath = Join-Path $backupRoot "backup-files.json"
   $markerPath = Join-Path $backupRoot "backup-complete.marker"
-  foreach ($path in @($manifestPath, $markerPath)) {
+  $pendingMarkerPath = "$markerPath.pending"
+  foreach ($path in @($manifestPath, $markerPath, $pendingMarkerPath)) {
     if (Test-Path -LiteralPath $path) {
       Remove-Item -LiteralPath $path -Force
     }
@@ -164,17 +172,41 @@ function Write-AsukaBackupIntegrity {
     bytes = [int64]$integrity.bytes
     treeSha256 = [string]$integrity.sha256
   }
-  Write-AsukaJsonFile -Path $markerPath -Value $marker
+  Write-AsukaJsonFile -Path $pendingMarkerPath -Value $marker
+  try {
+    [void](Test-AsukaBackupIntegrity -BackupPath $backupRoot -PendingMarker)
+    Move-Item -LiteralPath $pendingMarkerPath -Destination $markerPath
+  } catch {
+    if (Test-Path -LiteralPath $pendingMarkerPath) {
+      Remove-Item -LiteralPath $pendingMarkerPath -Force
+    }
+    throw
+  }
   return $marker
 }
 
 function Test-AsukaBackupIntegrity {
-  param([Parameter(Mandatory = $true)][string]$BackupPath)
+  param(
+    [Parameter(Mandatory = $true)][string]$BackupPath,
+    [switch]$PendingMarker
+  )
 
   $backupRoot = [IO.Path]::GetFullPath($BackupPath).TrimEnd("\")
   $manifestPath = Join-Path $backupRoot "backup-files.json"
-  $markerPath = Join-Path $backupRoot "backup-complete.marker"
-  $integrityFiles = @("backup-files.json", "backup-complete.marker")
+  $finalMarkerPath = Join-Path $backupRoot "backup-complete.marker"
+  $markerPath = if ($PendingMarker) {
+    "$finalMarkerPath.pending"
+  } else {
+    $finalMarkerPath
+  }
+  if ($PendingMarker -and (Test-Path -LiteralPath $finalMarkerPath)) {
+    throw "Final backup marker exists before pending verification."
+  }
+  $integrityFiles = if ($PendingMarker) {
+    @("backup-files.json", "backup-complete.marker.pending")
+  } else {
+    @("backup-files.json", "backup-complete.marker")
+  }
   foreach ($path in @($manifestPath, $markerPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
       throw "Backup integrity artifact is missing: $path"
@@ -208,7 +240,7 @@ function Test-AsukaBackupIntegrity {
   ) {
     throw "Backup file manifest and marker have inconsistent totals."
   }
-  $records = @()
+  $records = New-Object System.Collections.ArrayList
   $recordPaths = @{}
   foreach ($entry in @($manifest.files)) {
     $relative = ([string]$entry.path).Replace("\", "/")
@@ -232,20 +264,11 @@ function Test-AsukaBackupIntegrity {
     if (-not $canonicalRelative.Equals($relative, [StringComparison]::OrdinalIgnoreCase)) {
       throw "Backup file manifest contains a non-canonical protected path: $relative"
     }
-    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-      throw "Protected backup file is missing: $relative"
-    }
-    if (
-      [int64](Get-Item -LiteralPath $file).Length -ne [int64]$entry.bytes -or
-      (Get-AsukaSha256 -Path $file) -ne ([string]$entry.sha256).ToLowerInvariant()
-    ) {
-      throw "Protected backup file failed integrity verification: $relative"
-    }
-    $records += [pscustomobject]@{
+    [void]$records.Add([pscustomobject]@{
       path = $relative
       bytes = [int64]$entry.bytes
       sha256 = ([string]$entry.sha256).ToLowerInvariant()
-    }
+    })
   }
   $recordBytes = [int64](($records | Measure-Object -Property bytes -Sum).Sum)
   if ($recordBytes -ne [int64]$manifest.bytes) {
@@ -266,17 +289,33 @@ function Test-AsukaBackupIntegrity {
     throw "Backup file manifest tree hash is invalid."
   }
   $actual = Get-AsukaDirectoryIntegrity -Path $backupRoot -ExcludePaths $integrityFiles
+  $actualPaths = @{}
+  foreach ($entry in @($actual.files)) {
+    $pathKey = ([string]$entry.path).ToLowerInvariant()
+    $actualPaths[$pathKey] = $entry
+    if (-not $recordPaths.ContainsKey($pathKey)) {
+      throw "Backup directory contains an unmanifested protected file: $($entry.path)"
+    }
+  }
+  foreach ($record in $records) {
+    $pathKey = ([string]$record.path).ToLowerInvariant()
+    if (-not $actualPaths.ContainsKey($pathKey)) {
+      throw "Protected backup file is missing: $($record.path)"
+    }
+    $entry = $actualPaths[$pathKey]
+    if (
+      [int64]$entry.bytes -ne [int64]$record.bytes -or
+      [string]$entry.sha256 -ne [string]$record.sha256
+    ) {
+      throw "Protected backup file failed integrity verification: $($record.path)"
+    }
+  }
   if (
     [int]$actual.fileCount -ne [int]$manifest.fileCount -or
     [int64]$actual.bytes -ne [int64]$manifest.bytes -or
     [string]$actual.sha256 -ne $treeSha256
   ) {
     throw "Backup directory contains missing, extra, or modified protected files."
-  }
-  foreach ($entry in @($actual.files)) {
-    if (-not $recordPaths.ContainsKey(([string]$entry.path).ToLowerInvariant())) {
-      throw "Backup directory contains an unmanifested protected file: $($entry.path)"
-    }
   }
   return [pscustomobject]@{
     fileCount = [int]$actual.fileCount
@@ -445,7 +484,8 @@ function Test-AsukaFrozenCopyIntegrity {
     if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
       throw "Frozen backup copy destination is missing: $destination"
     }
-    $sourceIntegrity = Get-AsukaDirectoryIntegrity -Path $source
+    $sourceIntegrity = Get-AsukaDirectoryIntegrity -Path $source `
+      -ExcludeReparsePoints
     $destinationIntegrity = Get-AsukaDirectoryIntegrity -Path $destination
     if (
       [int]$sourceIntegrity.fileCount -ne [int]$destinationIntegrity.fileCount -or
@@ -736,15 +776,31 @@ namespace Asuka {
   return $tokens.ToArray()
 }
 
+function Test-AsukaFullyQualifiedWindowsPath {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    return $false
+  }
+  return [bool](
+    $Path -match '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+(?:\\|$))'
+  )
+}
+
 function Test-AsukaPowerShellFileAction {
   param(
     [Parameter(Mandatory = $true)][object]$Action,
-    [Parameter(Mandatory = $true)][string]$ScriptPath
+    [Parameter(Mandatory = $true)][string]$ScriptPath,
+    [string]$AllowedWorkingDirectory = ""
   )
 
   try {
-    $execute = ([string]$Action.execute).Trim()
-    if (-not [IO.Path]::IsPathRooted($execute)) {
+    $rawExecute = [string]$Action.execute
+    $execute = $rawExecute.Trim()
+    if (
+      -not $rawExecute.Equals($execute, [StringComparison]::Ordinal) -or
+      -not (Test-AsukaFullyQualifiedWindowsPath -Path $execute)
+    ) {
       return $false
     }
     $trustedPowerShell = [IO.Path]::GetFullPath(
@@ -758,11 +814,38 @@ function Test-AsukaPowerShellFileAction {
     ) {
       return $false
     }
+    $rawWorkingDirectory = if (
+      $Action.PSObject.Properties.Name -contains "workingDirectory"
+    ) {
+      [string]$Action.workingDirectory
+    } else {
+      ""
+    }
+    $workingDirectory = $rawWorkingDirectory.Trim()
     if (
-      $Action.PSObject.Properties.Name -contains "workingDirectory" -and
-      -not [string]::IsNullOrWhiteSpace([string]$Action.workingDirectory)
+      -not $rawWorkingDirectory.Equals(
+        $workingDirectory,
+        [StringComparison]::Ordinal
+      )
     ) {
       return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($workingDirectory)) {
+      if (
+        [string]::IsNullOrWhiteSpace($AllowedWorkingDirectory) -or
+        -not (
+          Test-AsukaFullyQualifiedWindowsPath -Path $workingDirectory
+        ) -or
+        -not (
+          Test-AsukaFullyQualifiedWindowsPath -Path $AllowedWorkingDirectory
+        ) -or
+        -not ([IO.Path]::GetFullPath($workingDirectory)).TrimEnd("\").Equals(
+          ([IO.Path]::GetFullPath($AllowedWorkingDirectory)).TrimEnd("\"),
+          [StringComparison]::OrdinalIgnoreCase
+        )
+      ) {
+        return $false
+      }
     }
 
     $tokens = @(ConvertFrom-AsukaTaskArguments -Arguments ([string]$Action.arguments))
@@ -782,6 +865,7 @@ function Test-AsukaPowerShellFileAction {
     }
     $actualScript = [string]$tokens[$fileIndex + 1]
     if (
+      -not (Test-AsukaFullyQualifiedWindowsPath -Path $actualScript) -or
       -not $actualScript.Equals(
         [IO.Path]::GetFullPath($ScriptPath),
         [StringComparison]::OrdinalIgnoreCase

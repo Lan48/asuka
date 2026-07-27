@@ -192,13 +192,19 @@ try {
   $syncActions = @($syncTask.actions)
   if (
     $gatewayActions.Count -ne 1 -or
-    -not (Test-AsukaPowerShellFileAction -Action $gatewayActions[0] -ScriptPath $gatewayScript)
+    -not (
+      Test-AsukaPowerShellFileAction -Action $gatewayActions[0] `
+        -ScriptPath $gatewayScript -AllowedWorkingDirectory $AppRoot
+    )
   ) {
     throw "$gatewayTaskName action does not reference the audited gateway script."
   }
   if (
     $syncActions.Count -ne 1 -or
-    -not (Test-AsukaPowerShellFileAction -Action $syncActions[0] -ScriptPath $syncScript)
+    -not (
+      Test-AsukaPowerShellFileAction -Action $syncActions[0] `
+        -ScriptPath $syncScript -AllowedWorkingDirectory $AppRoot
+    )
   ) {
     throw "$syncTaskName action does not reference the audited sync script."
   }

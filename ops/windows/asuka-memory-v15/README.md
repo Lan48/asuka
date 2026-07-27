@@ -74,7 +74,11 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 Seal mode adds and verifies `backup-files.json` and
 `backup-complete.marker`. It preserves `backup-manifest.json`, including its
 original `tasksBefore` rollback intent, and neither inspects nor changes the
-current Scheduled Task state.
+current Scheduled Task state. Tree inventories cover the same regular-file set
+as the `/XJ` backup copy: source-copy comparisons exclude filesystem reparse
+points, while the sealed backup inventory still covers every file actually
+present in the backup. The completion marker is finalized only after an
+independent tree revalidation; failures leave no final marker.
 
 ## Preflight and deploy
 

@@ -82,7 +82,7 @@ try {
     if (
       -not (
         Test-AsukaPowerShellFileAction -Action $validatedAction `
-          -ScriptPath $target.script
+          -ScriptPath $target.script -AllowedWorkingDirectory $AppRoot
       )
     ) {
       throw "$($target.name) arguments do not reference the audited script."
@@ -108,8 +108,14 @@ try {
       )
     )
     if (-not $alreadyCanonical) {
-      $newAction = New-ScheduledTaskAction -Execute $trustedPowerShell `
-        -Argument ([string]$action.arguments)
+      $actionParameters = @{
+        Execute = $trustedPowerShell
+        Argument = [string]$action.arguments
+      }
+      if (-not [string]::IsNullOrWhiteSpace([string]$action.workingDirectory)) {
+        $actionParameters["WorkingDirectory"] = [string]$action.workingDirectory
+      }
+      $newAction = New-ScheduledTaskAction @actionParameters
       Set-ScheduledTask -TaskName ([string]$entry.snapshot.name) `
         -TaskPath ([string]$entry.snapshot.taskPath) -Action $newAction |
         Out-Null
@@ -129,7 +135,8 @@ try {
       $actions.Count -ne 1 -or
       -not (
         Test-AsukaPowerShellFileAction -Action $actions[0] `
-          -ScriptPath ([string]$entry.target.script)
+          -ScriptPath ([string]$entry.target.script) `
+          -AllowedWorkingDirectory $AppRoot
       )
     ) {
       throw "$($entry.snapshot.name) failed post-normalization validation."
@@ -145,13 +152,21 @@ try {
       argumentsPreserved = (
         [string]$beforeAction.arguments -ceq [string]$afterAction.arguments
       )
+      workingDirectoryPreserved = (
+        [string]$beforeAction.workingDirectory -ceq
+          [string]$afterAction.workingDirectory
+      )
       enabled = [bool]$after.enabled
       running = [bool]$after.wasRunning
       backupXmlSha256 = Get-AsukaSha256 -Path ([string]$entry.xmlPath)
     }
   }
-  if (@($results | Where-Object { -not $_.argumentsPreserved }).Count -gt 0) {
-    throw "Scheduled-task arguments changed during normalization."
+  if (
+    @($results | Where-Object {
+      -not $_.argumentsPreserved -or -not $_.workingDirectoryPreserved
+    }).Count -gt 0
+  ) {
+    throw "Scheduled-task arguments or working directory changed during normalization."
   }
 
   $audit = [ordered]@{

@@ -242,7 +242,8 @@ try {
     }
   )
   $backupTreeChecks = @($backupTrees | ForEach-Object {
-    $sourceIntegrity = Get-AsukaDirectoryIntegrity -Path ([string]$_.source)
+    $sourceIntegrity = Get-AsukaDirectoryIntegrity -Path ([string]$_.source) `
+      -ExcludeReparsePoints
     $backupIntegrity = Get-AsukaDirectoryIntegrity -Path ([string]$_.backup)
     if (
       [int]$sourceIntegrity.fileCount -ne [int]$backupIntegrity.fileCount -or
@@ -280,7 +281,6 @@ try {
   }
   Write-AsukaJsonFile -Path (Join-Path $backupPath "backup.json") -Value $backupSummary
   $backupIntegrity = Write-AsukaBackupIntegrity -BackupPath $backupPath
-  [void](Test-AsukaBackupIntegrity -BackupPath $backupPath)
   $backupComplete = $true
 
   Copy-Item -LiteralPath $packagedSyncScript -Destination $syncScript -Force
