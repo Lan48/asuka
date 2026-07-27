@@ -222,6 +222,31 @@ function emptyState(): AsukaMemoryStateFile {
   };
 }
 
+function cloneState(state: AsukaMemoryStateFile): AsukaMemoryStateFile {
+  return {
+    version: 1,
+    memories: Object.fromEntries(
+      Object.entries(state.memories).map(([id, item]) => [id, { ...item }]),
+    ),
+  };
+}
+
+function writeStateAtomic(memoryFile: string, state: AsukaMemoryStateFile): void {
+  fs.mkdirSync(path.dirname(memoryFile), { recursive: true });
+  const temporary = `${memoryFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(state, null, 2), "utf-8");
+    fs.renameSync(temporary, memoryFile);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // Preserve the original write error.
+    }
+    throw error;
+  }
+}
+
 function loadState(): AsukaMemoryStateFile {
   if (cache.state) return cache.state;
   try {
@@ -245,8 +270,7 @@ function loadState(): AsukaMemoryStateFile {
 function saveState(options: { syncWiki?: boolean } = {}): void {
   if (!cache.state) return;
   try {
-    fs.mkdirSync(MEMORY_DIR, { recursive: true });
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify(cache.state, null, 2), "utf-8");
+    writeStateAtomic(MEMORY_FILE, cache.state);
   } catch (error) {
     console.error(`[asuka-memory] Failed to save memory: ${error}`);
   }
@@ -268,7 +292,7 @@ export interface AsukaLegacyProjectionWriteOptions {
 
 function readProjectionTarget(memoryFile: string): AsukaMemoryStateFile {
   if (path.resolve(memoryFile) === path.resolve(MEMORY_FILE)) {
-    return loadState();
+    return cloneState(loadState());
   }
   if (!fs.existsSync(memoryFile)) return emptyState();
   const parsed = JSON.parse(
@@ -379,13 +403,8 @@ export function writeAsukaLegacyMemoryProjection(
   }
 
   if (before === JSON.stringify(state)) return false;
-  if (memoryFile === path.resolve(MEMORY_FILE)) {
-    cache.state = state;
-    saveState({ syncWiki: false });
-  } else {
-    fs.mkdirSync(path.dirname(memoryFile), { recursive: true });
-    fs.writeFileSync(memoryFile, JSON.stringify(state, null, 2), "utf-8");
-  }
+  writeStateAtomic(memoryFile, state);
+  if (memoryFile === path.resolve(MEMORY_FILE)) cache.state = state;
   return true;
 }
 

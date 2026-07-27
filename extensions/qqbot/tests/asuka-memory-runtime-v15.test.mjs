@@ -16,6 +16,9 @@ import {
   initializeQQBotAsukaMemory,
 } from "../dist/src/asuka-memory-kernel/qqbot-adapter.js";
 import {
+  writeAsukaLegacyMemoryProjection,
+} from "../dist/src/asuka-memory.js";
+import {
   memoryWikiMarkers,
   projectMemoryWiki,
 } from "../dist/src/asuka-memory-kernel/wiki.js";
@@ -130,6 +133,70 @@ const databasePath = path.join(temporaryRoot, "memory.sqlite");
 const legacyMemoryFile = path.join(temporaryRoot, "legacy", "memory.json");
 const memoryRoot = path.join(temporaryRoot, "vault", "Asuka", "Memory");
 const identityId = "private:default:user-1";
+const atomicProjectionFile = path.join(temporaryRoot, "atomic", "memory.json");
+const originalProjection = `${JSON.stringify({
+  version: 1,
+  memories: {
+    existing: {
+      id: "existing",
+      text: "must survive a failed replacement",
+    },
+  },
+}, null, 2)}`;
+fs.mkdirSync(path.dirname(atomicProjectionFile), { recursive: true });
+fs.writeFileSync(atomicProjectionFile, originalProjection, "utf8");
+const originalRenameSync = fs.renameSync;
+fs.renameSync = (source, destination) => {
+  if (path.resolve(destination) === path.resolve(atomicProjectionFile)) {
+    throw new Error("fixture replacement failure");
+  }
+  return originalRenameSync(source, destination);
+};
+try {
+  assert.throws(
+    () => writeAsukaLegacyMemoryProjection(
+      {
+        identityId,
+        accountId: "default",
+        peerKind: "direct",
+        peerId: "user-1",
+      },
+      {
+        generatedAt: Date.now(),
+        claims: [{
+          claimId: "atomic-claim",
+          rootClaimId: "atomic-claim",
+          identityId,
+          canonicalText: "用户现在住在杭州",
+          authority: "user_explicit",
+          epistemicStatus: "explicit",
+          state: "active",
+          visibility: "private",
+          sourceEventId: "atomic-event",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        }],
+        history: [],
+        claimEvidence: [],
+        eventSummaries: [],
+      },
+      { memoryFile: atomicProjectionFile },
+    ),
+    /fixture replacement failure/,
+  );
+} finally {
+  fs.renameSync = originalRenameSync;
+}
+assert.equal(
+  fs.readFileSync(atomicProjectionFile, "utf8"),
+  originalProjection,
+  "a failed projection replacement must preserve the rollback file byte-for-byte",
+);
+assert.deepEqual(
+  fs.readdirSync(path.dirname(atomicProjectionFile)).sort(),
+  ["memory.json"],
+  "a failed projection replacement must remove its temporary file",
+);
 const persistentRoot = rootConfig({
   databasePath,
   worker: { enabled: false },
