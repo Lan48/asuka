@@ -50,6 +50,26 @@ try {
     throw "Deployment state and manifest releaseId do not match."
   }
   $releaseFiles = @(Test-AsukaReleaseFiles -Manifest $manifest -ReleaseRoot $ReleaseRoot)
+  $syncScript = Resolve-AsukaChildPath -Root $AppRoot `
+    -Relative ([string]$manifest.syncWorker.destination)
+  $expectedSyncScriptHash = ([string]$manifest.syncWorker.sha256).ToLowerInvariant()
+  if (
+    -not ($currentState.PSObject.Properties.Name -contains "syncWorker") -or
+    [string]$currentState.syncWorker.destination -ne
+      [string]$manifest.syncWorker.destination -or
+    ([string]$currentState.syncWorker.sha256).ToLowerInvariant() -ne
+      $expectedSyncScriptHash
+  ) {
+    throw "Deployment state does not contain the active sync worker integrity contract."
+  }
+  $installedSyncScriptHash = Get-AsukaSha256 -Path $syncScript
+  if (
+    $installedSyncScriptHash -ne $expectedSyncScriptHash -or
+    [int64](Get-Item -LiteralPath $syncScript).Length -ne
+      [int64]$manifest.syncWorker.bytes
+  ) {
+    throw "Installed sync worker does not match the release integrity contract."
+  }
   if (
     -not (Test-Path -LiteralPath ([string]$currentState.backupPath) -PathType Container) -or
     -not (
@@ -182,9 +202,10 @@ try {
   }
 
   $gatewayScript = Join-Path $AppRoot "asuka-gateway-task.ps1"
-  $syncScript = Join-Path $AppRoot "asuka-memory-sync.ps1"
   $gatewayActions = @($gatewayTask.actions)
   $syncActions = @($syncTask.actions)
+  $escapedSyncScript = [regex]::Escape($syncScript)
+  $syncScriptArgumentPattern = "(?i)(?:^|\s)-File\s+`"?${escapedSyncScript}`"?(?:\s|$)"
   if (
     $gatewayActions.Count -ne 1 -or
     [string]$gatewayActions[0].arguments -notmatch ([regex]::Escape($gatewayScript))
@@ -193,7 +214,7 @@ try {
   }
   if (
     $syncActions.Count -ne 1 -or
-    [string]$syncActions[0].arguments -notmatch ([regex]::Escape($syncScript))
+    [string]$syncActions[0].arguments -notmatch $syncScriptArgumentPattern
   ) {
     throw "$syncTaskName action does not reference the audited sync script."
   }
@@ -287,6 +308,11 @@ try {
     gateway = $gatewayReady
     gatewayTask = [string]$gatewayTask.state
     syncTask = [string]$syncTask.state
+    syncWorker = [ordered]@{
+      destination = [string]$manifest.syncWorker.destination
+      sha256 = $installedSyncScriptHash
+      bytes = [int64](Get-Item -LiteralPath $syncScript).Length
+    }
     syncStatus = $syncStatus
     vault = [ordered]@{
       dirty = (-not [string]::IsNullOrWhiteSpace($memoryStatus.Output))

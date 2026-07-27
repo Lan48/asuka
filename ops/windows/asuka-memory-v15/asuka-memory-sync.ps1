@@ -291,14 +291,14 @@ function Invoke-SyncCycle {
   }
 
   $pull = Invoke-Git -Arguments @("pull", "--rebase", "--autostash")
+  $conflictState = Get-ConflictState
+  if ($conflictState.IsPaused) {
+    $detail = "git pull --rebase paused for manual conflict resolution."
+    Write-SyncStatus -State "conflict" -Detail $detail -Conflicts $conflictState.Conflicts
+    Write-SyncLog -Level "WARN" -Message $detail
+    return "conflict"
+  }
   if ($pull.ExitCode -ne 0) {
-    $conflictState = Get-ConflictState
-    if ($conflictState.IsPaused) {
-      $detail = "git pull --rebase paused for manual conflict resolution."
-      Write-SyncStatus -State "conflict" -Detail $detail -Conflicts $conflictState.Conflicts
-      Write-SyncLog -Level "WARN" -Message $detail
-      return "conflict"
-    }
     throw "git pull --rebase failed; local memory remains available and will be retried: $($pull.Output)"
   }
 

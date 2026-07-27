@@ -95,6 +95,11 @@ try {
   $releaseId = [string]$manifest.releaseId
   $gatewayTaskName = [string]$manifest.requirements.tasks.gateway
   $syncTaskName = [string]$manifest.requirements.tasks.sync
+  $packagedSyncScript = Resolve-AsukaChildPath -Root $ReleaseRoot `
+    -Relative ([string]$manifest.syncWorker.source)
+  $syncScript = Resolve-AsukaChildPath -Root $AppRoot `
+    -Relative ([string]$manifest.syncWorker.destination)
+  $expectedSyncScriptHash = ([string]$manifest.syncWorker.sha256).ToLowerInvariant()
   $frozenBackup = $null
   if (-not [string]::IsNullOrWhiteSpace($FrozenBackupPath)) {
     $frozenBackup = Read-AsukaFrozenBackup -Path $FrozenBackupPath -AppRoot $AppRoot `
@@ -115,7 +120,6 @@ try {
   $vault = Join-Path $AppRoot "obsidian-vault"
   $memoryRoot = Join-Path $vault "Asuka\Memory"
   $gatewayScript = Join-Path $AppRoot "asuka-gateway-task.ps1"
-  $syncScript = Join-Path $AppRoot "asuka-memory-sync.ps1"
   $gatewayLog = Join-Path $AppRoot "logs\gateway.task.out.log"
   $syncLock = Join-Path $AppRoot "run\asuka-memory-sync.lock"
   $deployLock = Join-Path $AppRoot "run\asuka-memory-v15-deploy.lock"
@@ -266,6 +270,15 @@ try {
   Set-Content -LiteralPath (Join-Path $backupPath "backup-complete.marker") `
     -Value $backupSummary.createdAt -Encoding ASCII
   $backupComplete = $true
+
+  Copy-Item -LiteralPath $packagedSyncScript -Destination $syncScript -Force
+  if (
+    (Get-AsukaSha256 -Path $syncScript) -ne $expectedSyncScriptHash -or
+    [int64](Get-Item -LiteralPath $syncScript).Length -ne
+      [int64]$manifest.syncWorker.bytes
+  ) {
+    throw "Installed sync worker does not match the release integrity contract."
+  }
 
   $memoryConfigScript = Join-Path $ReleaseRoot "ops\configure-memory-kernel.mjs"
   $memoryConfigRun = Invoke-AsukaNative -FilePath $node -Arguments @(
@@ -490,6 +503,10 @@ try {
     gatewayLogOffset = $gatewayLogOffset
     gatewayTask = $gatewaySnapshot
     syncTask = $syncSnapshot
+    syncWorker = [ordered]@{
+      destination = [string]$manifest.syncWorker.destination
+      sha256 = $expectedSyncScriptHash
+    }
     migration = [ordered]@{
       reportPath = $migrationReportPath
       discoveredRecords = [int]$migration.discoveredRecords

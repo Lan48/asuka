@@ -65,6 +65,13 @@ function assertManifestFiles(releaseRoot, entries) {
   }
 }
 
+function assertInstalledWorker(appRoot, worker) {
+  const destination = path.join(appRoot, ...worker.destination.split("/"));
+  assert.equal(fs.existsSync(destination), true, "installed sync worker is missing");
+  assert.equal(fs.statSync(destination).size, worker.bytes, "installed sync worker size mismatch");
+  assert.equal(sha256(destination), worker.sha256, "installed sync worker hash mismatch");
+}
+
 try {
   for (const directory of ["bin", "dist", "scripts", "skills", "src"]) {
     write(`${directory}/fixture-${directory}.txt`, `${directory}-current-worktree\n`);
@@ -98,10 +105,11 @@ try {
     "runtime release must exclude node_modules and tests",
   );
   assert.ok(
-    first.opsFiles.every((entry) => !entry.source.endsWith("/test-deployment-assets.mjs")),
-    "release must exclude its self-test",
+    first.opsFiles.every((entry) => !/\/test-[^/]+\.mjs$/.test(entry.source)),
+    "release must exclude executable test fixtures",
   );
   for (const required of [
+    "ops/asuka-memory-sync.ps1",
     "ops/common.ps1",
     "ops/configure-memory-kernel.mjs",
     "ops/deploy.ps1",
@@ -116,6 +124,15 @@ try {
   }
 
   assertManifestFiles(releaseOne, [...first.runtimeFiles, ...first.opsFiles]);
+  const syncWorkerEntry = first.opsFiles.find(
+    (entry) => entry.source === "ops/asuka-memory-sync.ps1",
+  );
+  assert.deepEqual(first.syncWorker, {
+    source: syncWorkerEntry.source,
+    destination: "asuka-memory-sync.ps1",
+    bytes: syncWorkerEntry.bytes,
+    sha256: syncWorkerEntry.sha256,
+  });
   assert.deepEqual(
     first.runtimeFiles.map((entry) => entry.destination),
     [...first.runtimeFiles.map((entry) => entry.destination)].sort(),
@@ -128,7 +145,46 @@ try {
   );
   assert.deepEqual(first.runtimeFiles, second.runtimeFiles);
   assert.deepEqual(first.opsFiles, second.opsFiles);
+  assert.deepEqual(first.syncWorker, second.syncWorker);
   assert.equal(first.source.runtimeTreeSha256, second.source.runtimeTreeSha256);
+
+  const secondWorker = path.join(releaseTwo, ...second.syncWorker.source.split("/"));
+  const mutatedPackagedWorker = fs.readFileSync(secondWorker);
+  mutatedPackagedWorker[0] ^= 1;
+  fs.writeFileSync(secondWorker, mutatedPackagedWorker);
+  assert.throws(
+    () => assertManifestFiles(releaseTwo, [second.syncWorker]),
+    /hash mismatch: ops\/asuka-memory-sync\.ps1/,
+  );
+  fs.rmSync(secondWorker);
+  assert.throws(
+    () => assertManifestFiles(releaseTwo, [second.syncWorker]),
+    /missing release file: ops\/asuka-memory-sync\.ps1/,
+  );
+
+  const installedRoot = path.join(fixtureRoot, "installed");
+  const installedWorker = path.join(
+    installedRoot,
+    ...first.syncWorker.destination.split("/"),
+  );
+  fs.mkdirSync(path.dirname(installedWorker), { recursive: true });
+  fs.copyFileSync(
+    path.join(releaseOne, ...first.syncWorker.source.split("/")),
+    installedWorker,
+  );
+  assertInstalledWorker(installedRoot, first.syncWorker);
+  const mutatedInstalledWorker = fs.readFileSync(installedWorker);
+  mutatedInstalledWorker[0] ^= 1;
+  fs.writeFileSync(installedWorker, mutatedInstalledWorker);
+  assert.throws(
+    () => assertInstalledWorker(installedRoot, first.syncWorker),
+    /installed sync worker hash mismatch/,
+  );
+  fs.rmSync(installedWorker);
+  assert.throws(
+    () => assertInstalledWorker(installedRoot, first.syncWorker),
+    /installed sync worker is missing/,
+  );
 
   const currentMemory = path.join(fixtureRoot, "vault-current", "Asuka", "Memory");
   const backupMemory = path.join(fixtureRoot, "vault-backup", "Asuka", "Memory");
@@ -343,6 +399,9 @@ try {
   const rejudgementGate = deploy.indexOf("$rejudgementGate = $migrationReport.rejudgementGate");
   const memoryConfigRun = deploy.indexOf("$memoryConfigRun = Invoke-AsukaNative");
   const backupComplete = deploy.indexOf("$backupComplete = $true");
+  const syncWorkerInstall = deploy.indexOf(
+    "Copy-Item -LiteralPath $packagedSyncScript -Destination $syncScript -Force",
+  );
   const ledgerActivation = deploy.indexOf(
     "Move-Item -LiteralPath $ledgerNext -Destination $ledger",
   );
@@ -351,6 +410,10 @@ try {
     "model-aware preflight must finish before deployment stops writers",
   );
   assert.ok(syncStop >= 0 && syncStop < gatewayStop, "deploy must stop Sync before Gateway");
+  assert.ok(
+    gatewayStop < syncWorkerInstall && syncWorkerInstall < gatewayStart,
+    "deploy must install the packaged sync worker only while both tasks are stopped",
+  );
   assert.ok(
     backupComplete >= 0
       && backupComplete < memoryConfigRun
@@ -396,10 +459,17 @@ try {
   assert.match(deploy, /\$gatewaySnapshot\.wasRunning = \(/);
   assert.match(deploy, /frozenBackupPath = if \(\$null -eq \$frozenBackup\)/);
   assert.match(deploy, /Configured OpenClaw configuration is invalid/);
+  assert.match(deploy, /Installed sync worker does not match the release integrity contract/);
   assert.match(common, /function Read-AsukaFrozenBackup/);
   assert.match(common, /Current file changed after freeze/);
   assert.match(common, /scheduled-tasks\\\$GatewayTaskName\.xml/);
+  assert.match(common, /syncWorker integrity contract/);
+  assert.match(common, /syncWorker does not match its opsFiles entry/);
+  assert.match(preflight, /Packaged sync worker does not match the release integrity contract/);
+  assert.match(preflight, /expectedInstalledSha256\s*=\s*\$expectedSyncScriptHash/);
   assert.match(verify, /Persisted migration report is missing/);
+  assert.match(verify, /Installed sync worker does not match the release integrity contract/);
+  assert.match(verify, /\$installedSyncScriptHash\s+-ne\s+\$expectedSyncScriptHash/);
   assert.match(verify, /\$migrationReport\.rejudgementGate/);
   assert.match(verify, /\$gate\.jobs\.pending\s+-ne 0/);
   assert.match(verify, /\$gate\.jobs\.running\s+-ne 0/);
