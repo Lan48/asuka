@@ -762,6 +762,95 @@ await verifyIntegrityInvariant("foreground rerank revalidates deleted claims", a
   }
 });
 
+for (const mode of ["failure", "timeout"]) {
+  await verifyIntegrityInvariant(`${mode} fallback revalidates deleted claims`, async () => {
+    const revalidationLedger = new AsukaMemoryLedger(":memory:");
+    let signalRerankStarted;
+    let releaseRerank;
+    const rerankStarted = new Promise((resolve) => {
+      signalRerankStarted = resolve;
+    });
+    const rerankRelease = new Promise((resolve) => {
+      releaseRerank = resolve;
+    });
+    const query = `fallback-${mode}-query`;
+    const revalidationEngine = new AsukaMemoryEngine(revalidationLedger, {
+      rerankDeadlineMs: mode === "failure" ? 1_000 : 25,
+      model: {
+        async complete(request) {
+          if (request.task !== "rerank") {
+            return JSON.stringify({ proposals: [], noMemoryReason: "fixture" });
+          }
+          const ids = [...request.prompt.matchAll(/"claimId":"([^"]+)"/g)]
+            .map((match) => match[1]);
+          signalRerankStarted();
+          await rerankRelease;
+          if (mode === "failure") throw new Error("fixture rerank failure");
+          return JSON.stringify({ claimIds: ids });
+        },
+      },
+    });
+    try {
+      const source = revalidationLedger.appendEvent(eventInput({
+        text: query,
+        sourceMessageId: `fallback-${mode}-source`,
+      }));
+      const target = revalidationLedger.applyClaimProposal(source.eventId, {
+        semanticKey: `user.fixture.${mode}`,
+        subjectId: "user",
+        predicate: `fixture.${mode}`,
+        value: true,
+        canonicalText: query,
+        topLevelType: "fact",
+        epistemicStatus: "explicit",
+        authority: "user_explicit",
+        confidence: 1,
+      });
+      const retrieval = revalidationEngine.retrieveMemoryContext({
+        accountId: "default",
+        peerKind: "direct",
+        peerId: "user-1",
+        query,
+      });
+      await rerankStarted;
+      const deletionEvent = revalidationLedger.appendEvent(eventInput({
+        kind: "memory_control",
+        text: `删除 ${query}`,
+        sourceMessageId: `fallback-${mode}-control`,
+      }));
+      const deletion = revalidationLedger.applyClaimProposal(deletionEvent.eventId, {
+        semanticKey: `user.fixture.${mode}`,
+        subjectId: "user",
+        predicate: `fixture.${mode}`,
+        value: null,
+        canonicalText: `删除 ${query}`,
+        topLevelType: "fact",
+        epistemicStatus: "explicit",
+        authority: "user_correction",
+        confidence: 1,
+        action: "delete",
+        targetClaimId: target.claimId,
+      });
+      assert.equal(deletion.ignoredReason, undefined);
+      if (mode === "failure") releaseRerank();
+      const result = await retrieval;
+
+      if (mode === "timeout") {
+        releaseRerank();
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          if (revalidationLedger.readRerankCache(source.identityId, query)) break;
+          await wait(5);
+        }
+      }
+      assert.ok(!result.claimIds.includes(target.claimId));
+      assert.doesNotMatch(result.prompt, new RegExp(query));
+    } finally {
+      releaseRerank?.();
+      revalidationLedger.close();
+    }
+  });
+}
+
 await verifyIntegrityInvariant("background rerank revalidates deleted claims", async () => {
   const revalidationLedger = new AsukaMemoryLedger(":memory:");
   let signalRerankStarted;

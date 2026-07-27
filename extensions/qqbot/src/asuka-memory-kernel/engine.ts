@@ -1060,6 +1060,29 @@ export class AsukaMemoryEngine {
     };
   }
 
+  private revalidatedFallback(
+    request: MemoryRetrievalRequest,
+    local: LocalRetrieval,
+    startedAt: number,
+  ): MemoryContextResult {
+    const ordered = reorderCandidates(local.candidates, local.result.claimIds);
+    const liveCandidates = this.ledger.revalidateSearchCandidates(
+      ordered,
+      visibilityForRequest(request),
+      request.now,
+    );
+    const rendered = renderMemoryPrompt(liveCandidates, local.maxPromptChars);
+    return {
+      prompt: rendered.prompt,
+      claims: request.includeCandidates === false ? [] : rendered.claims,
+      claimIds: rendered.claims.map((claim) => claim.claimId),
+      sourceEventIds: [...new Set(rendered.claims.map((claim) => claim.sourceEventId))],
+      usedFallback: true,
+      rerankRunId: local.result.rerankRunId,
+      elapsedMs: Date.now() - startedAt,
+    };
+  }
+
   retrieveMemoryContextLocal(
     request: MemoryRetrievalRequest,
     embedding?: { model: string; vector: number[] },
@@ -1126,18 +1149,15 @@ export class AsukaMemoryEngine {
       }
 
       if (raced.type === "failed") {
+        const fallback = this.revalidatedFallback(request, local, startedAt);
         this.ledger.recordRetrievalFeedback({
           identityId: local.identityId,
           query: request.query,
-          claimIds: local.result.claimIds,
+          claimIds: fallback.claimIds,
           outcome: "foreground_rerank_failed",
           detail: { error: safeError(raced.error) },
         });
-        return {
-          ...local.result,
-          usedFallback: true,
-          elapsedMs: Date.now() - startedAt,
-        };
+        return fallback;
       }
     }
 
@@ -1163,26 +1183,24 @@ export class AsukaMemoryEngine {
         detail: { deadlineMs: this.rerankDeadlineMs },
       });
     }).catch((error) => {
+      const fallback = this.revalidatedFallback(request, local, startedAt);
       this.ledger.recordRetrievalFeedback({
         identityId: local.identityId,
         query: request.query,
-        claimIds: local.result.claimIds,
+        claimIds: fallback.claimIds,
         outcome: "background_rerank_failed",
         detail: { error: safeError(error) },
       });
     });
+    const fallback = this.revalidatedFallback(request, local, startedAt);
     this.ledger.recordRetrievalFeedback({
       identityId: local.identityId,
       query: request.query,
-      claimIds: local.result.claimIds,
+      claimIds: fallback.claimIds,
       outcome: "local_fallback_deadline",
       detail: { deadlineMs: this.rerankDeadlineMs },
     });
-    return {
-      ...local.result,
-      usedFallback: true,
-      elapsedMs: Date.now() - startedAt,
-    };
+    return fallback;
   }
 
   recordMemoryFeedback(input: {
