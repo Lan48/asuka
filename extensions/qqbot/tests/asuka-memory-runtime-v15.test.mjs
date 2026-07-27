@@ -13,6 +13,9 @@ import {
   resolveAsukaMemoryKernelConfig,
 } from "../dist/src/asuka-memory-kernel/runtime.js";
 import {
+  createQQBotLegacyProjectionWriter,
+} from "../dist/src/asuka-memory-kernel/qqbot-adapter.js";
+import {
   memoryWikiMarkers,
   projectMemoryWiki,
 } from "../dist/src/asuka-memory-kernel/wiki.js";
@@ -67,6 +70,12 @@ function manualBlock(content, startMarker, endMarker) {
   return content.slice(start + startMarker.length, end);
 }
 
+function readLegacyMemories(memoryFile) {
+  return Object.values(
+    JSON.parse(fs.readFileSync(memoryFile, "utf8")).memories ?? {},
+  );
+}
+
 await resetAsukaMemoryRuntime();
 assert.equal(
   initializeAsukaMemoryRuntime({ channels: { qqbot: {} } }),
@@ -118,6 +127,7 @@ assert.deepEqual(migrationConfig.migration, {
 
 const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-runtime-"));
 const databasePath = path.join(temporaryRoot, "memory.sqlite");
+const legacyMemoryFile = path.join(temporaryRoot, "legacy", "memory.json");
 const memoryRoot = path.join(temporaryRoot, "vault", "Asuka", "Memory");
 const identityId = "private:default:user-1";
 const persistentRoot = rootConfig({
@@ -179,16 +189,35 @@ const model = {
     );
     await wait(25);
     activeModelCalls -= 1;
+    const eventLine = request.prompt.match(/当前事件：(\{[^\n]+\})/);
+    const event = eventLine ? JSON.parse(eventLine[1]) : {};
+    if (event.actor === "asuka") {
+      return JSON.stringify({
+        proposals: [{
+          subjectId: "asuka",
+          predicate: "self.statement",
+          value: event.text,
+          canonicalText: `Asuka 说过：${event.text}`,
+          topLevelType: "self_narrative",
+          epistemicStatus: "explicit",
+          sourceKind: "statement",
+          confidence: 0.82,
+          topic: "Asuka 自述",
+          lifecycle: "episodic",
+        }],
+      });
+    }
+    const city = String(event.text ?? "").includes("苏州") ? "苏州" : "杭州";
     return JSON.stringify({
       proposals: [{
         subjectId: "user",
         predicate: "residence.current",
-        value: "杭州",
-        canonicalText: "用户现在住在杭州",
+        value: city,
+        canonicalText: `用户现在住在${city}`,
         topLevelType: "fact",
         epistemicStatus: "explicit",
         sourceKind: "statement",
-        confidence: 0.98,
+        confidence: city === "苏州" ? 0.93 : 0.98,
         topic: "居住状态",
         lifecycle: "bounded",
       }],
@@ -216,6 +245,9 @@ const secondLegacyReasons = [];
 secondRuntime.registerLegacyWriter((context) => {
   secondLegacyReasons.push(context.reason);
 });
+secondRuntime.registerLegacyWriter(
+  createQQBotLegacyProjectionWriter({ memoryFile: legacyMemoryFile }),
+);
 secondRuntime.ingestUserMessage({
   accountId: "default",
   peerKind: "direct",
@@ -234,6 +266,68 @@ assert.ok(
   "a queued event from the previous process must be adjudicated after restart",
 );
 assert.ok(secondLegacyReasons.includes("claims_changed"));
+await waitFor(() =>
+  fs.existsSync(legacyMemoryFile)
+  && readLegacyMemories(legacyMemoryFile).some((item) =>
+    item.status === "active" && item.text === "用户现在住在杭州"
+  )
+);
+
+secondRuntime.ingestUserMessage({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+  identityId,
+  text: "我已经搬到苏州",
+  sourceMessageId: "durable-residence-revision",
+});
+await waitFor(() =>
+  secondRuntime.ledger.listJobs().every((job) => job.status === "completed")
+  && secondRuntime.ledger.listClaims({
+    identityId,
+    states: ["active"],
+  }).some((claim) => claim.canonicalText === "用户现在住在苏州")
+);
+await waitFor(() => {
+  const memories = readLegacyMemories(legacyMemoryFile);
+  return memories.some((item) =>
+    item.status === "active" && item.text === "用户现在住在苏州"
+  ) && memories.some((item) =>
+    item.status === "superseded" && item.text === "用户现在住在杭州"
+  );
+});
+
+const assistantReceipt = secondRuntime.ingestAssistantReply({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+  identityId,
+  text: "今晚我会记得把窗帘拉好",
+  sourceMessageId: "durable-assistant-evidence",
+}).receipt;
+const proactiveReceipt = secondRuntime.ingestProactiveMessage({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+  identityId,
+  text: "我路过时想起你怕夜里太亮",
+  sourceMessageId: "durable-proactive-evidence",
+}).receipt;
+assert.ok(assistantReceipt?.eventId);
+assert.ok(proactiveReceipt?.eventId);
+await waitFor(() =>
+  secondRuntime.ledger.listJobs().every((job) => job.status === "completed")
+);
+await waitFor(() => {
+  const memories = readLegacyMemories(legacyMemoryFile);
+  return [assistantReceipt.eventId, proactiveReceipt.eventId].every((eventId) =>
+    memories.some((item) =>
+      item.sourceMessageId === eventId
+      && item.source === "assistant_self_signal"
+      && item.status === "superseded"
+    )
+  );
+});
 
 const originalClaim = secondRuntime.ledger.listClaims({
   identityId,
@@ -331,7 +425,10 @@ assert.ok(projected?.pageCount);
 assert.equal(fs.existsSync(path.join(memoryRoot, ".asuka-memory-pending")), true);
 const entityFile = fs.readdirSync(path.join(memoryRoot, "entities"))
   .map((name) => path.join(memoryRoot, "entities", name))
-  .find((file) => file.endsWith(".md"));
+  .find((file) =>
+    file.endsWith(".md")
+    && fs.readFileSync(file, "utf8").includes("用户现在住在")
+  );
 assert.ok(entityFile, "Wiki projection must create a topic page");
 const indexFile = path.join(memoryRoot, "index.md");
 const relativeEntity = path.relative(memoryRoot, entityFile)
@@ -431,6 +528,13 @@ assert.equal(
   secondRuntime.ledger.listEvents(identityId).length,
   generatedEventCount + 1,
   "only a non-empty Overrides block should create one durable event",
+);
+await waitFor(() =>
+  readLegacyMemories(legacyMemoryFile).some((item) =>
+    item.status === "active"
+    && item.text === "用户现在住在苏州"
+    && item.source === "user_explicit"
+  )
 );
 await secondRuntime.flushWiki();
 assert.equal(
