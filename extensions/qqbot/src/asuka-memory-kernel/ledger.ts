@@ -27,6 +27,8 @@ import type {
   MemoryJob,
   MemoryJobKind,
   MemoryJudgement,
+  MemoryProjectionClaimEvidence,
+  MemoryProjectionEventSummary,
   MemoryProjectionSnapshot,
   MemorySearchCandidate,
   MemoryVisibility,
@@ -36,6 +38,8 @@ const SCHEMA_VERSION = 2;
 const DEFAULT_INFERENCE_PROMOTION_CONFIDENCE = 0.74;
 const DEFAULT_JOB_LEASE_MS = 60_000;
 const DEFAULT_MAX_JOB_ATTEMPTS = 8;
+const MAX_PROJECTION_EVIDENCE_PER_STANCE = 4;
+const MAX_PROJECTION_EVIDENCE_CHARS = 280;
 
 interface LedgerOptions {
   enableVector?: boolean;
@@ -243,6 +247,28 @@ function asLegacyConsolidationRun(row: LegacyConsolidationRunRow): LegacyConsoli
 
 function normalizeText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function projectionEventSummary(event: MemoryEvent): MemoryProjectionEventSummary {
+  const excerpt = [
+    event.evidence.excerpt,
+    event.evidence.transcript,
+    event.evidence.imageSummary,
+    event.text,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0) ?? "";
+  return {
+    eventId: event.eventId,
+    identityId: event.identityId,
+    visibility: event.visibility,
+    actor: event.actor,
+    kind: event.kind,
+    occurredAt: event.occurredAt,
+    source: event.evidence.sourcePath?.trim()
+      || event.sourceId?.trim()
+      || event.sourceMessageId?.trim()
+      || event.kind,
+    excerpt: normalizeText(excerpt).slice(0, MAX_PROJECTION_EVIDENCE_CHARS),
+  };
 }
 
 function safeTopic(value: string | undefined): string {
@@ -2128,17 +2154,57 @@ export class AsukaMemoryLedger {
   }
 
   getProjectionSnapshot(identityId?: string, now = Date.now()): MemoryProjectionSnapshot {
+    const claims = this.listClaims({
+      identityId,
+      states: ["active"],
+      now,
+    });
+    const history = this.listClaims({
+      identityId,
+      states: ["candidate", "superseded", "refuted", "forgotten"],
+    });
+    const claimEvidence: MemoryProjectionClaimEvidence[] = [];
+    const eventSummaries = new Map<string, MemoryProjectionEventSummary>();
+    for (const claim of [...claims, ...history]) {
+      const linked = this.listClaimEvidence(claim.claimId)
+        .filter((item): item is { eventId: string; stance: "supports" | "opposes" } =>
+          item.stance === "supports" || item.stance === "opposes"
+        )
+        .map((item) => ({ ...item, event: this.getEvent(item.eventId) }))
+        .filter((item): item is typeof item & { event: MemoryEvent } =>
+          item.event !== undefined
+          && item.event.identityId === claim.identityId
+          && item.event.visibility === claim.visibility
+        );
+      for (const stance of ["supports", "opposes"] as const) {
+        const bounded = linked
+          .filter((item) => item.stance === stance)
+          .sort((left, right) =>
+            right.event.occurredAt - left.event.occurredAt
+            || left.event.eventId.localeCompare(right.event.eventId)
+          )
+          .slice(0, MAX_PROJECTION_EVIDENCE_PER_STANCE);
+        for (const item of bounded) {
+          claimEvidence.push({
+            claimId: claim.claimId,
+            eventId: item.eventId,
+            stance,
+          });
+          if (!eventSummaries.has(item.eventId)) {
+            eventSummaries.set(item.eventId, projectionEventSummary(item.event));
+          }
+        }
+      }
+    }
     return {
       generatedAt: now,
-      claims: this.listClaims({
-        identityId,
-        states: ["active"],
-        now,
-      }),
-      history: this.listClaims({
-        identityId,
-        states: ["candidate", "superseded", "refuted", "forgotten"],
-      }),
+      claims,
+      history,
+      claimEvidence,
+      eventSummaries: [...eventSummaries.values()].sort((left, right) =>
+        right.occurredAt - left.occurredAt
+        || left.eventId.localeCompare(right.eventId)
+      ),
     };
   }
 

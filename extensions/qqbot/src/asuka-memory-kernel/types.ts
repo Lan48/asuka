@@ -316,8 +316,27 @@ export interface MemoryEngineOptions {
   onProjectionChanged?: () => void;
 }
 
+export interface MemoryProjectionEventSummary {
+  eventId: string;
+  identityId: string;
+  visibility: MemoryVisibility;
+  actor: MemoryActor;
+  kind: MemoryEventKind;
+  occurredAt: number;
+  source: string;
+  excerpt: string;
+}
+
+export interface MemoryProjectionClaimEvidence {
+  claimId: string;
+  eventId: string;
+  stance: "supports" | "opposes";
+}
+
 export interface MemoryProjectionSnapshot {
   generatedAt: number;
   claims: MemoryClaim[];
   history: MemoryClaim[];
+  claimEvidence: MemoryProjectionClaimEvidence[];
+  eventSummaries: MemoryProjectionEventSummary[];
 }
