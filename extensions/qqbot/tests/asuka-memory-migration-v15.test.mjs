@@ -138,6 +138,142 @@ assert.throws(
   "a missing configured source must not be treated as an empty source",
 );
 
+const sourceAccountingRegressionFailures = [];
+function verifySourceAccountingRegression(name, run) {
+  try {
+    run();
+  } catch (error) {
+    sourceAccountingRegressionFailures.push(
+      `${name}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+verifySourceAccountingRegression("full source content hash", () => {
+  const collisionSessionsDirectory = path.join(fixtureRoot, "collision-sessions");
+  const collisionSessionsIndex = path.join(collisionSessionsDirectory, "sessions.json");
+  const collisionSessionFile = path.join(collisionSessionsDirectory, "collision-session.jsonl");
+  const sharedPrefix = "相".repeat(8_000);
+  fs.mkdirSync(collisionSessionsDirectory, { recursive: true });
+  fs.writeFileSync(collisionSessionsIndex, JSON.stringify({
+    "agent:main:qqbot:direct:user-1": {
+      sessionId: "collision-session",
+      channel: "qqbot",
+      chatType: "direct",
+    },
+  }));
+  const writeCollisionRow = (tail) => fs.writeFileSync(
+    collisionSessionFile,
+    `${JSON.stringify({
+      type: "message",
+      id: "collision-message",
+      timestamp: "2026-07-27T00:00:00Z",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: `${sharedPrefix}${tail}` }],
+      },
+    })}\n`,
+  );
+  const collisionSources = {
+    sessionsIndexJson: collisionSessionsIndex,
+    sessionsDirectory: collisionSessionsDirectory,
+  };
+  const collisionLedger = new AsukaMemoryLedger(":memory:");
+  try {
+    writeCollisionRow("尾部甲");
+    const firstRecords = collectLegacyMigrationRecords(collisionSources, scope);
+    assert.equal(firstRecords.length, 1);
+    assert.equal(firstRecords[0].text.length, 8_000, "model-facing text stays bounded");
+    assert.ok(firstRecords[0].sourceRecordId, "physical row identity must be explicit");
+    assert.equal(migrateLegacyRecords(collisionLedger, firstRecords, scope).importedEvents, 1);
+
+    writeCollisionRow("尾部乙");
+    const changedRecords = collectLegacyMigrationRecords(collisionSources, scope);
+    assert.equal(changedRecords[0].sourceRecordId, firstRecords[0].sourceRecordId);
+    assert.throws(
+      () => migrateLegacyRecords(collisionLedger, changedRecords, scope),
+      /legacy content hash mismatch/i,
+      "content beyond the model text limit must remain collision-bound",
+    );
+  } finally {
+    collisionLedger.close();
+  }
+});
+
+verifySourceAccountingRegression("duplicate logical IDs keep physical row identity", () => {
+  const duplicateClaimsFile = path.join(fixtureRoot, "duplicate-claims.jsonl");
+  fs.writeFileSync(duplicateClaimsFile, [
+    JSON.stringify({ id: "duplicate-id", value: "重复 ID 的第一条证据" }),
+    JSON.stringify({ id: "duplicate-id", value: "重复 ID 的第二条证据" }),
+  ].join("\n"));
+  const duplicateRecords = collectLegacyMigrationRecords(
+    { claimsJsonl: duplicateClaimsFile },
+    scope,
+  );
+  assert.equal(duplicateRecords.length, 2);
+  assert.equal(
+    new Set(duplicateRecords.map((record) => record.sourceRecordId)).size,
+    2,
+    "JSONL line identity must disambiguate duplicate legacy IDs",
+  );
+  const duplicateLedger = new AsukaMemoryLedger(":memory:");
+  try {
+    const duplicateReport = migrateLegacyRecords(duplicateLedger, duplicateRecords, scope);
+    assert.equal(duplicateReport.importedEvents, 2);
+    assert.equal(duplicateReport.skippedRecords, 0);
+    assert.equal(duplicateReport.sourceMap.length, 2);
+  } finally {
+    duplicateLedger.close();
+  }
+});
+
+verifySourceAccountingRegression("every parseable source row is accounted", () => {
+  const accountingClaimsFile = path.join(fixtureRoot, "accounting-claims.jsonl");
+  fs.writeFileSync(accountingClaimsFile, [
+    JSON.stringify({ id: "known", value: "可识别声明" }),
+    JSON.stringify({ id: "empty" }),
+    JSON.stringify({ id: "unknown", opaque: { nested: true } }),
+    JSON.stringify(["schema", "mismatch"]),
+    JSON.stringify(null),
+    JSON.stringify("standalone legacy row"),
+  ].join("\n"));
+  const accountingRecords = collectLegacyMigrationRecords(
+    { claimsJsonl: accountingClaimsFile },
+    scope,
+  );
+  assert.equal(
+    accountingRecords.length,
+    6,
+    "empty, unknown, and schema-mismatched but parseable rows must not disappear",
+  );
+  assert.equal(
+    new Set(accountingRecords.map((record) => record.sourceRecordId)).size,
+    6,
+    "every physical row must have one stable accounting identity",
+  );
+  const accountingLedger = new AsukaMemoryLedger(":memory:");
+  try {
+    const accountingReport = migrateLegacyRecords(accountingLedger, accountingRecords, scope);
+    assert.equal(accountingReport.discoveredRecords, 6);
+    assert.equal(accountingReport.sourceCounts.claim, 6);
+    assert.equal(accountingReport.sourceMap.length, 6);
+    assert.equal(
+      accountingReport.importedEvents
+        + accountingReport.duplicateEvents
+        + accountingReport.skippedRecords,
+      accountingReport.discoveredRecords,
+      "terminal outcomes must exactly cover every discovered row",
+    );
+    assert.equal(accountingReport.skippedRecords, 0);
+    assert.deepEqual(
+      accountingReport.sourceMap.map((item) => item.sourceRecordId),
+      accountingRecords.map((record) => record.sourceRecordId),
+    );
+  } finally {
+    accountingLedger.close();
+  }
+});
+
 const database = path.join(fixtureRoot, "memory-ledger.sqlite.next");
 const ledger = new AsukaMemoryLedger(database);
 const engine = new AsukaMemoryEngine(ledger);
@@ -1191,6 +1327,11 @@ assert.equal(missingCoverage.gateAfter.consolidation.status, "failed");
 assert.match(missingCoverage.gateAfter.blockers.join("; "), /coverage|non-empty/i);
 coverageLedger.close();
 
+assert.deepEqual(
+  sourceAccountingRegressionFailures,
+  [],
+  `legacy source accounting regression failures:\n${sourceAccountingRegressionFailures.join("\n")}`,
+);
 assert.deepEqual(
   migrationInvariantFailures,
   [],
