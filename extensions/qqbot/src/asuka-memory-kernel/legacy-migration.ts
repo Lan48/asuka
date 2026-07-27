@@ -33,11 +33,17 @@ export interface LegacyMigrationSources {
 export interface LegacyMigrationRecord {
   sourceKind: "memory" | "claim" | "state" | "digest" | "ref_index" | "session";
   sourcePath: string;
+  sourceRecordId?: string;
+  sourceContent?: string;
   legacyId: string;
   actor: MemoryActor;
   text: string;
   occurredAt: number;
   metadata: Record<string, unknown>;
+  auditedNonImport?: {
+    code: LegacyAuditedNonImportCode;
+    reason: string;
+  };
   provisional?: {
     legacyType: string;
     topLevelType: MemoryTopLevelType;
@@ -45,10 +51,41 @@ export interface LegacyMigrationRecord {
   };
 }
 
+const LEGACY_AUDITED_NON_IMPORT_REASONS = {
+  empty_record: "source record is empty",
+  no_supported_text: "source record has no supported text field",
+  unsupported_record_shape: "source record has an unsupported parsed shape",
+  unsupported_session_record: "session row is not a supported user or assistant message",
+  filtered_system_record: "session row is an internal system record",
+} as const;
+
+type LegacyAuditedNonImportCode = keyof typeof LEGACY_AUDITED_NON_IMPORT_REASONS;
+
+function auditedNonImport(
+  code: LegacyAuditedNonImportCode,
+): LegacyMigrationRecord["auditedNonImport"] {
+  return {
+    code,
+    reason: LEGACY_AUDITED_NON_IMPORT_REASONS[code],
+  };
+}
+
+function isAuditedNonImport(value: unknown): boolean {
+  const record = objectRecord(value);
+  if (!record || typeof record.code !== "string" || typeof record.reason !== "string") {
+    return false;
+  }
+  const expected = LEGACY_AUDITED_NON_IMPORT_REASONS[
+    record.code as LegacyAuditedNonImportCode
+  ];
+  return typeof expected === "string" && record.reason === expected;
+}
+
 class LegacyContentHashMismatchError extends Error {}
 
 function stableJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableJsonValue);
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
   if (!value || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
@@ -62,17 +99,24 @@ function legacyContentHash(input: {
   sourceKind: LegacyMigrationRecord["sourceKind"];
   actor: MemoryActor;
   text: string;
+  sourceContent?: string;
   metadata: Record<string, unknown>;
   provisional?: LegacyMigrationRecord["provisional"];
 }): string {
-  return createHash("sha256")
-    .update(JSON.stringify(stableJsonValue({
+  const material = input.sourceContent === undefined
+    ? {
       sourceKind: input.sourceKind,
       actor: input.actor,
       text: input.text.replace(/\s+/g, " ").trim(),
       metadata: input.metadata,
       provisional: input.provisional,
-    })))
+    }
+    : {
+      sourceKind: input.sourceKind,
+      sourceContent: input.sourceContent,
+    };
+  return createHash("sha256")
+    .update(JSON.stringify(stableJsonValue(material)))
     .digest("hex");
 }
 
@@ -95,6 +139,7 @@ function storedLegacyContentHash(event: ReturnType<AsukaMemoryEngine["ledger"]["
     legacyContentHash: _legacyContentHash,
     legacySourceKind: _legacySourceKind,
     legacyId: _legacyId,
+    legacySourceRecordId: _legacySourceRecordId,
     provisional,
     ...metadata
   } = event.metadata;
@@ -102,6 +147,9 @@ function storedLegacyContentHash(event: ReturnType<AsukaMemoryEngine["ledger"]["
     sourceKind,
     actor: event.actor,
     text: event.text,
+    sourceContent: typeof event.metadata.legacySourceContent === "string"
+      ? event.metadata.legacySourceContent
+      : undefined,
     metadata,
     provisional: provisional as LegacyMigrationRecord["provisional"],
   });
@@ -115,13 +163,18 @@ export interface LegacyMigrationReport {
   duplicateEvents: number;
   provisionalCandidates: number;
   pendingRejudgements: number;
+  auditedNonImportRecords: number;
   skippedRecords: number;
   sourceMap: Array<{
     sourceKind: LegacyMigrationRecord["sourceKind"];
+    sourcePath: string;
+    sourceRecordId: string;
     legacyId: string;
+    legacyContentHash: string;
     eventId?: string;
     claimId?: string;
-    status: "discovered" | "imported" | "duplicate" | "skipped";
+    status: "discovered" | "imported" | "duplicate" | "audited_non_import" | "skipped";
+    reason?: string;
   }>;
 }
 
@@ -197,15 +250,23 @@ function readJson(file: string | undefined): unknown {
   }
 }
 
-function readJsonLines(file: string | undefined): unknown[] {
+interface LegacyJsonLine {
+  value: unknown;
+  lineNumber: number;
+}
+
+function readJsonLines(file: string | undefined): LegacyJsonLine[] {
   if (!file) return [];
   if (!fs.existsSync(file)) throw new Error(`legacy source does not exist: ${file}`);
-  const values: unknown[] = [];
+  const values: LegacyJsonLine[] = [];
   for (const [index, rawLine] of fs.readFileSync(file, "utf8").split(/\r?\n/).entries()) {
     const line = rawLine.trim();
     if (!line) continue;
     try {
-      values.push(JSON.parse(line) as unknown);
+      values.push({
+        value: JSON.parse(line) as unknown,
+        lineNumber: index + 1,
+      });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`cannot parse legacy JSONL source ${file}:${index + 1}: ${detail}`);
@@ -214,14 +275,45 @@ function readJsonLines(file: string | undefined): unknown[] {
   return values;
 }
 
+function canonicalSourceContent(value: unknown): string {
+  const serialized = JSON.stringify(stableJsonValue(value));
+  return serialized === undefined ? String(value) : serialized;
+}
+
 function textValue(value: unknown, maxLength = 8_000): string {
   if (typeof value === "string") return value.replace(/\s+/g, " ").trim().slice(0, maxLength);
   if (value === undefined || value === null) return "";
   try {
-    return JSON.stringify(value).slice(0, maxLength);
+    return canonicalSourceContent(value).slice(0, maxLength);
   } catch {
     return "";
   }
+}
+
+function modelText(value: unknown, preferredText?: string): string {
+  const preferred = textValue(preferredText);
+  if (preferred) return preferred;
+  return canonicalSourceContent(value).slice(0, 8_000);
+}
+
+function sourceRecordId(record: LegacyMigrationRecord): string {
+  return record.sourceRecordId?.trim() || record.legacyId;
+}
+
+function sourceMapBase(
+  record: LegacyMigrationRecord,
+  contentHash: string,
+): Pick<
+  LegacyMigrationReport["sourceMap"][number],
+  "sourceKind" | "sourcePath" | "sourceRecordId" | "legacyId" | "legacyContentHash"
+> {
+  return {
+    sourceKind: record.sourceKind,
+    sourcePath: record.sourcePath,
+    sourceRecordId: sourceRecordId(record),
+    legacyId: record.legacyId,
+    legacyContentHash: contentHash,
+  };
 }
 
 function timestampValue(value: unknown, fallback = Date.now()): number {
@@ -260,10 +352,17 @@ function scopePeerKind(scope: LegacyMigrationScope): MemoryPeerKind {
   return scope.peerKind ?? "direct";
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
 function matchesScope(
-  record: Record<string, unknown>,
+  value: unknown,
   scope: LegacyMigrationScope,
 ): boolean {
+  const record = objectRecord(value);
+  if (!record) return true;
   const accountId = textValue(record.accountId, 200);
   const peerKind = textValue(record.peerKind ?? record.chatType, 50);
   const peerId = textValue(record.peerId, 300);
@@ -277,32 +376,40 @@ function collectMemoryRecords(
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
   const parsed = readJson(file) as {
-    memories?: Record<string, Record<string, unknown>>;
+    memories?: Record<string, unknown>;
   } | undefined;
   if (!parsed?.memories || !file) return [];
   return Object.entries(parsed.memories).flatMap(([id, item]) => {
     if (!matchesScope(item, scope)) return [];
-    const text = textValue(item.text);
-    if (!text) return [];
-    const legacyType = textValue(item.type, 100) || "unknown";
-    const source = item.source;
+    const record = objectRecord(item);
+    const preferredText = record ? textValue(record.text) : "";
+    const legacyType = record ? textValue(record.type, 100) || "unknown" : "unknown";
+    const source = record?.source;
+    const sourceContent = canonicalSourceContent(item);
     return [{
       sourceKind: "memory" as const,
       sourcePath: file,
+      sourceRecordId: `memory:${id}`,
+      sourceContent,
       legacyId: id,
       actor: actorFromLegacySource(source),
-      text,
-      occurredAt: timestampValue(item.createdAt ?? item.updatedAt),
+      text: modelText(item, preferredText),
+      occurredAt: timestampValue(record?.createdAt ?? record?.updatedAt),
       metadata: {
         legacyRecord: item,
-        legacyStatus: item.status,
+        legacyStatus: record?.status,
         legacySource: source,
       },
-      provisional: {
+      auditedNonImport: !record
+        ? auditedNonImport("unsupported_record_shape")
+        : preferredText
+          ? undefined
+          : auditedNonImport("no_supported_text"),
+      provisional: preferredText ? {
         legacyType,
         topLevelType: legacyTopLevelType(legacyType),
         epistemicStatus: source === "user_explicit" ? "explicit" as const : "inferred" as const,
-      },
+      } : undefined,
     }];
   });
 }
@@ -312,29 +419,47 @@ function collectClaimRecords(
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
   if (!file) return [];
-  return readJsonLines(file).flatMap((value, index) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-    const claim = value as Record<string, unknown>;
-    if (!matchesScope(claim, scope)) return [];
-    const text = textValue(claim.value ?? claim.text ?? claim.canonicalText);
-    if (!text) return [];
-    const legacyId = textValue(claim.id ?? claim.claimId, 200) || `line-${index + 1}`;
-    const memoryType = textValue(claim.memoryType ?? claim.type, 100) || "claim";
+  return readJsonLines(file).flatMap(({ value, lineNumber }) => {
+    if (!matchesScope(value, scope)) return [];
+    const claim = objectRecord(value);
+    const preferredText = claim
+      ? textValue(claim.value ?? claim.text ?? claim.canonicalText)
+      : "";
+    const legacyId = claim
+      ? textValue(claim.id ?? claim.claimId, 200) || `line-${lineNumber}`
+      : `line-${lineNumber}`;
+    const memoryType = claim
+      ? textValue(claim.memoryType ?? claim.type, 100) || "claim"
+      : "claim";
+    const sourceContent = canonicalSourceContent(value);
     return [{
       sourceKind: "claim" as const,
       sourcePath: file,
+      sourceRecordId: `claim:line-${lineNumber}`,
+      sourceContent,
       legacyId,
       actor: actorFromLegacySource(
-        claim.actor ?? claim.role ?? claim.sourceKind ?? claim.source,
+        claim?.actor ?? claim?.role ?? claim?.sourceKind ?? claim?.source,
       ),
-      text,
-      occurredAt: timestampValue(claim.observedAt ?? claim.createdAt ?? claim.updatedAt),
-      metadata: { legacyClaim: claim },
-      provisional: {
+      text: modelText(value, preferredText),
+      occurredAt: timestampValue(
+        claim?.observedAt ?? claim?.createdAt ?? claim?.updatedAt,
+      ),
+      metadata: { legacyClaim: value },
+      auditedNonImport: value === null
+        ? auditedNonImport("empty_record")
+        : !claim
+          ? auditedNonImport("unsupported_record_shape")
+          : preferredText
+            ? undefined
+            : auditedNonImport("no_supported_text"),
+      provisional: preferredText ? {
         legacyType: memoryType,
         topLevelType: legacyTopLevelType(memoryType),
-        epistemicStatus: claim.sourceKind === "user_explicit" ? "explicit" as const : "inferred" as const,
-      },
+        epistemicStatus: claim?.sourceKind === "user_explicit"
+          ? "explicit" as const
+          : "inferred" as const,
+      } : undefined,
     }];
   });
 }
@@ -345,14 +470,15 @@ function collectSnapshotRecord(
 ): LegacyMigrationRecord[] {
   const value = readJson(file);
   if (!file || value === undefined) return [];
-  const text = textValue(value, 24_000);
-  if (!text) return [];
+  const sourceContent = canonicalSourceContent(value);
   return [{
     sourceKind,
     sourcePath: file,
+    sourceRecordId: `${sourceKind}:snapshot`,
+    sourceContent,
     legacyId: path.basename(file),
     actor: "system",
-    text,
+    text: modelText(value),
     occurredAt: fs.statSync(file).mtimeMs,
     metadata: {
       snapshot: value,
@@ -360,6 +486,9 @@ function collectSnapshotRecord(
         ? "relationship_commitment_scene_projection"
         : "conversation_digest_projection",
     },
+    auditedNonImport: value === null
+      ? auditedNonImport("empty_record")
+      : undefined,
   }];
 }
 
@@ -375,26 +504,38 @@ function collectRefIndexRecords(
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
   if (!file) return [];
-  return readJsonLines(file).flatMap((value, index) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-    const record = value as Record<string, unknown>;
-    if (!matchesScope(record, scope)) return [];
-    const text = textValue(record.content ?? record.text ?? record.summary);
-    const attachments = Array.isArray(record.attachments) ? record.attachments : [];
+  return readJsonLines(file).flatMap(({ value, lineNumber }) => {
+    if (!matchesScope(value, scope)) return [];
+    const record = objectRecord(value);
+    const text = record
+      ? textValue(record.content ?? record.text ?? record.summary)
+      : "";
+    const attachments = Array.isArray(record?.attachments) ? record.attachments : [];
     const attachmentText = attachments
       .map((attachment) => textValue(attachment, 1_000))
       .filter(Boolean)
       .join(" ");
-    const combined = [text, attachmentText].filter(Boolean).join(" ");
-    if (!combined) return [];
+    const combined = textValue([text, attachmentText].filter(Boolean).join(" "));
+    const sourceContent = canonicalSourceContent(value);
     return [{
       sourceKind: "ref_index" as const,
       sourcePath: file,
-      legacyId: textValue(record.msgIdx ?? record.id, 300) || `line-${index + 1}`,
-      actor: inferRefActor(record, scope),
-      text: combined,
-      occurredAt: timestampValue(record.timestamp),
-      metadata: { legacyRefIndex: record },
+      sourceRecordId: `ref_index:line-${lineNumber}`,
+      sourceContent,
+      legacyId: record
+        ? textValue(record.msgIdx ?? record.id, 300) || `line-${lineNumber}`
+        : `line-${lineNumber}`,
+      actor: record ? inferRefActor(record, scope) : "system",
+      text: modelText(value, combined),
+      occurredAt: timestampValue(record?.timestamp),
+      metadata: { legacyRefIndex: value },
+      auditedNonImport: value === null
+        ? auditedNonImport("empty_record")
+        : !record
+          ? auditedNonImport("unsupported_record_shape")
+          : combined
+            ? undefined
+            : auditedNonImport("no_supported_text"),
     }];
   });
 }
@@ -444,27 +585,40 @@ function collectSessionRecords(
   const records: LegacyMigrationRecord[] = [];
   for (const sessionId of sessionIds) {
     const file = path.join(sessionsDirectory, `${sessionId}.jsonl`);
-    for (const [index, value] of readJsonLines(file).entries()) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const row = value as Record<string, unknown>;
-      if (row.type !== "message" || !row.message || typeof row.message !== "object") continue;
-      const message = row.message as Record<string, unknown>;
-      const role = message.role;
-      if (role !== "user" && role !== "assistant") continue;
-      const text = sessionText(message);
-      if (!text || /^\[(?:cron|system):/i.test(text)) continue;
+    for (const { value, lineNumber } of readJsonLines(file)) {
+      const row = objectRecord(value);
+      const message = row?.type === "message"
+        ? objectRecord(row.message)
+        : undefined;
+      const role = message?.role;
+      const preferredText = message ? sessionText(message) : "";
+      const sourceContent = canonicalSourceContent(value);
+      const internalSystemRecord = /^\[(?:cron|system):/i.test(preferredText);
       records.push({
         sourceKind: "session",
         sourcePath: file,
-        legacyId: textValue(row.id, 200) || `${sessionId}:${index + 1}`,
-        actor: role === "assistant" ? "asuka" : "user",
-        text,
-        occurredAt: timestampValue(message.timestamp ?? row.timestamp),
+        sourceRecordId: `${sessionId}:line-${lineNumber}`,
+        sourceContent,
+        legacyId: row
+          ? textValue(row.id, 200) || `${sessionId}:${lineNumber}`
+          : `${sessionId}:${lineNumber}`,
+        actor: role === "assistant" ? "asuka" : role === "user" ? "user" : "system",
+        text: modelText(value, preferredText),
+        occurredAt: timestampValue(message?.timestamp ?? row?.timestamp),
         metadata: {
+          legacyRecord: value,
           sessionId,
-          messageId: row.id,
+          sourceLine: lineNumber,
+          messageId: row?.id,
           role,
         },
+        auditedNonImport: internalSystemRecord
+          ? auditedNonImport("filtered_system_record")
+          : !message || (role !== "user" && role !== "assistant")
+            ? auditedNonImport("unsupported_session_record")
+            : preferredText
+              ? undefined
+              : auditedNonImport("no_supported_text"),
       });
     }
   }
@@ -494,6 +648,8 @@ function eventInputForRecord(
   scope: LegacyMigrationScope,
 ): MemoryEventInput {
   const contentHash = legacyContentHash(record);
+  const physicalRecordId = sourceRecordId(record);
+  const boundedText = textValue(record.text);
   return {
     accountId: scope.accountId,
     peerKind: scopePeerKind(scope),
@@ -501,18 +657,18 @@ function eventInputForRecord(
     identityId: scope.identityId,
     actor: record.actor,
     kind: "legacy_import",
-    text: record.text,
+    text: boundedText,
     occurredAt: record.occurredAt,
-    sourceId: `${record.sourceKind}:${record.legacyId}`,
+    sourceId: `${record.sourceKind}:${physicalRecordId}`,
     dedupeKey: `legacy:${JSON.stringify([
       scope.accountId,
       scopePeerKind(scope),
       scope.peerId,
       record.sourceKind,
-      record.legacyId,
+      physicalRecordId,
     ])}`,
     evidence: {
-      excerpt: record.text.slice(0, 2_000),
+      excerpt: boundedText.slice(0, 2_000),
       sourcePath: record.sourcePath,
       mediaType: "text",
     },
@@ -520,7 +676,9 @@ function eventInputForRecord(
       ...record.metadata,
       legacySourceKind: record.sourceKind,
       legacyId: record.legacyId,
+      legacySourceRecordId: physicalRecordId,
       legacyContentHash: contentHash,
+      legacyAuditedNonImport: record.auditedNonImport,
       provisional: record.provisional,
     },
   };
@@ -547,6 +705,7 @@ export function migrateLegacyRecords(
     duplicateEvents: 0,
     provisionalCandidates: 0,
     pendingRejudgements: 0,
+    auditedNonImportRecords: 0,
     skippedRecords: 0,
     sourceMap: [],
   };
@@ -554,13 +713,16 @@ export function migrateLegacyRecords(
     sourceCounts[record.sourceKind] += 1;
     const input = eventInputForRecord(record, scope);
     try {
-      const result = engine.ingestMemoryEvent(input, { jobKind: "legacy_rejudge" });
+      const result = engine.ingestMemoryEvent(input, {
+        enqueue: record.auditedNonImport ? false : undefined,
+        jobKind: "legacy_rejudge",
+      });
       if (!result.receipt) {
         report.skippedRecords += 1;
         report.sourceMap.push({
-          sourceKind: record.sourceKind,
-          legacyId: record.legacyId,
+          ...sourceMapBase(record, input.metadata?.legacyContentHash as string),
           status: "skipped",
+          reason: result.reason ?? "missing_receipt",
         });
         continue;
       }
@@ -576,6 +738,16 @@ export function migrateLegacyRecords(
           );
         }
         report.duplicateEvents += 1;
+      }
+      if (record.auditedNonImport) {
+        report.auditedNonImportRecords += 1;
+        report.sourceMap.push({
+          ...sourceMapBase(record, input.metadata?.legacyContentHash as string),
+          eventId: result.receipt.eventId,
+          status: "audited_non_import",
+          reason: record.auditedNonImport.reason,
+        });
+        continue;
       }
       report.pendingRejudgements += result.accepted && result.receipt.inserted ? 1 : 0;
       let claimId: string | undefined;
@@ -601,8 +773,7 @@ export function migrateLegacyRecords(
         if (claimId) report.provisionalCandidates += 1;
       }
       report.sourceMap.push({
-        sourceKind: record.sourceKind,
-        legacyId: record.legacyId,
+        ...sourceMapBase(record, input.metadata?.legacyContentHash as string),
         eventId: result.receipt.eventId,
         claimId,
         status: result.receipt.inserted ? "imported" : "duplicate",
@@ -611,9 +782,9 @@ export function migrateLegacyRecords(
       if (error instanceof LegacyContentHashMismatchError) throw error;
       report.skippedRecords += 1;
       report.sourceMap.push({
-        sourceKind: record.sourceKind,
-        legacyId: record.legacyId,
+        ...sourceMapBase(record, input.metadata?.legacyContentHash as string),
         status: "skipped",
+        reason: error instanceof Error ? error.message : String(error),
       });
     }
   }
@@ -626,7 +797,10 @@ export function getLegacyRejudgementGate(
   const events = engine.ledger.listEvents()
     .filter((event) => event.kind === "legacy_import");
   const eligibleEvents = events
-    .filter((event) => event.metadata.secretRedacted !== true);
+    .filter((event) =>
+      event.metadata.secretRedacted !== true
+      && !isAuditedNonImport(event.metadata.legacyAuditedNonImport)
+    );
   const eligibleEventIds = new Set(eligibleEvents.map((event) => event.eventId));
   const jobs = engine.ledger.listJobs()
     .filter((job) =>

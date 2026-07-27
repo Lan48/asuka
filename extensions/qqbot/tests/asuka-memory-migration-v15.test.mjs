@@ -180,18 +180,27 @@ verifySourceAccountingRegression("full source content hash", () => {
   };
   const collisionLedger = new AsukaMemoryLedger(":memory:");
   try {
+    const collisionEngine = new AsukaMemoryEngine(collisionLedger);
     writeCollisionRow("尾部甲");
     const firstRecords = collectLegacyMigrationRecords(collisionSources, scope);
     assert.equal(firstRecords.length, 1);
     assert.equal(firstRecords[0].text.length, 8_000, "model-facing text stays bounded");
     assert.ok(firstRecords[0].sourceRecordId, "physical row identity must be explicit");
-    assert.equal(migrateLegacyRecords(collisionLedger, firstRecords, scope).importedEvents, 1);
+    const firstReport = migrateLegacyRecords(collisionEngine, firstRecords, scope);
+    assert.equal(firstReport.importedEvents, 1);
+    const storedSource = collisionLedger.getEvent(firstReport.sourceMap[0].eventId);
+    assert.equal(storedSource.text.length, 8_000);
+    assert.match(
+      JSON.stringify(storedSource.metadata.legacyRecord),
+      /尾部甲/,
+      "the ledger must retain complete source provenance outside model-facing text",
+    );
 
     writeCollisionRow("尾部乙");
     const changedRecords = collectLegacyMigrationRecords(collisionSources, scope);
     assert.equal(changedRecords[0].sourceRecordId, firstRecords[0].sourceRecordId);
     assert.throws(
-      () => migrateLegacyRecords(collisionLedger, changedRecords, scope),
+      () => migrateLegacyRecords(collisionEngine, changedRecords, scope),
       /legacy content hash mismatch/i,
       "content beyond the model text limit must remain collision-bound",
     );
@@ -218,10 +227,18 @@ verifySourceAccountingRegression("duplicate logical IDs keep physical row identi
   );
   const duplicateLedger = new AsukaMemoryLedger(":memory:");
   try {
-    const duplicateReport = migrateLegacyRecords(duplicateLedger, duplicateRecords, scope);
+    const duplicateEngine = new AsukaMemoryEngine(duplicateLedger);
+    const duplicateReport = migrateLegacyRecords(duplicateEngine, duplicateRecords, scope);
     assert.equal(duplicateReport.importedEvents, 2);
     assert.equal(duplicateReport.skippedRecords, 0);
     assert.equal(duplicateReport.sourceMap.length, 2);
+    const duplicateRepeat = migrateLegacyRecords(
+      duplicateEngine,
+      duplicateRecords,
+      scope,
+    );
+    assert.equal(duplicateRepeat.importedEvents, 0);
+    assert.equal(duplicateRepeat.duplicateEvents, 2);
   } finally {
     duplicateLedger.close();
   }
@@ -253,10 +270,27 @@ verifySourceAccountingRegression("every parseable source row is accounted", () =
   );
   const accountingLedger = new AsukaMemoryLedger(":memory:");
   try {
-    const accountingReport = migrateLegacyRecords(accountingLedger, accountingRecords, scope);
+    const accountingEngine = new AsukaMemoryEngine(accountingLedger);
+    const accountingReport = migrateLegacyRecords(
+      accountingEngine,
+      accountingRecords,
+      scope,
+    );
     assert.equal(accountingReport.discoveredRecords, 6);
     assert.equal(accountingReport.sourceCounts.claim, 6);
     assert.equal(accountingReport.sourceMap.length, 6);
+    assert.equal(accountingReport.auditedNonImportRecords, 5);
+    assert.equal(
+      accountingReport.sourceMap
+        .filter((item) => item.status === "audited_non_import").length,
+      5,
+    );
+    assert.ok(
+      accountingReport.sourceMap
+        .filter((item) => item.status === "audited_non_import")
+        .every((item) => typeof item.reason === "string" && item.reason.length > 0),
+      "every deterministic non-import outcome must retain an audit reason",
+    );
     assert.equal(
       accountingReport.importedEvents
         + accountingReport.duplicateEvents
@@ -269,6 +303,25 @@ verifySourceAccountingRegression("every parseable source row is accounted", () =
       accountingReport.sourceMap.map((item) => item.sourceRecordId),
       accountingRecords.map((record) => record.sourceRecordId),
     );
+    const auditOnlyLedger = new AsukaMemoryLedger(":memory:");
+    try {
+      const auditOnlyEngine = new AsukaMemoryEngine(auditOnlyLedger);
+      const auditOnlyRecords = accountingRecords
+        .filter((record) => record.auditedNonImport);
+      const auditOnlyReport = migrateLegacyRecords(
+        auditOnlyEngine,
+        auditOnlyRecords,
+        scope,
+      );
+      assert.equal(auditOnlyReport.auditedNonImportRecords, 5);
+      assert.equal(
+        getLegacyRejudgementGate(auditOnlyEngine).passed,
+        true,
+        "recognized deterministic audit dispositions must not require model jobs",
+      );
+    } finally {
+      auditOnlyLedger.close();
+    }
   } finally {
     accountingLedger.close();
   }
