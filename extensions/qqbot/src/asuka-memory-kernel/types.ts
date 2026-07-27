@@ -313,7 +313,7 @@ export interface MemoryEngineOptions {
   legacyConsolidationMaxClaimsPerBatch?: number;
   legacyConsolidationMaxTokens?: number;
   model?: MemoryModelAdapter;
-  onProjectionChanged?: () => void;
+  onProjectionChanged?: (identityId: string) => void;
 }
 
 export interface MemoryProjectionEventSummary {

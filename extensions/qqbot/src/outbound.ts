@@ -30,6 +30,10 @@ import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileS
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName, getQQBotDataDir } from "./utils/platform.js";
 import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, formatSceneContinuityVerdictForPrompt, getPromiseRenderContext, getSceneContinuityTextViolation, judgeProactiveDeliveryFreshness, judgeProactiveSceneContinuity, markPromiseDelivered, markPromiseDuplicateSuppressed, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, recordProactiveBeatSuppressed, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext, type AsukaSceneContinuityVerdict } from "./asuka-state.js";
 import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
+import {
+  captureAsukaProactiveMemory,
+  retrieveQQBotAsukaMemory,
+} from "./asuka-memory-kernel/qqbot-adapter.js";
 import { buildConversationDigestPrompt } from "./asuka-conversation-digest.js";
 import { scheduleAmbientLifeJobs, schedulePlannedAmbientDelivery } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
@@ -96,6 +100,8 @@ export interface CronDeliveryRenderContext {
   retryReason?: string;
   requiredShift?: string;
   nowMs?: number;
+  memoryPrompt?: string;
+  memoryClaimIds?: string[];
 }
 interface SafeCronDeliverySelection {
   text: string | null;
@@ -278,6 +284,7 @@ export interface OutboundContext {
   replyToId?: string | null;
   account: ResolvedQQBotAccount;
   skipContextRender?: boolean;
+  memoryClaimIds?: string[];
 }
 
 export interface MediaOutboundContext extends OutboundContext {
@@ -465,11 +472,128 @@ function buildProactiveMemoryPrompt(
   peerContext: AsukaPeerContext | null,
   payload: DecodedCronPayload,
   renderContext?: ReturnType<typeof getPromiseRenderContext> | null,
+  deliveryContext: CronDeliveryRenderContext = {},
 ): string {
   if (!peerContext || peerContext.peerKind !== "direct" || payload.targetType !== "c2c") {
     return "";
   }
+  if (deliveryContext.memoryPrompt !== undefined) {
+    return deliveryContext.memoryPrompt;
+  }
   return buildAsukaProactiveMemoryPrompt(peerContext, buildProactiveMemoryCue(payload, renderContext));
+}
+
+async function hydrateProactiveMemoryContext(
+  account: ResolvedQQBotAccount,
+  payload: DecodedCronPayload,
+  deliveryContext: CronDeliveryRenderContext,
+): Promise<void> {
+  if (deliveryContext.memoryPrompt !== undefined) return;
+  const peerContext = buildPeerContextFromCronPayload(account, payload);
+  if (!peerContext || peerContext.peerKind !== "direct" || payload.targetType !== "c2c") return;
+  const promiseContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
+  const memory = await retrieveQQBotAsukaMemory(
+    peerContext,
+    buildProactiveMemoryCue(payload, promiseContext),
+    console,
+  );
+  if (!memory) return;
+  deliveryContext.memoryPrompt = memory.prompt;
+  deliveryContext.memoryClaimIds = memory.claimIds;
+}
+
+function memorySafeProactiveText(text: string): string {
+  const parsed = parseQQBotPayload(text);
+  if (parsed.isPayload && !parsed.error && parsed.payload) {
+    const payload = parsed.payload;
+    const spokenText = isMediaPayload(payload)
+      && payload.mediaType === "audio"
+      && payload.tts
+      ? payload.path
+      : "";
+    const caption = isMediaPayload(payload) || isSelfiePayload(payload)
+      ? payload.caption
+      : "";
+    return sanitizeSelfieContextText([
+      parsed.leadingText,
+      spokenText,
+      caption,
+      parsed.trailingText,
+    ].filter(Boolean).join("\n"));
+  }
+  return sanitizeSelfieContextText(text);
+}
+
+function recordDeliveredProactiveMemory(
+  peerContext: AsukaPeerContext | null,
+  text: string,
+  result: OutboundResult,
+  generatedFromClaimIds?: string[],
+  metadata: Record<string, unknown> = {},
+): void {
+  if (!peerContext || !result.messageId || result.error || result.skipped) return;
+  const durableText = memorySafeProactiveText(text);
+  if (!durableText) return;
+  captureAsukaProactiveMemory(peerContext, {
+    text: durableText,
+    sourceMessageId: result.messageId,
+    sourceId: result.messageId ? `qqbot-outbound:${result.messageId}` : undefined,
+    dedupeKey: result.messageId
+      ? `qqbot-proactive:${peerContext.accountId}:${result.messageId}`
+      : undefined,
+    generatedFromClaimIds,
+    metadata: {
+      source: "qqbot_outbound",
+      ...metadata,
+    },
+  }, console);
+}
+
+function buildOutboundMemoryPeerContext(
+  account: ResolvedQQBotAccount,
+  target: ReturnType<typeof parseTarget>,
+): AsukaPeerContext | null {
+  if (target.type === "channel") return null;
+  return {
+    accountId: account.accountId,
+    peerKind: target.type === "group" ? "group" : "direct",
+    peerId: target.id,
+    senderId: target.id,
+    target: target.type === "group"
+      ? `qqbot:group:${target.id}`
+      : `qqbot:c2c:${target.id}`,
+  };
+}
+
+async function sendMediaCaption(
+  accessToken: string,
+  target: ReturnType<typeof parseTarget>,
+  ctx: MediaOutboundContext,
+  deliveryPath: string,
+): Promise<void> {
+  const text = ctx.text?.trim();
+  if (!text || target.type === "channel") return;
+  try {
+    const sent = target.type === "c2c"
+      ? await sendC2CMessage(accessToken, target.id, text, ctx.replyToId ?? undefined)
+      : await sendGroupMessage(accessToken, target.id, text, ctx.replyToId ?? undefined);
+    if (!ctx.replyToId) {
+      recordDeliveredProactiveMemory(
+        buildOutboundMemoryPeerContext(ctx.account, target),
+        text,
+        {
+          channel: "qqbot",
+          messageId: sent.id,
+          timestamp: sent.timestamp,
+          refIdx: sent.ext_info?.ref_idx,
+        },
+        ctx.memoryClaimIds,
+        { deliveryPath },
+      );
+    }
+  } catch (error) {
+    console.error(`[qqbot] Failed to send text after media: ${error}`);
+  }
 }
 
 function normalizeQuietHour(value: number | undefined): number | null {
@@ -665,7 +789,13 @@ async function maybeSendRepairBeforeProactive(
       const failureReason = repairResult.error || repairResult.skipReason || "generated selfie send skipped";
       console.warn(`[${timestamp}] [qqbot] sendCronMessage: repair selfie delivery failed for promise=${repair.promiseId}: ${failureReason}`);
       markPromiseDeliveryFailed(repair.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
-      const fallbackResult = await sendCronSelfieFallbackImage(account, repairPayload, deliveredRepairText, failureReason);
+      const fallbackResult = await sendCronSelfieFallbackImage(
+        account,
+        repairPayload,
+        deliveredRepairText,
+        failureReason,
+        repairRenderContext.memoryClaimIds,
+      );
       if (fallbackResult.skipped) {
         markPromiseDeliveryFallback(repair.promiseId, {
           state: "skipped",
@@ -687,7 +817,10 @@ async function maybeSendRepairBeforeProactive(
       return;
     }
   } else {
-    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText, { skipContextRender: true });
+    const repairResult = await sendProactiveMessage(account, targetTo, deliveredRepairText, {
+      skipContextRender: true,
+      memoryClaimIds: repairRenderContext.memoryClaimIds,
+    });
     if (repairResult.skipped) {
       console.log(
         `[${timestamp}] [qqbot] sendCronMessage: repair delivery skipped for promise=${repair.promiseId}, skipReason=${repairResult.skipReason ?? "duplicate"}`
@@ -956,57 +1089,100 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
       return { channel: "qqbot", error: "QQBot not configured (missing appId or clientSecret)" };
     }
 
-    try {
+    const sendStructuredTts = async (): Promise<OutboundResult> => {
       const stableTts = stabilizeQQBotTTSOverrides(parsedPayload.tts);
       const runtimeTtsCfg = applyTTSRuntimeOverrides(baseTtsCfg, stableTts);
       const accessToken = await getAccessToken(ctx.account.appId!, ctx.account.clientSecret!);
       const target = parseTarget(ctx.to);
+      const peerContext = buildOutboundMemoryPeerContext(ctx.account, target);
       const ttsSegments = splitAsukaNarrationSegments(ttsText);
       let lastResult: OutboundResult = { channel: "qqbot" };
 
-      for (const segment of ttsSegments) {
-        const visibleSegment = stripTTSControlMarkers(segment);
-        if (isAsukaNarrationSegment(visibleSegment)) {
-          if (target.type === "c2c") {
-            const result = await sendC2CMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
-            lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
-          } else if (target.type === "group") {
-            const result = await sendGroupMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
-            lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
-          } else {
-            const result = await sendChannelMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+      try {
+        for (const segment of ttsSegments) {
+          const visibleSegment = stripTTSControlMarkers(segment);
+          if (isAsukaNarrationSegment(visibleSegment)) {
+            if (target.type === "c2c") {
+              const result = await sendC2CMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+            } else if (target.type === "group") {
+              const result = await sendGroupMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: result.ext_info?.ref_idx };
+            } else {
+              const result = await sendChannelMessage(accessToken, target.id, visibleSegment, ctx.replyToId ?? undefined);
+              lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+            }
+            if (!ctx.replyToId) {
+              recordDeliveredProactiveMemory(
+                peerContext,
+                visibleSegment,
+                lastResult,
+                ctx.memoryClaimIds,
+                { deliveryPath: "structured_tts_narration" },
+              );
+            }
+            continue;
+          }
+
+          for (const spokenSegment of splitAsukaSpokenSegments(segment, runtimeTtsCfg.maxInputChars ?? 240)) {
+            const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(spokenSegment), stableTts);
+            const visibleSpokenText = stripTTSControlMarkers(spokenSegment) || spokenSegment;
+            console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
+            const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
+            console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
+
+            let result: { id: string; timestamp: number | string };
+            if (target.type === "c2c") {
+              result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleSpokenText);
+            } else if (target.type === "group") {
+              result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
+            } else {
+              result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleSpokenText}`, ctx.replyToId ?? undefined);
+            }
             lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
+            if (!ctx.replyToId) {
+              recordDeliveredProactiveMemory(
+                peerContext,
+                visibleSpokenText,
+                lastResult,
+                ctx.memoryClaimIds,
+                { deliveryPath: "structured_tts_voice" },
+              );
+            }
           }
-          continue;
         }
-
-        for (const spokenSegment of splitAsukaSpokenSegments(segment, runtimeTtsCfg.maxInputChars ?? 240)) {
-          const spokenText = applyTTSPauseHints(normalizeTTSControlMarkersForSpeech(spokenSegment), stableTts);
-          const visibleSpokenText = stripTTSControlMarkers(spokenSegment) || spokenSegment;
-          console.log(`[qqbot] sendText: routing QQBOT_PAYLOAD audio through TTS, model=${runtimeTtsCfg.model}, voice=${runtimeTtsCfg.voice}, text="${visibleSpokenText.slice(0, 60)}${visibleSpokenText.length > 60 ? "..." : ""}"`);
-          const { silkBase64, duration } = await textToSilk(spokenText, runtimeTtsCfg, getQQBotDataDir("tts"));
-          console.log(`[qqbot] sendText: TTS done for structured payload: ${formatDuration(duration)}, uploading voice...`);
-
-          let result: { id: string; timestamp: number | string };
-          if (target.type === "c2c") {
-            result = await sendC2CVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined, visibleSpokenText);
-          } else if (target.type === "group") {
-            result = await sendGroupVoiceMessage(accessToken, target.id, silkBase64, ctx.replyToId ?? undefined);
-          } else {
-            result = await sendChannelMessage(accessToken, target.id, `[语音消息暂不支持频道发送] ${visibleSpokenText}`, ctx.replyToId ?? undefined);
-          }
-          lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
-        }
+      } catch (error) {
+        if (!lastResult.messageId) throw error;
+        console.warn(
+          `[qqbot] sendText: structured audio stopped after a partial delivery; suppressing text fallback: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
 
       return lastResult;
+    };
+
+    try {
+      if (!ctx.replyToId) {
+        const quietHoursError = getProactiveQuietHoursError(ctx.account);
+        if (quietHoursError) {
+          return { channel: "qqbot", error: quietHoursError };
+        }
+        return await runProactiveGuardedSend(
+          ctx.account,
+          ctx.to,
+          visibleTtsText || ttsText,
+          sendStructuredTts,
+          "sendStructuredTts",
+        );
+      }
+      return await sendStructuredTts();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[qqbot] sendText: structured audio payload failed, falling back to text: ${message}`);
       const fallbackText = extractSafeStructuredPayloadFallbackText(ctx.text);
       if (!fallbackText) {
         console.warn("[qqbot] sendText: structured audio fallback suppressed because no safe visible text remained");
-        return { channel: "qqbot" };
+        return { channel: "qqbot", skipped: true, skipReason: "structured_audio_no_safe_fallback" };
       }
       return await sendText({ ...ctx, text: fallbackText });
     }
@@ -1028,7 +1204,9 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
       selfiePrompt: parsedPayload.prompt || caption,
       selfieCaption: caption,
     };
-    return await runDirectSelfieFlowForCron(ctx.account, selfiePayload, caption);
+    return await runDirectSelfieFlowForCron(ctx.account, selfiePayload, caption, {
+      memoryClaimIds: ctx.memoryClaimIds,
+    });
   }
 
   return null;
@@ -2257,7 +2435,12 @@ function buildPromiseDeliveryPrompt(
   }
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext, deliveryContext.nowMs ?? Date.now(), deliveryContext.sceneVerdict) : "";
-  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, promiseContext);
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(
+    peerContext,
+    payload,
+    promiseContext,
+    deliveryContext,
+  );
   const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
   const recentContext = buildRecentConversationTranscript(payload.targetAddress, promiseContext.peer?.lastUserText);
   const modeLabel = payload.mode === "repair"
@@ -2367,7 +2550,12 @@ function buildSharedSessionDeliveryPrompt(
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(payload.targetAddress);
   const refIndexTranscript = buildRecentConversationTranscript(payload.targetAddress);
   const renderContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
-  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, renderContext);
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(
+    peerContext,
+    payload,
+    renderContext,
+    deliveryContext,
+  );
   const conversationDigestPrompt = buildConversationDigestPrompt(peerContext);
   const promptTimeZone = getPromptTimeZone(account);
   const currentLocalTime = formatZonedDateTimeForPrompt(deliveryContext.nowMs ?? Date.now(), promptTimeZone);
@@ -2754,13 +2942,18 @@ async function renderDirectProactiveTextFromSharedSession(
   account: ResolvedQQBotAccount,
   targetAddress: string,
   text: string,
-): Promise<string | null> {
+): Promise<{ text: string; memoryClaimIds: string[] } | null> {
   if (!shouldRenderDirectProactiveWithSharedContext(text)) return null;
   const payload = buildDirectProactivePayload(account, targetAddress, text);
-  const generated = await renderDeliveryTextFromSharedSession(account, payload);
+  const renderContext: CronDeliveryRenderContext = { nowMs: Date.now() };
+  await hydrateProactiveMemoryContext(account, payload, renderContext);
+  const generated = await renderDeliveryTextFromSharedSession(account, payload, renderContext);
   if (!generated) return null;
   console.log(`[qqbot] renderDirectProactiveTextFromSharedSession: rewrote direct proactive text "${text.slice(0, 80)}" -> "${generated.slice(0, 160)}"`);
-  return generated;
+  return {
+    text: generated,
+    memoryClaimIds: renderContext.memoryClaimIds ?? [],
+  };
 }
 
 async function renderPromiseDeliveryText(
@@ -2768,6 +2961,7 @@ async function renderPromiseDeliveryText(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   renderContext: CronDeliveryRenderContext = {},
 ): Promise<string> {
+  await hydrateProactiveMemoryContext(account, payload, renderContext);
   const transcriptAnchoredFallback = buildTranscriptAnchoredFallbackText(account, payload, renderContext);
   const fallbackText = resolveCronDeliveryFallbackText(payload, transcriptAnchoredFallback);
   const sharedSessionText = await renderDeliveryTextFromSharedSession(account, payload, renderContext);
@@ -2850,7 +3044,12 @@ function buildCronSelfiePrompt(
   const peerContext = buildPeerContextFromCronPayload(account, payload);
   const promiseContext = payload.promiseId ? getPromiseRenderContext(payload.promiseId) : null;
   const statePrompt = peerContext ? buildAsukaStatePrompt(peerContext, deliveryContext.nowMs ?? Date.now(), deliveryContext.sceneVerdict) : "";
-  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(peerContext, payload, promiseContext);
+  const proactiveMemoryPrompt = buildProactiveMemoryPrompt(
+    peerContext,
+    payload,
+    promiseContext,
+    deliveryContext,
+  );
   const conversationDigestPrompt = peerContext ? buildConversationDigestPrompt(peerContext) : "";
   const recentTranscript = buildRecentConversationTranscript(peerId, promiseContext?.peer?.lastUserText || visibleContent);
   const sessionTranscript = resolveRecentTranscriptFromNormalSession(peerId);
@@ -2939,6 +3138,7 @@ async function runDirectSelfieFlowForCron(
       replyToId: undefined,
       account,
       mediaUrl: imageUrl,
+      memoryClaimIds: renderContext.memoryClaimIds,
     });
     if (result.error) {
       console.warn(`[qqbot] runDirectSelfieFlowForCron: generated selfie image was not sent for target=${payload.targetAddress}: ${result.error}`);
@@ -2989,6 +3189,7 @@ async function sendCronSelfieFallbackImage(
   payload: NonNullable<ReturnType<typeof decodeCronPayload>["payload"]>,
   captionOverride?: string,
   reason?: string,
+  memoryClaimIds?: string[],
 ): Promise<OutboundResult> {
   const { referenceImagePath: configuredReferenceImagePath } = resolveSelfieSkillRuntimeConfig();
   const referenceImagePath = getSelfiePrimaryReferenceImagePath(configuredReferenceImagePath);
@@ -3009,6 +3210,7 @@ async function sendCronSelfieFallbackImage(
     replyToId: undefined,
     account,
     mediaUrl: referenceImagePath,
+    memoryClaimIds,
   });
 }
 
@@ -3251,7 +3453,10 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
                 lastResult = { channel: "qqbot", messageId: result.id, timestamp: result.timestamp, refIdx: (result as any).ext_info?.ref_idx };
               }
             } else {
-              lastResult = await sendProactiveMessage(account, to, segment, { skipContextRender: ctx.skipContextRender });
+              lastResult = await sendProactiveMessage(account, to, segment, {
+                skipContextRender: ctx.skipContextRender,
+                memoryClaimIds: ctx.memoryClaimIds,
+              });
             }
             console.log(`[qqbot] sendText: Sent text part: ${segment.slice(0, 30)}...`);
           }
@@ -3514,7 +3719,10 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   try {
     // 如果没有 replyToId，使用主动发送接口
     if (!replyToId) {
-      return await sendProactiveMessage(account, to, text, { skipContextRender: ctx.skipContextRender });
+      return await sendProactiveMessage(account, to, text, {
+        skipContextRender: ctx.skipContextRender,
+        memoryClaimIds: ctx.memoryClaimIds,
+      });
     }
 
     const accessToken = await getAccessToken(account.appId, account.clientSecret);
@@ -3576,7 +3784,7 @@ export async function sendProactiveMessage(
   account: ResolvedQQBotAccount,
   to: string,
   text: string,
-  options?: { skipContextRender?: boolean },
+  options?: { skipContextRender?: boolean; memoryClaimIds?: string[] },
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
 
@@ -3585,27 +3793,35 @@ export async function sendProactiveMessage(
 
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
   if (!cronProbe.isCronPayload && containsStructuredPayloadPrefix(text)) {
-    return await sendText({ account, accountId: account.accountId, to, text, replyToId: null, skipContextRender: true });
+    return await sendText({
+      account,
+      accountId: account.accountId,
+      to,
+      text,
+      replyToId: null,
+      skipContextRender: true,
+      memoryClaimIds: options?.memoryClaimIds,
+    });
   }
 
   if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "internal_delivery_leak" };
   }
 
   if (!cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed incomplete delivery text: ${text.slice(0, 160)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "incomplete_delivery_text" };
   }
 
   if (!cronProbe.isCronPayload && looksLikeDebugProbeText(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed debug probe text: ${text.slice(0, 80)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "debug_probe" };
   }
 
   if (!cronProbe.isCronPayload && looksLikeBareEncodedPayloadLeak(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed bare encoded payload leak: ${text.slice(0, 80)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "encoded_payload_leak" };
   }
   
   if (!account.appId || !account.clientSecret) {
@@ -3629,6 +3845,7 @@ export async function sendProactiveMessage(
     console.log(`[${timestamp}] [qqbot] sendProactiveMessage: target parsed, type=${target.type}, id=${target.id}`);
 
     let deliveryText = text;
+    let generatedFromClaimIds = options?.memoryClaimIds;
     if (
       target.type === "c2c" &&
       !options?.skipContextRender &&
@@ -3636,19 +3853,23 @@ export async function sendProactiveMessage(
     ) {
       const rendered = await renderDirectProactiveTextFromSharedSession(account, target.id, text);
       if (rendered) {
-        deliveryText = rendered;
+        deliveryText = rendered.text;
+        generatedFromClaimIds = rendered.memoryClaimIds;
       }
     }
     if (!cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(deliveryText)) {
       console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed incomplete rendered text: ${deliveryText.slice(0, 160)}`);
-      return { channel: "qqbot" };
+      return { channel: "qqbot", skipped: true, skipReason: "incomplete_rendered_text" };
     }
 
     const textSegments = splitAsukaNarrationSegments(deliveryText);
     if (textSegments.length > 1) {
       let lastResult: OutboundResult = { channel: "qqbot" };
       for (const segment of textSegments) {
-        const result = await sendProactiveMessage(account, to, segment, { skipContextRender: true });
+        const result = await sendProactiveMessage(account, to, segment, {
+          skipContextRender: true,
+          memoryClaimIds: generatedFromClaimIds,
+        });
         if (result.error || result.skipped) return result;
         lastResult = result;
       }
@@ -3689,6 +3910,13 @@ export async function sendProactiveMessage(
     if (proactiveGuard?.peerKey) {
       confirmProactiveDedupDelivery(proactiveGuard.peerKey, deliveryText, { at: Date.now() });
     }
+    recordDeliveredProactiveMemory(
+      buildOutboundMemoryPeerContext(account, target),
+      deliveryText,
+      outResult,
+      generatedFromClaimIds,
+      { deliveryPath: "sendProactiveMessage" },
+    );
     return outResult;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -3917,17 +4145,7 @@ export async function sendMedia(ctx: MediaOutboundContext): Promise<OutboundResu
       return { channel: "qqbot", messageId: result.id, timestamp: result.timestamp };
     }
 
-    if (text?.trim()) {
-      try {
-        if (target.type === "c2c") {
-          await sendC2CMessage(accessToken, target.id, text, replyToId ?? undefined);
-        } else if (target.type === "group") {
-          await sendGroupMessage(accessToken, target.id, text, replyToId ?? undefined);
-        }
-      } catch (textErr) {
-        console.error(`[qqbot] Failed to send text after image: ${textErr}`);
-      }
-    }
+    await sendMediaCaption(accessToken, target, ctx, "send_media_image_caption");
 
   return { channel: "qqbot", messageId: imageResult.id, timestamp: imageResult.timestamp, refIdx: (imageResult as any).ext_info?.ref_idx };
   } catch (err) {
@@ -3982,6 +4200,7 @@ async function sendVoiceFile(ctx: MediaOutboundContext): Promise<OutboundResult>
         return { channel: "qqbot", messageId: r.id, timestamp: r.timestamp };
       }
 
+      await sendMediaCaption(accessToken, target, ctx, "send_media_voice_caption");
       return { channel: "qqbot", messageId: result.id, timestamp: result.timestamp };
     }
 
@@ -4000,18 +4219,7 @@ async function sendVoiceFile(ctx: MediaOutboundContext): Promise<OutboundResult>
       return { channel: "qqbot", messageId: r.id, timestamp: r.timestamp };
     }
 
-    // 如果有文本说明，再发送一条文本消息
-    if (text?.trim()) {
-      try {
-        if (target.type === "c2c") {
-          await sendC2CMessage(accessToken, target.id, text, replyToId ?? undefined);
-        } else if (target.type === "group") {
-          await sendGroupMessage(accessToken, target.id, text, replyToId ?? undefined);
-        }
-      } catch (textErr) {
-        console.error(`[qqbot] Failed to send text after voice: ${textErr}`);
-      }
-    }
+    await sendMediaCaption(accessToken, target, ctx, "send_media_voice_caption");
 
     console.log(`[qqbot] sendVoiceFile: voice message sent`);
     return { channel: "qqbot", messageId: voiceResult.id, timestamp: voiceResult.timestamp, refIdx: (voiceResult as any).ext_info?.ref_idx };
@@ -4062,18 +4270,7 @@ async function sendVideoUrl(ctx: MediaOutboundContext): Promise<OutboundResult> 
       return { channel: "qqbot", messageId: r.id, timestamp: r.timestamp };
     }
 
-    // 如果有文本说明，再发送一条文本消息
-    if (text?.trim()) {
-      try {
-        if (target.type === "c2c") {
-          await sendC2CMessage(accessToken, target.id, text, replyToId ?? undefined);
-        } else if (target.type === "group") {
-          await sendGroupMessage(accessToken, target.id, text, replyToId ?? undefined);
-        }
-      } catch (textErr) {
-        console.error(`[qqbot] Failed to send text after video: ${textErr}`);
-      }
-    }
+    await sendMediaCaption(accessToken, target, ctx, "send_media_video_url_caption");
 
     console.log(`[qqbot] sendVideoUrl: video message sent`);
     return { channel: "qqbot", messageId: videoResult.id, timestamp: videoResult.timestamp, refIdx: (videoResult as any).ext_info?.ref_idx };
@@ -4125,18 +4322,7 @@ async function sendVideoFile(ctx: MediaOutboundContext): Promise<OutboundResult>
       return { channel: "qqbot", messageId: r.id, timestamp: r.timestamp };
     }
 
-    // 如果有文本说明，再发送一条文本消息
-    if (text?.trim()) {
-      try {
-        if (target.type === "c2c") {
-          await sendC2CMessage(accessToken, target.id, text, replyToId ?? undefined);
-        } else if (target.type === "group") {
-          await sendGroupMessage(accessToken, target.id, text, replyToId ?? undefined);
-        }
-      } catch (textErr) {
-        console.error(`[qqbot] Failed to send text after video: ${textErr}`);
-      }
-    }
+    await sendMediaCaption(accessToken, target, ctx, "send_media_video_file_caption");
 
     console.log(`[qqbot] sendVideoFile: video message sent`);
     return { channel: "qqbot", messageId: videoResult.id, timestamp: videoResult.timestamp, refIdx: (videoResult as any).ext_info?.ref_idx };
@@ -4211,18 +4397,7 @@ async function sendDocumentFile(ctx: MediaOutboundContext): Promise<OutboundResu
       }
     }
 
-    // 如果有附带文本说明，再发送一条文本消息
-    if (text?.trim()) {
-      try {
-        if (target.type === "c2c") {
-          await sendC2CMessage(accessToken, target.id, text, replyToId ?? undefined);
-        } else if (target.type === "group") {
-          await sendGroupMessage(accessToken, target.id, text, replyToId ?? undefined);
-        }
-      } catch (textErr) {
-        console.error(`[qqbot] Failed to send text after file: ${textErr}`);
-      }
-    }
+    await sendMediaCaption(accessToken, target, ctx, "send_media_file_caption");
 
     console.log(`[qqbot] sendDocumentFile: file message sent`);
     return { channel: "qqbot", messageId: fileResult.id, timestamp: fileResult.timestamp, refIdx: (fileResult as any).ext_info?.ref_idx };
@@ -4453,7 +4628,13 @@ export async function sendCronMessage(
           if (payload.promiseId) {
             markPromiseDeliveryFailed(payload.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
           }
-          const fallbackResult = await sendCronSelfieFallbackImage(account, payload, safeDeliveryText, failureReason);
+          const fallbackResult = await sendCronSelfieFallbackImage(
+            account,
+            payload,
+            safeDeliveryText,
+            failureReason,
+            deliveryRenderContext.memoryClaimIds,
+          );
           if (fallbackResult.skipped) {
             if (payload.promiseId) {
               markPromiseDeliveryFallback(payload.promiseId, {
@@ -4517,6 +4698,7 @@ export async function sendCronMessage(
         text: safeDeliveryText,
         replyToId: null,
         skipContextRender: true,
+        memoryClaimIds: deliveryRenderContext.memoryClaimIds,
       });
       if (result.skipped) {
         console.log(

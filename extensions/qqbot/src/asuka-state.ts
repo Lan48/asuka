@@ -2535,7 +2535,9 @@ function deriveAmbientDisposition(
   };
 }
 
-export function makePeerKey(context: AsukaPeerContext): string {
+export function makePeerKey(
+  context: Pick<AsukaPeerContext, "accountId" | "peerKind" | "peerId">,
+): string {
   return `${context.accountId}:${context.peerKind}:${context.peerId}`;
 }
 

@@ -6,6 +6,10 @@ import { makePeerKey } from "./asuka-state.js";
 import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
 import { getQQBotDataDir } from "./utils/platform.js";
 import { syncAsukaMemoryWiki } from "./asuka-memory-wiki.js";
+import type {
+  MemoryClaim,
+  MemoryProjectionSnapshot,
+} from "./asuka-memory-kernel/types.js";
 
 type AsukaMemoryType =
   | "user_profile"
@@ -249,6 +253,140 @@ function saveState(options: { syncWiki?: boolean } = {}): void {
   if (options.syncWiki !== false) {
     syncAsukaMemoryWiki(Object.values(cache.state.memories));
   }
+}
+
+export interface AsukaLegacyProjectionScope {
+  identityId: string;
+  accountId: string;
+  peerKind: "direct" | "group";
+  peerId: string;
+}
+
+export interface AsukaLegacyProjectionWriteOptions {
+  memoryFile?: string;
+}
+
+function readProjectionTarget(memoryFile: string): AsukaMemoryStateFile {
+  if (path.resolve(memoryFile) === path.resolve(MEMORY_FILE)) {
+    return loadState();
+  }
+  if (!fs.existsSync(memoryFile)) return emptyState();
+  const parsed = JSON.parse(
+    fs.readFileSync(memoryFile, "utf-8"),
+  ) as Partial<AsukaMemoryStateFile>;
+  return {
+    version: 1,
+    memories: parsed.memories && typeof parsed.memories === "object"
+      ? parsed.memories
+      : {},
+  };
+}
+
+function projectionMemorySource(claim: MemoryClaim): AsukaMemorySource {
+  if (
+    claim.authority === "human_override"
+    || claim.authority === "user_correction"
+    || claim.authority === "user_explicit"
+    || claim.authority === "mutual_agreement"
+  ) {
+    return "user_explicit";
+  }
+  if (
+    claim.epistemicStatus === "inferred"
+    || claim.authority === "inferred"
+    || claim.authority === "observed_pattern"
+  ) {
+    return "user_inferred";
+  }
+  return "assistant_self_signal";
+}
+
+function projectionMemoryStatus(claim: MemoryClaim): AsukaMemoryStatus {
+  if (claim.state === "active") return "active";
+  if (claim.state === "forgotten") return "forgotten";
+  return "superseded";
+}
+
+function projectionSalience(claim: MemoryClaim): number {
+  if (claim.authority === "human_override" || claim.authority === "user_correction") {
+    return 10;
+  }
+  if (claim.authority === "user_explicit" || claim.authority === "mutual_agreement") {
+    return 9;
+  }
+  return claim.epistemicStatus === "inferred" ? 6 : 7;
+}
+
+export function writeAsukaLegacyMemoryProjection(
+  scope: AsukaLegacyProjectionScope,
+  snapshot: MemoryProjectionSnapshot,
+  options: AsukaLegacyProjectionWriteOptions = {},
+): boolean {
+  const memoryFile = path.resolve(options.memoryFile ?? MEMORY_FILE);
+  const state = readProjectionTarget(memoryFile);
+  const peerKey = makePeerKey(scope);
+  const claims = [...snapshot.claims, ...snapshot.history]
+    .filter((claim) => claim.identityId === scope.identityId);
+  const successorByClaimId = new Map<string, string>();
+  for (const claim of claims) {
+    if (claim.supersedesClaimId) {
+      successorByClaimId.set(claim.supersedesClaimId, claim.claimId);
+    }
+  }
+
+  const before = JSON.stringify(state);
+  for (const [id, item] of Object.entries(state.memories)) {
+    if (
+      item.accountId === scope.accountId
+      && item.peerKey === peerKey
+      && item.key?.startsWith("v15:claim:")
+    ) {
+      delete state.memories[id];
+    }
+  }
+
+  for (const claim of claims) {
+    const text = claim.canonicalText.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const status = projectionMemoryStatus(claim);
+    const successor = successorByClaimId.get(claim.claimId);
+    state.memories[claim.claimId] = {
+      id: claim.claimId,
+      accountId: scope.accountId,
+      peerKey,
+      peerKind: scope.peerKind,
+      peerId: scope.peerId,
+      type: "explicit",
+      text: text.length > MAX_MEMORY_TEXT_LENGTH
+        ? `${text.slice(0, MAX_MEMORY_TEXT_LENGTH).trimEnd()}...`
+        : text,
+      source: projectionMemorySource(claim),
+      sourceMessageId: claim.sourceEventId,
+      createdAt: claim.createdAt,
+      updatedAt: claim.updatedAt,
+      salience: projectionSalience(claim),
+      confidence: claim.confidence,
+      expiresAt: claim.validTo,
+      privacy: claim.visibility === "private" ? "direct_only" : "group_safe",
+      key: `v15:claim:${claim.claimId}`,
+      userMemoryEvidence: `v1.5 root=${claim.rootClaimId}`,
+      extractionVersion: 2,
+      status,
+      supersededBy: status === "superseded" ? successor : undefined,
+      supersededAt: status === "superseded" ? claim.updatedAt : undefined,
+      forgottenAt: status === "forgotten" ? claim.updatedAt : undefined,
+    };
+  }
+
+  if (before === JSON.stringify(state)) return false;
+  if (memoryFile === path.resolve(MEMORY_FILE)) {
+    cache.state = state;
+    saveState({ syncWiki: false });
+  } else {
+    fs.mkdirSync(path.dirname(memoryFile), { recursive: true });
+    fs.writeFileSync(memoryFile, JSON.stringify(state, null, 2), "utf-8");
+  }
+  return true;
 }
 
 function sanitizeMemoryText(text: string | undefined): string {

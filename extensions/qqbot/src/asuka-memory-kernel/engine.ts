@@ -197,7 +197,7 @@ export class AsukaMemoryEngine {
   private readonly legacyConsolidationMaxClaimsPerBatch: number;
   private readonly legacyConsolidationMaxTokens: number;
   private readonly model?: MemoryModelAdapter;
-  private readonly onProjectionChanged?: () => void;
+  private readonly onProjectionChanged?: (identityId: string) => void;
 
   constructor(
     readonly ledger: AsukaMemoryLedger,
@@ -355,7 +355,7 @@ export class AsukaMemoryEngine {
         }),
       });
       if (claimIds.length > 0) {
-        this.onProjectionChanged?.();
+        this.onProjectionChanged?.(event.identityId);
         if (claimIds.length > 0 && this.model.embed) {
           this.ledger.enqueueJob(eventId, "embed");
         }
@@ -428,7 +428,7 @@ export class AsukaMemoryEngine {
           noMemoryReason: extraction.noMemoryReason,
         }),
       });
-      this.onProjectionChanged?.();
+      this.onProjectionChanged?.(event.identityId);
       return {
         eventId,
         judgement,
@@ -814,7 +814,7 @@ export class AsukaMemoryEngine {
                 this.ledger.enqueueJob(eventId, "embed");
               }
             }
-            this.onProjectionChanged?.();
+            this.onProjectionChanged?.(run.identityId);
             results.push(completed);
             break;
           }

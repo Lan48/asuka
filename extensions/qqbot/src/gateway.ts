@@ -24,7 +24,13 @@ import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summariz
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
 import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, clearAmbientScheduledJobs, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
-import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage, recordAsukaLongTermMemoryFromAssistantReply, recordAsukaLongTermMemoryFromUserMessageWithModel } from "./asuka-memory.js";
+import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage } from "./asuka-memory.js";
+import {
+  captureAsukaAssistantMemory,
+  captureAsukaUserMemory,
+  initializeQQBotAsukaMemory,
+  retrieveQQBotAsukaMemory,
+} from "./asuka-memory-kernel/qqbot-adapter.js";
 import { buildConversationDigestPrompt, startDailyConversationDigestScheduler } from "./asuka-conversation-digest.js";
 import { parseAssistantPromisesWithLlm } from "./promise-parser.js";
 import { schedulePromiseJobs } from "./promise-scheduler.js";
@@ -2116,6 +2122,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   if (!productionGuard.allowed) {
     throw new Error(formatQQBotProductionSendGuardError(productionGuard));
   }
+  initializeQQBotAsukaMemory(cfg, account.accountId, log);
 
   // 启动环境诊断（首次连接时执行）
   const diag = await runDiagnostics();
@@ -3006,9 +3013,34 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           ? { handled: false }
           : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
         if (!proactiveNudge.isNudge && !memoryControl.handled) {
-          void recordAsukaLongTermMemoryFromUserMessageWithModel(asukaPeerContext, userContent).catch((error) => {
-            log?.error(`[qqbot:${account.accountId}] User memory extraction failed: ${error}`);
-          });
+          const imageSummary = imageUnderstandingResults
+            .filter((item) => item.status === "summarized" && item.summary)
+            .map((item) => item.summary)
+            .join("\n");
+          const transcript = voiceTranscripts
+            .filter((item) => item && !item.startsWith("[语音消息 -"))
+            .join("\n");
+          captureAsukaUserMemory(asukaPeerContext, {
+            text: userContent,
+            occurredAt: new Date(event.timestamp).getTime(),
+            sourceMessageId: event.messageId,
+            evidence: {
+              ...(transcript ? { transcript } : {}),
+              ...(imageSummary ? { imageSummary } : {}),
+              mediaType: imageSummary && transcript
+                ? "mixed"
+                : imageSummary
+                  ? "image"
+                  : transcript
+                    ? "voice"
+                    : "text",
+            },
+            metadata: {
+              source: "qqbot_gateway",
+              senderId: event.senderId,
+              bufferedMessageCount: sourceMessages.length,
+            },
+          }, log);
         }
         const cancelledPromises = proactiveNudge.isNudge
           ? { cancelledPromises: [], cronJobIds: [] }
@@ -3143,7 +3175,14 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
           at: nowMs,
         });
         const asukaStatePrompt = buildAsukaStatePrompt(asukaPeerContext);
-        const asukaMemoryPrompt = buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
+        const asukaKernelMemoryContext = await retrieveQQBotAsukaMemory(
+          asukaPeerContext,
+          userContent,
+          log,
+        );
+        const asukaMemoryPrompt = asukaKernelMemoryContext
+          ? asukaKernelMemoryContext.prompt
+          : buildAsukaLongTermMemoryPrompt(asukaPeerContext, userContent);
         const asukaConversationDigestPrompt = buildConversationDigestPrompt(asukaPeerContext);
         const eventTimestampMs = new Date(event.timestamp).getTime();
         const recentChatTranscript = buildRecentConversationTranscript(asukaPeerContext.peerId, userContent, eventTimestampMs);
@@ -3977,6 +4016,19 @@ ${ttsHint}${sttHint}`;
                   setImmediate(() => {
                     void (async () => {
                       try {
+                        const durableReplyText = cleanOutgoingTextSegment(postprocessReplyText);
+                        if (durableReplyText) {
+                          captureAsukaAssistantMemory(asukaPeerContext, {
+                            text: durableReplyText,
+                            sourceId: `qqbot-reply:${event.messageId}`,
+                            dedupeKey: `qqbot-assistant:${account.accountId}:${event.messageId}`,
+                            generatedFromClaimIds: asukaKernelMemoryContext?.claimIds,
+                            metadata: {
+                              source: "qqbot_gateway",
+                              postprocessReason: reason,
+                            },
+                          }, log);
+                        }
                         appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises start textLength=${postprocessReplyText.length}`);
                         const parsedPromises = await parseAssistantPromisesWithLlm(postprocessReplyText, {
                           userText: userContent,
@@ -3987,9 +4039,6 @@ ${ttsHint}${sttHint}`;
                         appendGatewayDiagnosticLine(account.accountId, "deliver postprocess record-assistant start");
                         const loggedPromises = recordAssistantReply(asukaPeerContext, postprocessReplyText, parsedPromises);
                         appendGatewayDiagnosticLine(account.accountId, `deliver postprocess record-assistant done logged=${loggedPromises.length}`);
-                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory start");
-                        await recordAsukaLongTermMemoryFromAssistantReply(asukaPeerContext, postprocessReplyText);
-                        appendGatewayDiagnosticLine(account.accountId, "deliver postprocess long-memory done");
                         appendGatewayDiagnosticLine(account.accountId, "deliver postprocess refresh-scene start");
                         await refreshSceneState(asukaPeerContext, {
                           trigger: "assistant",

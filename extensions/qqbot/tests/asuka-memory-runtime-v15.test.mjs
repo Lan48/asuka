@@ -13,7 +13,7 @@ import {
   resolveAsukaMemoryKernelConfig,
 } from "../dist/src/asuka-memory-kernel/runtime.js";
 import {
-  createQQBotLegacyProjectionWriter,
+  initializeQQBotAsukaMemory,
 } from "../dist/src/asuka-memory-kernel/qqbot-adapter.js";
 import {
   memoryWikiMarkers,
@@ -230,8 +230,8 @@ const secondRoot = rootConfig({
   worker: { enabled: true, intervalMs: 20, maxJobs: 10 },
   wiki: persistentRoot.channels.qqbot.memoryKernel.wiki,
 });
-const secondRuntime = new AsukaMemoryRuntime(
-  resolveAsukaMemoryKernelConfig(secondRoot),
+const secondRuntime = initializeAsukaMemoryRuntime(
+  secondRoot,
   {
     model,
     logger: {
@@ -241,12 +241,19 @@ const secondRuntime = new AsukaMemoryRuntime(
     },
   },
 );
+assert.ok(secondRuntime);
 const secondLegacyReasons = [];
 secondRuntime.registerLegacyWriter((context) => {
   secondLegacyReasons.push(context.reason);
 });
-secondRuntime.registerLegacyWriter(
-  createQQBotLegacyProjectionWriter({ memoryFile: legacyMemoryFile }),
+assert.equal(
+  initializeQQBotAsukaMemory(
+    secondRoot,
+    "default",
+    undefined,
+    { legacyWriter: { memoryFile: legacyMemoryFile } },
+  ),
+  secondRuntime,
 );
 secondRuntime.ingestUserMessage({
   accountId: "default",
