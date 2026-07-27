@@ -465,11 +465,34 @@ try {
   assert.match(common, /scheduled-tasks\\\$GatewayTaskName\.xml/);
   assert.match(common, /syncWorker integrity contract/);
   assert.match(common, /syncWorker does not match its opsFiles entry/);
+  assert.match(common, /function ConvertFrom-AsukaTaskArguments/);
+  assert.match(common, /function Test-AsukaPowerShellFileAction/);
+  assert.match(common, /CommandLineToArgvW/);
+  assert.match(common, /LocalFree/);
+  assert.doesNotMatch(common, /ExpandEnvironmentVariables/);
   assert.match(preflight, /Packaged sync worker does not match the release integrity contract/);
   assert.match(preflight, /expectedInstalledSha256\s*=\s*\$expectedSyncScriptHash/);
+  assert.match(
+    preflight,
+    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\] -ScriptPath \$gatewayScript/,
+  );
+  assert.match(
+    preflight,
+    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\] -ScriptPath \$syncScript/,
+  );
   assert.match(verify, /Persisted migration report is missing/);
   assert.match(verify, /Installed sync worker does not match the release integrity contract/);
   assert.match(verify, /\$installedSyncScriptHash\s+-ne\s+\$expectedSyncScriptHash/);
+  assert.match(
+    verify,
+    /Test-AsukaPowerShellFileAction -Action \$gatewayActions\[0\] -ScriptPath \$gatewayScript/,
+  );
+  assert.match(
+    verify,
+    /Test-AsukaPowerShellFileAction -Action \$syncActions\[0\] -ScriptPath \$syncScript/,
+  );
+  assert.doesNotMatch(preflight, /syncScriptArgumentPattern/);
+  assert.doesNotMatch(verify, /syncScriptArgumentPattern/);
   assert.match(verify, /\$migrationReport\.rejudgementGate/);
   assert.match(verify, /\$gate\.jobs\.pending\s+-ne 0/);
   assert.match(verify, /\$gate\.jobs\.running\s+-ne 0/);
@@ -682,6 +705,48 @@ try {
         "if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }",
       ].join("; ");
       run(parser[0], [...parser.slice(1), command], { cwd: opsRoot });
+    }
+    if (process.platform === "win32") {
+      const commonScript = path.join(opsRoot, "common.ps1").replace(/'/g, "''");
+      const actionValidation = [
+        `. '${commonScript}'`,
+        "$target = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'Asuka Memory\\asuka-memory-sync.ps1'))",
+        "$trustedHost = Join-Path $PSHOME 'powershell.exe'",
+        "$validArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + $target + '\"'",
+        "$cases = @(",
+        "  @{ Name = 'valid bare host'; Expected = $true; Execute = 'powershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'valid absolute host'; Expected = $true; Execute = $trustedHost; Arguments = $validArguments },",
+        "  @{ Name = 'valid case difference'; Expected = $true; Execute = 'POWERSHELL.EXE'; Arguments = '-File \"' + $target.ToUpperInvariant() + '\"' },",
+        "  @{ Name = 'evil executable'; Expected = $false; Execute = 'evilpowershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'alternate executable'; Expected = $false; Execute = 'C:\\Temp\\powershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'relative executable'; Expected = $false; Execute = '.\\powershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'extensionless executable'; Expected = $false; Execute = 'powershell'; Arguments = $validArguments },",
+        "  @{ Name = 'pwsh executable'; Expected = $false; Execute = 'pwsh.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'environment executable'; Expected = $false; Execute = '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'decoy file first'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"C:\\evil.ps1\" -File \"' + $target + '\"' },",
+        "  @{ Name = 'command before file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-Command \"Write-Output bad\" -File \"' + $target + '\"' },",
+        "  @{ Name = 'encoded command before file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-EncodedCommand ZQB2AGkAbAA= -File \"' + $target + '\"' },",
+        "  @{ Name = 'command abbreviation'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-c bad -File \"' + $target + '\"' },",
+        "  @{ Name = 'encoded abbreviation'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-enc ZQB2AGkAbAA= -File \"' + $target + '\"' },",
+        "  @{ Name = 'file contains arguments'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + ' -Once\"' },",
+        "  @{ Name = 'file suffix'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + '.evil\"' },",
+        "  @{ Name = 'relative file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File .\\asuka-memory-sync.ps1' },",
+        "  @{ Name = 'alternate stream'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + ':evil\"' },",
+        "  @{ Name = 'missing file value'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File' },",
+        "  @{ Name = 'second file after script'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments + ' -File \"C:\\evil.ps1\"' },",
+        "  @{ Name = 'unexpected script argument'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments + ' -Once' },",
+        ")",
+        "foreach ($case in $cases) {",
+        "  $action = [pscustomobject]@{ execute = $case.Execute; arguments = $case.Arguments }",
+        "  $actual = Test-AsukaPowerShellFileAction -Action $action -ScriptPath $target",
+        "  if ($actual -ne $case.Expected) { throw \"Task action validation case failed: $($case.Name)\" }",
+        "}",
+        "$parsed = @(ConvertFrom-AsukaTaskArguments -Arguments '  -NoProfile   -File \"C:\\Asuka Memory\\worker.ps1\"  ')",
+        "if ($parsed.Count -ne 3 -or $parsed[2] -ne 'C:\\Asuka Memory\\worker.ps1') { throw 'Quoted path parsing failed.' }",
+        "$escaped = @(ConvertFrom-AsukaTaskArguments -Arguments 'one\\\\\\\"two')",
+        "if ($escaped.Count -ne 1 -or $escaped[0] -ne 'one\\\"two') { throw 'Backslash-quote parsing failed.' }",
+      ].join("\n");
+      run(parser[0], [...parser.slice(1), actionValidation], { cwd: opsRoot });
     }
     process.stdout.write("PowerShell parser validation passed.\n");
   } else {

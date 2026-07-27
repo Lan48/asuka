@@ -190,19 +190,15 @@ try {
   $syncTask = Get-AsukaTaskSnapshot -Name $syncTaskName
   $gatewayActions = @($gatewayTask.actions)
   $syncActions = @($syncTask.actions)
-  $escapedSyncScript = [regex]::Escape($syncScript)
-  $syncScriptArgumentPattern = "(?i)(?:^|\s)-File\s+`"?${escapedSyncScript}`"?(?:\s|$)"
   if (
     $gatewayActions.Count -ne 1 -or
-    [string]$gatewayActions[0].execute -notmatch "(?i)powershell(\.exe)?$" -or
-    [string]$gatewayActions[0].arguments -notmatch ([regex]::Escape($gatewayScript))
+    -not (Test-AsukaPowerShellFileAction -Action $gatewayActions[0] -ScriptPath $gatewayScript)
   ) {
     throw "$gatewayTaskName action does not reference the audited gateway script."
   }
   if (
     $syncActions.Count -ne 1 -or
-    [string]$syncActions[0].execute -notmatch "(?i)powershell(\.exe)?$" -or
-    [string]$syncActions[0].arguments -notmatch $syncScriptArgumentPattern
+    -not (Test-AsukaPowerShellFileAction -Action $syncActions[0] -ScriptPath $syncScript)
   ) {
     throw "$syncTaskName action does not reference the audited sync script."
   }

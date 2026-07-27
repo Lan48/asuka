@@ -362,6 +362,141 @@ function Get-AsukaTaskSnapshot {
   }
 }
 
+function ConvertFrom-AsukaTaskArguments {
+  param([AllowEmptyString()][string]$Arguments)
+
+  if ($Arguments.IndexOf([char]0) -ge 0) {
+    throw "Scheduled-task action contains a null character."
+  }
+  if (-not ("Asuka.NativeCommandLine" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Asuka {
+  public static class NativeCommandLine {
+    [DllImport("shell32.dll", SetLastError = true)]
+    public static extern IntPtr CommandLineToArgvW(
+      [MarshalAs(UnmanagedType.LPWStr)] string commandLine,
+      out int argumentCount
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr LocalFree(IntPtr memory);
+  }
+}
+'@ | Out-Null
+  }
+
+  $commandLine = '"C:\AsukaTaskActionValidator.exe"'
+  if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+    $commandLine += " $Arguments"
+  }
+  $argumentCount = 0
+  $argumentsPointer = [Asuka.NativeCommandLine]::CommandLineToArgvW(
+    $commandLine,
+    [ref]$argumentCount
+  )
+  if ($argumentsPointer -eq [IntPtr]::Zero -or $argumentCount -lt 1) {
+    throw "Windows could not parse the scheduled-task action."
+  }
+
+  $tokens = New-Object System.Collections.Generic.List[string]
+  try {
+    for ($index = 1; $index -lt $argumentCount; $index += 1) {
+      $tokenPointer = [Runtime.InteropServices.Marshal]::ReadIntPtr(
+        $argumentsPointer,
+        $index * [IntPtr]::Size
+      )
+      $tokens.Add([Runtime.InteropServices.Marshal]::PtrToStringUni($tokenPointer))
+    }
+  } finally {
+    [void][Asuka.NativeCommandLine]::LocalFree($argumentsPointer)
+  }
+  return $tokens.ToArray()
+}
+
+function Test-AsukaPowerShellFileAction {
+  param(
+    [Parameter(Mandatory = $true)][object]$Action,
+    [Parameter(Mandatory = $true)][string]$ScriptPath
+  )
+
+  try {
+    $execute = ([string]$Action.execute).Trim()
+    if ($execute -ine "powershell.exe") {
+      if (-not [IO.Path]::IsPathRooted($execute)) {
+        return $false
+      }
+      $trustedPowerShell = [IO.Path]::GetFullPath(
+        (Join-Path $PSHOME "powershell.exe")
+      )
+      if (
+        -not ([IO.Path]::GetFullPath($execute)).Equals(
+          $trustedPowerShell,
+          [StringComparison]::OrdinalIgnoreCase
+        )
+      ) {
+        return $false
+      }
+    }
+
+    $tokens = @(ConvertFrom-AsukaTaskArguments -Arguments ([string]$Action.arguments))
+    $fileIndexes = @()
+    for ($index = 0; $index -lt $tokens.Count; $index += 1) {
+      if ([string]$tokens[$index] -ieq "-File") {
+        $fileIndexes += $index
+      }
+    }
+    if ($fileIndexes.Count -ne 1) {
+      return $false
+    }
+
+    $fileIndex = [int]$fileIndexes[0]
+    if ($fileIndex + 1 -ne $tokens.Count - 1) {
+      return $false
+    }
+    $actualScript = [string]$tokens[$fileIndex + 1]
+    if (
+      -not $actualScript.Equals(
+        [IO.Path]::GetFullPath($ScriptPath),
+        [StringComparison]::OrdinalIgnoreCase
+      )
+    ) {
+      return $false
+    }
+
+    $cursor = 0
+    $seenOptions = @{}
+    while ($cursor -lt $fileIndex) {
+      $option = [string]$tokens[$cursor]
+      $optionKey = $option.ToLowerInvariant()
+      if ($seenOptions.ContainsKey($optionKey)) {
+        return $false
+      }
+      $seenOptions[$optionKey] = $true
+      if (@("-NoProfile", "-NonInteractive") -contains $option) {
+        $cursor += 1
+        continue
+      }
+      if ($option -ieq "-ExecutionPolicy") {
+        if (
+          $cursor + 1 -ge $fileIndex -or
+          [string]$tokens[$cursor + 1] -ine "Bypass"
+        ) {
+          return $false
+        }
+        $cursor += 2
+        continue
+      }
+      return $false
+    }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 function Wait-AsukaTaskStopped {
   param(
     [Parameter(Mandatory = $true)][string]$Name,
