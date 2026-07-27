@@ -762,6 +762,92 @@ await verifyIntegrityInvariant("foreground rerank revalidates deleted claims", a
   }
 });
 
+await verifyIntegrityInvariant("background rerank revalidates deleted claims", async () => {
+  const revalidationLedger = new AsukaMemoryLedger(":memory:");
+  let signalRerankStarted;
+  let releaseRerank;
+  const rerankStarted = new Promise((resolve) => {
+    signalRerankStarted = resolve;
+  });
+  const rerankRelease = new Promise((resolve) => {
+    releaseRerank = resolve;
+  });
+  const query = "雨后石板路";
+  const revalidationEngine = new AsukaMemoryEngine(revalidationLedger, {
+    rerankDeadlineMs: 10,
+    model: {
+      async complete(request) {
+        if (request.task !== "rerank") {
+          return JSON.stringify({ proposals: [], noMemoryReason: "fixture" });
+        }
+        const ids = [...request.prompt.matchAll(/"claimId":"([^"]+)"/g)]
+          .map((match) => match[1]);
+        signalRerankStarted();
+        await rerankRelease;
+        return JSON.stringify({ claimIds: ids });
+      },
+    },
+  });
+  try {
+    const source = revalidationLedger.appendEvent(eventInput({
+      text: "我喜欢雨后的石板路",
+      sourceMessageId: "background-rerank-delete-source",
+    }));
+    const target = revalidationLedger.applyClaimProposal(source.eventId, {
+      semanticKey: "user.preference.rain_street",
+      subjectId: "user",
+      predicate: "preference.rain_street",
+      value: true,
+      canonicalText: "用户喜欢雨后的石板路",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const retrieval = revalidationEngine.retrieveMemoryContext({
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      query,
+    });
+    await rerankStarted;
+    const fallback = await retrieval;
+    assert.equal(fallback.usedFallback, true);
+
+    const deletionEvent = revalidationLedger.appendEvent(eventInput({
+      kind: "memory_control",
+      text: "删除这条偏好",
+      sourceMessageId: "background-rerank-delete-control",
+    }));
+    const deletion = revalidationLedger.applyClaimProposal(deletionEvent.eventId, {
+      semanticKey: "user.preference.rain_street",
+      subjectId: "user",
+      predicate: "preference.rain_street",
+      value: null,
+      canonicalText: "删除用户的雨后石板路偏好",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_correction",
+      confidence: 1,
+      action: "delete",
+      targetClaimId: target.claimId,
+    });
+    assert.equal(deletion.ignoredReason, undefined);
+    releaseRerank();
+
+    let cache;
+    for (let attempt = 0; attempt < 40 && !cache; attempt += 1) {
+      await wait(5);
+      cache = revalidationLedger.readRerankCache(source.identityId, query);
+    }
+    assert.ok(cache, "background rerank should populate the cache after its deadline");
+    assert.ok(!cache.claimIds.includes(target.claimId));
+  } finally {
+    releaseRerank?.();
+    revalidationLedger.close();
+  }
+});
+
 await verifyIntegrityInvariant("semantic key compatibility migration", async () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-schema-v1-"));
   const databasePath = path.join(fixtureRoot, "ledger.sqlite");
