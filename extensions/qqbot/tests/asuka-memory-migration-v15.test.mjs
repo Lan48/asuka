@@ -1,0 +1,1200 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
+import { AsukaMemoryEngine } from "../dist/src/asuka-memory-kernel/engine.js";
+import { AsukaMemoryLedger } from "../dist/src/asuka-memory-kernel/ledger.js";
+import {
+  collectLegacyMigrationRecords,
+  executeLegacyRejudgements,
+  getLegacyRejudgementGate,
+  migrateLegacyRecords,
+} from "../dist/src/asuka-memory-kernel/legacy-migration.js";
+import {
+  importWikiOverrides,
+  memoryWikiMarkers,
+  projectMemoryWiki,
+} from "../dist/src/asuka-memory-kernel/wiki.js";
+
+const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-v15-"));
+const memoryFile = path.join(fixtureRoot, "memory.json");
+const claimsFile = path.join(fixtureRoot, "claims.jsonl");
+const stateFile = path.join(fixtureRoot, "state.json");
+const refIndexFile = path.join(fixtureRoot, "ref-index.jsonl");
+const sessionsDirectory = path.join(fixtureRoot, "sessions");
+const sessionsIndexFile = path.join(sessionsDirectory, "sessions.json");
+fs.mkdirSync(sessionsDirectory, { recursive: true });
+
+fs.writeFileSync(memoryFile, JSON.stringify({
+  version: 1,
+  memories: {
+    "legacy-explicit": {
+      id: "legacy-explicit",
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      type: "explicit",
+      text: "我晚上睡觉不安分",
+      source: "user_explicit",
+      createdAt: 100,
+      status: "active",
+    },
+    "legacy-noise": {
+      id: "legacy-noise",
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      type: "boundary",
+      text: "不想睡",
+      source: "user_inferred",
+      createdAt: 200,
+      status: "active",
+    },
+  },
+}, null, 2));
+fs.writeFileSync(claimsFile, `${JSON.stringify({
+  id: "legacy-claim",
+  accountId: "default",
+  peerId: "user-1",
+  value: "旧住所推断",
+  sourceKind: "user_inferred",
+  observedAt: "2026-01-01T00:00:00Z",
+})}\n`);
+fs.writeFileSync(stateFile, JSON.stringify({
+  peers: {
+    "default:direct:user-1": {
+      relationship: { phase: "close" },
+      promises: [{ id: "promise-1", text: "稍后提醒" }],
+    },
+  },
+}));
+fs.writeFileSync(refIndexFile, `${JSON.stringify({
+  id: "ref-1",
+  peerId: "user-1",
+  senderId: "user-1",
+  content: "最近在准备搬家",
+  timestamp: 300,
+})}\n`);
+fs.writeFileSync(sessionsIndexFile, JSON.stringify({
+  "agent:main:qqbot:direct:user-1": {
+    sessionId: "session-1",
+    channel: "qqbot",
+    chatType: "direct",
+  },
+}));
+fs.writeFileSync(path.join(sessionsDirectory, "session-1.jsonl"), [
+  JSON.stringify({
+    type: "message",
+    id: "session-user",
+    timestamp: "2026-01-02T00:00:00Z",
+    message: {
+      role: "user",
+      content: [{ type: "text", text: "我这周暂住朋友家" }],
+    },
+  }),
+  JSON.stringify({
+    type: "message",
+    id: "session-assistant",
+    timestamp: "2026-01-02T00:00:01Z",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "那我记得你现在是暂住，不会当成常住地址。" }],
+    },
+  }),
+].join("\n"));
+
+const sources = {
+  memoryJson: memoryFile,
+  claimsJsonl: claimsFile,
+  stateJson: stateFile,
+  refIndexJsonl: refIndexFile,
+  sessionsIndexJson: sessionsIndexFile,
+  sessionsDirectory,
+};
+const scope = { accountId: "default", peerId: "user-1" };
+const records = collectLegacyMigrationRecords(sources, scope);
+assert.deepEqual(
+  Object.fromEntries(
+    ["memory", "claim", "state", "ref_index", "session"].map((kind) => [
+      kind,
+      records.filter((record) => record.sourceKind === kind).length,
+    ]),
+  ),
+  { memory: 2, claim: 1, state: 1, ref_index: 1, session: 2 },
+);
+const malformedClaimsFile = path.join(fixtureRoot, "malformed-claims.jsonl");
+fs.writeFileSync(malformedClaimsFile, "{\"id\":\n");
+assert.throws(
+  () => collectLegacyMigrationRecords({ claimsJsonl: malformedClaimsFile }, scope),
+  /cannot parse legacy JSONL source .*:1:/,
+  "a malformed configured source must block a lossless migration",
+);
+assert.throws(
+  () => collectLegacyMigrationRecords({
+    memoryJson: path.join(fixtureRoot, "missing-memory.json"),
+  }, scope),
+  /legacy source does not exist:/,
+  "a missing configured source must not be treated as an empty source",
+);
+
+const database = path.join(fixtureRoot, "memory-ledger.sqlite.next");
+const ledger = new AsukaMemoryLedger(database);
+const engine = new AsukaMemoryEngine(ledger);
+const firstMigration = migrateLegacyRecords(engine, records, scope);
+assert.equal(firstMigration.discoveredRecords, 7);
+assert.equal(firstMigration.importedEvents, 7);
+assert.equal(firstMigration.skippedRecords, 0);
+assert.equal(firstMigration.provisionalCandidates, 3);
+assert.equal(ledger.listClaims({ states: ["active"] }).length, 0, "legacy claims must not become active without rejudgement");
+assert.equal(ledger.listClaims({ states: ["candidate"] }).length, 3);
+assert.equal(ledger.listJobs("pending").length, 7);
+assert.ok(firstMigration.sourceMap.every((item) => item.eventId), "every imported legacy id must map to an event");
+
+const secondMigration = migrateLegacyRecords(engine, records, scope);
+assert.equal(secondMigration.importedEvents, 0);
+assert.equal(secondMigration.duplicateEvents, 7, "migration must be safely resumable");
+assert.equal(ledger.listEvents().length, 7);
+const untrackedLegacyEvent = engine.ingestMemoryEvent({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+  actor: "user",
+  kind: "legacy_import",
+  text: "未排入重裁决队列的旧记忆",
+}, { enqueue: false });
+assert.ok(untrackedLegacyEvent.receipt);
+const untrackedGate = getLegacyRejudgementGate(engine);
+assert.equal(untrackedGate.passed, false);
+assert.equal(untrackedGate.events.untracked, 1);
+assert.match(untrackedGate.blockers.join("; "), /no rejudgement job/);
+ledger.enqueueJob(untrackedLegacyEvent.receipt.eventId, "legacy_rejudge");
+assert.equal(getLegacyRejudgementGate(engine).events.untracked, 0);
+
+const wikiRoot = path.join(fixtureRoot, "Memory");
+const firstProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
+  memoryRoot: wikiRoot,
+});
+assert.equal(firstProjection.pageCount, 1, "only a topic with real claims should generate a page");
+assert.ok(firstProjection.changedFiles.some((file) => file.endsWith("index.md")));
+const entityFile = firstProjection.changedFiles.find((file) => file.includes(`${path.sep}entities${path.sep}`));
+assert.ok(entityFile);
+
+let entityContent = fs.readFileSync(entityFile, "utf8");
+entityContent = entityContent
+  .replace(
+    memoryWikiMarkers.notesStart,
+    `${memoryWikiMarkers.notesStart}\n用户自由 Notes，compile 后必须保留。`,
+  )
+  .replace(
+    memoryWikiMarkers.overridesStart,
+    `${memoryWikiMarkers.overridesStart}\n用户明确纠正：我睡觉其实很安稳。`,
+  );
+fs.writeFileSync(entityFile, entityContent);
+const secondProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
+  memoryRoot: wikiRoot,
+});
+const preserved = fs.readFileSync(entityFile, "utf8");
+assert.match(preserved, /用户自由 Notes/);
+assert.match(preserved, /用户明确纠正/);
+const thirdProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
+  memoryRoot: wikiRoot,
+});
+assert.equal(
+  thirdProjection.changedFiles.length,
+  0,
+  `an unchanged projection must be idempotent after manual blocks are normalized; previous=${secondProjection.changedFiles.length}`,
+);
+
+const overrideImport = importWikiOverrides(engine, {
+  memoryRoot: wikiRoot,
+  accountId: "default",
+  peerId: "user-1",
+});
+assert.equal(overrideImport.imported, 1);
+const repeatedOverrideImport = importWikiOverrides(engine, {
+  memoryRoot: wikiRoot,
+  accountId: "default",
+  peerId: "user-1",
+});
+assert.equal(repeatedOverrideImport.imported, 0);
+assert.equal(repeatedOverrideImport.unchanged, 1);
+const overrideEvent = ledger.getEvent(overrideImport.eventIds[0]);
+assert.equal(overrideEvent.kind, "human_override");
+assert.equal(overrideEvent.actor, "user");
+assert.equal(ledger.integrityCheck().ok, true);
+
+ledger.close();
+
+function legacyRecord(id, text, occurredAt, actor = "user") {
+  return {
+    sourceKind: "memory",
+    sourcePath: memoryFile,
+    legacyId: id,
+    actor,
+    text,
+    occurredAt,
+    metadata: {},
+    provisional: {
+      legacyType: actor === "user" ? "explicit" : "assistant_summary",
+      topLevelType: "fact",
+      epistemicStatus: actor === "user" ? "explicit" : "inferred",
+    },
+  };
+}
+
+function promptPayload(prompt, marker) {
+  const line = prompt.split("\n").find((item) => item.startsWith(`${marker}=`));
+  assert.ok(line, `missing ${marker} payload`);
+  return JSON.parse(line.slice(marker.length + 1));
+}
+
+function extractionForResidence(request) {
+  const { event } = promptPayload(request.prompt, "LEGACY_EXTRACTION_INPUT");
+  const inHangzhou = event.text.includes("杭州");
+  return JSON.stringify({
+    proposals: [{
+      subjectId: "user",
+      predicate: inHangzhou ? "home.city" : "residence.current_city",
+      value: inHangzhou ? "杭州" : "苏州",
+      canonicalText: inHangzhou ? "用户曾住在杭州" : "用户目前住在苏州",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      sourceKind: "statement",
+      confidence: 0.99,
+      topic: "居住状态",
+      lifecycle: "bounded",
+    }],
+  });
+}
+
+function consolidateResidences(request) {
+  const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+  const hangzhou = items.filter((item) => item.canonicalText.includes("杭州"));
+  const suzhou = items.filter((item) => item.canonicalText.includes("苏州"));
+  assert.equal(hangzhou.length, 1);
+  assert.equal(suzhou.length, 2);
+  return JSON.stringify({
+    claims: [
+      {
+        semanticKey: "user.residence.current_city",
+        sourceItemIds: hangzhou.map((item) => item.itemId),
+        subjectId: "user",
+        predicate: "residence.current_city",
+        value: "杭州",
+        canonicalText: "用户曾住在杭州",
+        topLevelType: "fact",
+        epistemicStatus: "explicit",
+        confidence: 0.99,
+        topic: "居住状态",
+        lifecycle: "bounded",
+      },
+      {
+        semanticKey: "user.residence.current_city",
+        sourceItemIds: suzhou.map((item) => item.itemId),
+        subjectId: "user",
+        predicate: "residence.current_city",
+        value: "苏州",
+        canonicalText: "用户目前住在苏州",
+        topLevelType: "fact",
+        epistemicStatus: "explicit",
+        confidence: 0.99,
+        topic: "居住状态",
+        lifecycle: "bounded",
+      },
+    ],
+    discarded: [],
+  });
+}
+
+const migrationInvariantFailures = [];
+async function verifyMigrationInvariant(name, run) {
+  try {
+    await run();
+  } catch (error) {
+    migrationInvariantFailures.push(
+      `${name}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+await verifyMigrationInvariant("legacy stable content hash", async () => {
+  const hashLedger = new AsukaMemoryLedger(":memory:");
+  try {
+    const hashEngine = new AsukaMemoryEngine(hashLedger);
+    const stableHashFirst = migrateLegacyRecords(hashEngine, [
+      legacyRecord("stable-hash", "同一份旧记忆证据", 10_000),
+    ], scope);
+    assert.equal(stableHashFirst.importedEvents, 1);
+    const stableHashRepeat = migrateLegacyRecords(hashEngine, [
+      legacyRecord("stable-hash", "同一份旧记忆证据", 99_999),
+    ], scope);
+    assert.equal(
+      stableHashRepeat.duplicateEvents,
+      1,
+      "unstable fallback timestamps must not change the legacy content binding",
+    );
+    assert.throws(
+      () => migrateLegacyRecords(hashEngine, [
+        legacyRecord("stable-hash", "同一个旧 ID 下被替换的内容", 99_999),
+      ], scope),
+      /legacy content hash mismatch/i,
+      "one legacy ID must never silently bind to different evidence",
+    );
+  } finally {
+    hashLedger.close();
+  }
+});
+
+const chronologicalRejudgementRecords = [
+  legacyRecord("residence-hangzhou", "我以前住在杭州", 1_000),
+  legacyRecord("residence-suzhou", "我已经搬到苏州", 2_000),
+  legacyRecord("residence-suzhou-confirmation", "苏州现在是我的常住地", 3_000),
+];
+const rejudgementRecords = [
+  chronologicalRejudgementRecords[2],
+  chronologicalRejudgementRecords[0],
+  chronologicalRejudgementRecords[1],
+];
+const rejudgementDatabase = path.join(fixtureRoot, "rejudgement.sqlite");
+let firstAttempt = true;
+const failingLedger = new AsukaMemoryLedger(rejudgementDatabase);
+const failingEngine = new AsukaMemoryEngine(failingLedger, {
+  maxJobAttempts: 1,
+  model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        if (firstAttempt) {
+          firstAttempt = false;
+          throw new Error("fixture provider outage");
+        }
+        return extractionForResidence(request);
+      }
+      throw new Error(`unexpected task before extraction completes: ${request.task}`);
+    },
+  },
+});
+for (const record of rejudgementRecords) {
+  migrateLegacyRecords(failingEngine, [record], scope);
+  await wait(2);
+}
+assert.equal(failingLedger.listEvents().length, 3);
+assert.equal(
+  failingEngine.retrieveMemoryContextLocal({
+    accountId: "default",
+    peerKind: "direct",
+    peerId: "user-1",
+    query: "我住在哪里",
+  }).claimIds.length,
+  0,
+  "migration candidates must never participate in official recall",
+);
+const stagedGate = getLegacyRejudgementGate(failingEngine);
+assert.equal(stagedGate.passed, false);
+assert.equal(stagedGate.jobs.pending, 3);
+assert.equal(stagedGate.claims.provisionalOpen, 3);
+const interrupted = await executeLegacyRejudgements(failingEngine, {
+  batchSize: 1,
+  maxBatches: 1,
+  retryDelayMs: 0,
+});
+assert.equal(interrupted.processed, 1);
+assert.equal(interrupted.failed, 1);
+assert.equal(interrupted.gateAfter.jobs.failed, 1);
+assert.equal(interrupted.gateAfter.jobs.pending, 2);
+assert.equal(interrupted.gateAfter.consolidation.status, "not_started");
+failingLedger.close();
+
+const taskCalls = [];
+const resumedLedger = new AsukaMemoryLedger(rejudgementDatabase);
+const resumedEngine = new AsukaMemoryEngine(resumedLedger, {
+  model: {
+    async complete(request) {
+      taskCalls.push(request.task);
+      if (request.task === "legacy_extract") return extractionForResidence(request);
+      if (request.task === "legacy_consolidate") return consolidateResidences(request);
+      throw new Error(`unexpected task: ${request.task}`);
+    },
+  },
+});
+const resumed = await executeLegacyRejudgements(resumedEngine, {
+  batchSize: 2,
+  retryDelayMs: 0,
+  retryFailed: true,
+});
+assert.equal(resumed.retriedFailedJobs, 1);
+assert.equal(resumed.gateAfter.passed, true, resumed.gateAfter.blockers.join("; "));
+assert.equal(resumed.gateAfter.jobs.completed, 3);
+assert.equal(resumed.gateAfter.extractions.completed, 3);
+assert.equal(resumed.gateAfter.consolidation.status, "completed");
+assert.equal(resumed.gateAfter.coverage.sourceEvents, 3);
+assert.equal(resumed.gateAfter.coverage.coveredSourceEvents, 3);
+assert.equal(resumed.gateAfter.claims.provisionalOpen, 0);
+assert.ok(taskCalls.includes("legacy_extract"));
+assert.ok(taskCalls.includes("legacy_consolidate"));
+assert.equal(resumedLedger.listEvents().length, 3, "raw legacy events must remain lossless");
+
+const residenceClaims = resumedLedger.listClaims()
+  .filter((claim) => claim.predicate === "residence.current_city");
+const currentResidence = residenceClaims.find((claim) => claim.state === "active");
+const previousResidence = residenceClaims.find((claim) => claim.state === "superseded");
+assert.equal(currentResidence?.canonicalText, "用户目前住在苏州");
+assert.equal(currentResidence?.supportingEvidenceCount, 2, "semantic duplicates must merge evidence");
+assert.equal(previousResidence?.canonicalText, "用户曾住在杭州");
+assert.equal(
+  currentResidence?.rootClaimId,
+  previousResidence?.rootClaimId,
+  "a changed fact must remain in one version chain despite predicate paraphrases",
+);
+assert.ok((previousResidence?.validFrom ?? Infinity) < (currentResidence?.validFrom ?? -Infinity));
+assert.equal(
+  resumedLedger.listClaims({ states: ["candidate"] })
+    .filter((claim) => claim.metadata.migrationPendingConsolidation === true)
+    .length,
+  0,
+  "successful consolidation must close every extraction candidate",
+);
+
+const repeatedMigration = migrateLegacyRecords(resumedEngine, rejudgementRecords, scope);
+assert.equal(repeatedMigration.importedEvents, 0);
+const callsBeforeRepeat = taskCalls.length;
+const repeatedExecution = await executeLegacyRejudgements(resumedEngine);
+assert.equal(repeatedExecution.processed, 0);
+assert.equal(repeatedExecution.gateAfter.passed, true);
+assert.equal(taskCalls.length, callsBeforeRepeat, "completed consolidation must be idempotent");
+
+assert.ok(currentResidence);
+const reorganizedResidenceClaimIds = new Set([
+  ...residenceClaims
+    .filter((claim) => claim.metadata.legacyConsolidationRunId)
+    .map((claim) => claim.claimId),
+  ...residenceClaims
+    .filter((claim) => claim.metadata.legacyConsolidationRunId)
+    .flatMap((claim) => claim.metadata.sourceCandidateIds ?? []),
+]);
+const deleteControl = resumedEngine.ingestMemoryEvent({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+  actor: "user",
+  kind: "human_override",
+  text: "彻底删除住所声明",
+}, { enqueue: false });
+assert.ok(deleteControl.receipt);
+const deletedResidence = resumedLedger.applyClaimProposal(deleteControl.receipt.eventId, {
+  subjectId: "user",
+  predicate: "residence.current_city",
+  value: null,
+  canonicalText: "删除用户住所声明",
+  topLevelType: "fact",
+  epistemicStatus: "explicit",
+  authority: "human_override",
+  confidence: 1,
+  action: "delete",
+  targetClaimId: currentResidence.claimId,
+});
+assert.equal(
+  deletedResidence.deletedClaimIds?.length,
+  reorganizedResidenceClaimIds.size,
+  "deleting a reorganized chain must also remove extraction candidates with synonymous predicates",
+);
+assert.ok(
+  [...reorganizedResidenceClaimIds].every((claimId) => !resumedLedger.getClaim(claimId)),
+);
+assert.equal(
+  resumedLedger.listEvents().filter((event) => event.kind === "legacy_import").length,
+  3,
+  "deleting reorganized claims must not delete the immutable legacy evidence ledger",
+);
+await verifyMigrationInvariant("final output revalidation", async () => {
+  const deletedOutputGate = getLegacyRejudgementGate(resumedEngine);
+  assert.equal(
+    deletedOutputGate.passed,
+    false,
+    "the final gate must revalidate output claim existence",
+  );
+  assert.match(deletedOutputGate.blockers.join("; "), /output claim.*missing/i);
+});
+assert.equal(resumedLedger.integrityCheck().ok, true);
+resumedLedger.close();
+
+async function runExtractionFailureCase(name, modelResult, engineOptions = {}) {
+  const database = path.join(fixtureRoot, `${name}.sqlite`);
+  const caseLedger = new AsukaMemoryLedger(database);
+  const caseEngine = new AsukaMemoryEngine(caseLedger, {
+    maxJobAttempts: 1,
+    ...engineOptions,
+    model: {
+      async complete(request) {
+        assert.equal(request.task, "legacy_extract");
+        return typeof modelResult === "function" ? modelResult(request) : modelResult;
+      },
+    },
+  });
+  migrateLegacyRecords(caseEngine, [
+    legacyRecord(`${name}-event`, "需要裁决的旧信息", 10_000),
+  ], scope);
+  const result = await executeLegacyRejudgements(caseEngine, { retryDelayMs: 0 });
+  assert.equal(result.failed, 1, `${name} must fail extraction`);
+  assert.equal(result.gateAfter.passed, false);
+  assert.equal(result.gateAfter.jobs.failed, 1);
+  assert.equal(result.gateAfter.extractions.completed, 0);
+  caseLedger.close();
+}
+
+await runExtractionFailureCase(
+  "empty-without-disposition",
+  JSON.stringify({ proposals: [] }),
+);
+await runExtractionFailureCase(
+  "invalid-proposal",
+  JSON.stringify({
+    proposals: [{
+      subjectId: "user",
+      canonicalText: "缺少 predicate",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      confidence: 0.9,
+    }],
+  }),
+);
+await runExtractionFailureCase(
+  "invalid-validity-interval",
+  JSON.stringify({
+    proposals: [{
+      subjectId: "user",
+      predicate: "dynamic.interval",
+      value: true,
+      canonicalText: "结束时间早于开始时间",
+      topLevelType: "event",
+      epistemicStatus: "explicit",
+      sourceKind: "statement",
+      confidence: 0.9,
+      validFrom: "2026-07-28T00:00:00.000Z",
+      validTo: "2026-07-27T00:00:00.000Z",
+    }],
+  }),
+);
+await runExtractionFailureCase(
+  "proposal-overflow",
+  JSON.stringify({
+    proposals: Array.from({ length: 13 }, (_, index) => ({
+      subjectId: "user",
+      predicate: `dynamic.${index}`,
+      value: index,
+      canonicalText: `动态声明 ${index}`,
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      sourceKind: "statement",
+      confidence: 0.9,
+    })),
+  }),
+  { legacyExtractionMaxProposals: 12 },
+);
+
+const emptyDatabase = path.join(fixtureRoot, "valid-empty.sqlite");
+const emptyLedger = new AsukaMemoryLedger(emptyDatabase);
+const emptyEngine = new AsukaMemoryEngine(emptyLedger, {
+  model: {
+    async complete(request) {
+      assert.equal(request.task, "legacy_extract");
+      return JSON.stringify({
+        proposals: [],
+        noMemoryReason: "这只是没有长期价值的寒暄",
+      });
+    },
+  },
+});
+migrateLegacyRecords(emptyEngine, [
+  legacyRecord("valid-empty", "你好", 20_000),
+], scope);
+const validEmpty = await executeLegacyRejudgements(emptyEngine, { retryDelayMs: 0 });
+assert.equal(validEmpty.gateAfter.passed, true, validEmpty.gateAfter.blockers.join("; "));
+assert.equal(validEmpty.gateAfter.extractions.noMemory, 1);
+assert.equal(validEmpty.gateAfter.consolidation.status, "not_required");
+emptyLedger.close();
+
+await verifyMigrationInvariant("audited all-discard consolidation", async () => {
+  const allDiscardDatabase = path.join(fixtureRoot, "all-discard.sqlite");
+  const allDiscardLedger = new AsukaMemoryLedger(allDiscardDatabase);
+  const allDiscardEngine = new AsukaMemoryEngine(allDiscardLedger, {
+    legacyConsolidationMaxClaimsPerBatch: 2,
+    model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        return JSON.stringify({
+          proposals: [{
+            subjectId: "user",
+            predicate: "transient.noise",
+            value: true,
+            canonicalText: "误提取的瞬时噪声",
+            topLevelType: "working_memory",
+            epistemicStatus: "inferred",
+            sourceKind: "inference",
+            confidence: 0.3,
+          }],
+        });
+      }
+      const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+      return JSON.stringify({
+        claims: [],
+        discarded: [{
+          sourceItemIds: items.map((item) => item.itemId),
+          reason: "全局复核确认只是瞬时噪声，不具备长期记忆价值",
+        }],
+      });
+    },
+  },
+  });
+  try {
+    migrateLegacyRecords(allDiscardEngine, [
+      legacyRecord("all-discard-1", "嗯嗯，刚才随口说的甲", 25_000),
+      legacyRecord("all-discard-2", "嗯嗯，刚才随口说的乙", 26_000),
+      legacyRecord("all-discard-3", "嗯嗯，刚才随口说的丙", 27_000),
+    ], scope);
+    const allDiscard = await executeLegacyRejudgements(allDiscardEngine, { retryDelayMs: 0 });
+    assert.equal(allDiscard.gateAfter.passed, true, allDiscard.gateAfter.blockers.join("; "));
+    assert.equal(allDiscard.gateAfter.consolidation.status, "completed");
+    assert.equal(allDiscard.gateAfter.consolidation.outputClaims, 0);
+    const allDiscardRun = allDiscardLedger.listLegacyConsolidationRuns()[0];
+    assert.equal(allDiscardRun.coveredCandidateCount, allDiscardRun.inputCandidateCount);
+    assert.ok(Array.isArray(allDiscardRun.audit.discarded));
+    assert.ok(
+      allDiscardRun.audit.discarded.every((item) =>
+        item.reason === "全局复核确认只是瞬时噪声，不具备长期记忆价值"
+      ),
+      "every discarded group must retain a concrete audit reason",
+    );
+    assert.deepEqual(
+      allDiscardRun.audit.discarded
+        .flatMap((item) => item.sourceCandidateIds)
+        .sort(),
+      [...allDiscardRun.discardedCandidateIds].sort(),
+      "an all-discard result must retain exact audited coverage",
+    );
+    assert.equal(
+      allDiscardLedger.listClaims({ states: ["candidate"] })
+        .filter((claim) =>
+          claim.metadata.migrationPendingRejudge === true
+          || claim.metadata.migrationPendingConsolidation === true
+        ).length,
+      0,
+    );
+  } finally {
+    allDiscardLedger.close();
+  }
+});
+
+await verifyMigrationInvariant("bounded intermediate evidence excerpts", async () => {
+  const evidenceBudgetDatabase = path.join(fixtureRoot, "evidence-budget.sqlite");
+  const evidenceBudgetLedger = new AsukaMemoryLedger(evidenceBudgetDatabase);
+  let sawIntermediateEvidence = false;
+  const evidenceBudgetEngine = new AsukaMemoryEngine(evidenceBudgetLedger, {
+  legacyConsolidationMaxClaimsPerBatch: 2,
+  legacyConsolidationMaxInputChars: 8_000,
+  model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        const { event } = promptPayload(request.prompt, "LEGACY_EXTRACTION_INPUT");
+        return JSON.stringify({
+          proposals: [{
+            subjectId: "user",
+            predicate: "dynamic.evidence",
+            value: event.text,
+            canonicalText: event.text,
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            sourceKind: "statement",
+            confidence: 0.99,
+          }],
+        });
+      }
+      assert.ok(
+        request.prompt.length <= 8_000,
+        `consolidation prompt exceeded its configured input budget: ${request.prompt.length}`,
+      );
+      const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+      if (items.some((item) => item.itemId.startsWith("legacy-consolidated-"))) {
+        sawIntermediateEvidence = true;
+        assert.ok(
+          items.every((item) =>
+            item.evidence.length > 0
+            && item.evidence.every((evidence) =>
+              typeof evidence.text === "string" && evidence.text.length > 0
+            )
+          ),
+          "intermediate consolidation must preserve bounded source excerpts",
+        );
+      }
+      return JSON.stringify({
+        claims: [{
+          semanticKey: "user.dynamic.evidence",
+          sourceItemIds: items.map((item) => item.itemId),
+          subjectId: "user",
+          predicate: "dynamic.evidence",
+          value: "归并证据",
+          canonicalText: "用户提供了多条需要归并的证据",
+          topLevelType: "fact",
+          epistemicStatus: "explicit",
+          confidence: 0.99,
+        }],
+        discarded: [],
+      });
+    },
+  },
+  });
+  try {
+    migrateLegacyRecords(evidenceBudgetEngine, [
+      legacyRecord("evidence-budget-1", "证据片段甲：保留这段原话", 31_000),
+      legacyRecord("evidence-budget-2", "证据片段乙：保留这段原话", 32_000),
+      legacyRecord("evidence-budget-3", "证据片段丙：保留这段原话", 33_000),
+      legacyRecord("evidence-budget-4", "证据片段丁：保留这段原话", 34_000),
+    ], scope);
+    const evidenceBudgetResult = await executeLegacyRejudgements(
+      evidenceBudgetEngine,
+      { retryDelayMs: 0 },
+    );
+    assert.equal(
+      evidenceBudgetResult.gateAfter.passed,
+      true,
+      evidenceBudgetResult.gateAfter.blockers.join("; "),
+    );
+    assert.equal(sawIntermediateEvidence, true);
+  } finally {
+    evidenceBudgetLedger.close();
+  }
+});
+
+await verifyMigrationInvariant("large consolidation fan-in remains bounded and traceable", async () => {
+  const fanInDatabase = path.join(fixtureRoot, "large-fan-in.sqlite");
+  const fanInLedger = new AsukaMemoryLedger(fanInDatabase);
+  let maximumPromptLength = 0;
+  const fanInEngine = new AsukaMemoryEngine(fanInLedger, {
+    legacyConsolidationMaxClaimsPerBatch: 8,
+    legacyConsolidationMaxInputChars: 8_000,
+    model: {
+      async complete(request) {
+        if (request.task === "legacy_extract") {
+          const { event } = promptPayload(request.prompt, "LEGACY_EXTRACTION_INPUT");
+          return JSON.stringify({
+            proposals: [{
+              subjectId: "user",
+              predicate: "dynamic.large_fan_in",
+              value: event.text,
+              canonicalText: event.text,
+              topLevelType: "fact",
+              epistemicStatus: "explicit",
+              sourceKind: "statement",
+              confidence: 0.99,
+            }],
+          });
+        }
+        maximumPromptLength = Math.max(maximumPromptLength, request.prompt.length);
+        assert.ok(request.prompt.length <= 8_000);
+        const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+        return JSON.stringify({
+          claims: [{
+            semanticKey: "user.dynamic.large_fan_in",
+            sourceItemIds: items.map((item) => item.itemId),
+            subjectId: "user",
+            predicate: "dynamic.large_fan_in",
+            value: "完整归并",
+            canonicalText: "用户提供了一组需要完整归并的长期事实",
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            confidence: 0.99,
+          }],
+          discarded: [],
+        });
+      },
+    },
+  });
+  try {
+    migrateLegacyRecords(
+      fanInEngine,
+      Array.from({ length: 128 }, (_, index) =>
+        legacyRecord(
+          `large-fan-in-${index}`,
+          `长期事实片段 ${String(index).padStart(3, "0")}`,
+          100_000 + index,
+        )
+      ),
+      scope,
+    );
+    const result = await executeLegacyRejudgements(fanInEngine, {
+      batchSize: 128,
+      retryDelayMs: 0,
+    });
+    assert.equal(result.gateAfter.passed, true, result.gateAfter.blockers.join("; "));
+    assert.ok(maximumPromptLength <= 8_000);
+    const output = fanInLedger.listClaims()
+      .find((claim) => claim.metadata.legacyConsolidationRunId);
+    assert.ok(output);
+    assert.equal(
+      fanInLedger.listClaimEvidence(output.claimId, "supports").length,
+      128,
+      "prompt compaction must not discard engine-side provenance",
+    );
+  } finally {
+    fanInLedger.close();
+  }
+});
+
+await verifyMigrationInvariant("invalidated extraction candidates cannot be resurrected", async () => {
+  const invalidatedDatabase = path.join(fixtureRoot, "invalidated-candidate.sqlite");
+  const invalidatedLedger = new AsukaMemoryLedger(invalidatedDatabase);
+  const invalidatedEngine = new AsukaMemoryEngine(invalidatedLedger, {
+    model: {
+      async complete(request) {
+        if (request.task === "legacy_extract") {
+          return JSON.stringify({
+            proposals: [{
+              subjectId: "user",
+              predicate: "dynamic.invalidated",
+              value: true,
+              canonicalText: "这条候选随后被用户否定",
+              topLevelType: "fact",
+              epistemicStatus: "explicit",
+              sourceKind: "statement",
+              confidence: 0.99,
+            }],
+          });
+        }
+        const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+        return JSON.stringify({
+          claims: [{
+            semanticKey: "user.dynamic.invalidated",
+            sourceItemIds: items.map((item) => item.itemId),
+            subjectId: "user",
+            predicate: "dynamic.invalidated",
+            value: true,
+            canonicalText: "这条候选随后被用户否定",
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            confidence: 0.99,
+          }],
+          discarded: [],
+        });
+      },
+    },
+  });
+  try {
+    migrateLegacyRecords(invalidatedEngine, [
+      legacyRecord("invalidated-candidate", "这条候选随后被用户否定", 120_000),
+    ], scope);
+    const extractionBatch = await invalidatedEngine.processPendingMemoryJobs({
+      maxJobs: 10,
+      kinds: ["legacy_rejudge"],
+      retryDelayMs: 0,
+    });
+    assert.equal(extractionBatch.failed, 0);
+    const extraction = invalidatedLedger.listLegacyExtractions()[0];
+    const candidate = invalidatedLedger.getClaim(extraction.candidateClaimIds[0]);
+    const override = invalidatedLedger.appendEvent({
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      actor: "user",
+      kind: "human_override",
+      text: "这条旧记忆不是真的",
+      sourceMessageId: "invalidated-candidate-override",
+      occurredAt: 130_000,
+    });
+    invalidatedLedger.applyClaimProposal(override.eventId, {
+      semanticKey: candidate.semanticKey,
+      subjectId: candidate.subjectId,
+      predicate: candidate.predicate,
+      value: false,
+      canonicalText: "用户明确否定了这条旧记忆",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "human_override",
+      confidence: 1,
+      action: "refute",
+      targetClaimId: candidate.claimId,
+    });
+    assert.equal(invalidatedLedger.getClaim(candidate.claimId).state, "superseded");
+    await invalidatedEngine.consolidateLegacyExtractions();
+    const gate = getLegacyRejudgementGate(invalidatedEngine);
+    assert.equal(gate.passed, false);
+    assert.match(gate.blockers.join("; "), /candidate|state|invalid/i);
+    assert.equal(
+      invalidatedLedger.listClaims({ states: ["active"] })
+        .filter((claim) => claim.metadata.legacyConsolidationRunId).length,
+      0,
+    );
+  } finally {
+    invalidatedLedger.close();
+  }
+});
+
+await verifyMigrationInvariant("legacy consolidation joins an existing semantic chain", async () => {
+  const joinedDatabase = path.join(fixtureRoot, "joined-semantic-chain.sqlite");
+  const joinedLedger = new AsukaMemoryLedger(joinedDatabase);
+  const liveEvent = joinedLedger.appendEvent({
+    accountId: "default",
+    peerKind: "direct",
+    peerId: "user-1",
+    actor: "user",
+    kind: "user_message",
+    text: "我现在住在苏州",
+    sourceMessageId: "joined-live-claim",
+    occurredAt: 200_000,
+  });
+  const liveClaim = joinedLedger.applyClaimProposal(liveEvent.eventId, {
+    semanticKey: "user.residence.current",
+    subjectId: "user",
+    predicate: "residence.current_city",
+    value: "苏州",
+    canonicalText: "用户目前住在苏州",
+    topLevelType: "fact",
+    epistemicStatus: "explicit",
+    authority: "user_explicit",
+    confidence: 1,
+    validFrom: 200_000,
+  });
+  const joinedEngine = new AsukaMemoryEngine(joinedLedger, {
+    model: {
+      async complete(request) {
+        if (request.task === "legacy_extract") {
+          return JSON.stringify({
+            proposals: [{
+              subjectId: "person:user",
+              predicate: "home.city",
+              value: "杭州",
+              canonicalText: "用户曾住在杭州",
+              topLevelType: "fact",
+              epistemicStatus: "explicit",
+              sourceKind: "statement",
+              confidence: 1,
+              validFrom: "1970-01-01T00:00:10.000Z",
+            }],
+          });
+        }
+        const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+        return JSON.stringify({
+          claims: [{
+            semanticKey: "user.residence.current",
+            sourceItemIds: items.map((item) => item.itemId),
+            subjectId: "user",
+            predicate: "residence.current_city",
+            value: "杭州",
+            canonicalText: "用户曾住在杭州",
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            confidence: 1,
+            validFrom: "1970-01-01T00:00:10.000Z",
+          }],
+          discarded: [],
+        });
+      },
+    },
+  });
+  try {
+    migrateLegacyRecords(joinedEngine, [
+      legacyRecord("joined-legacy-claim", "我以前住在杭州", 10_000),
+    ], scope);
+    const result = await executeLegacyRejudgements(joinedEngine, { retryDelayMs: 0 });
+    assert.equal(result.gateAfter.passed, true, result.gateAfter.blockers.join("; "));
+    const chain = joinedLedger.listClaims()
+      .filter((claim) =>
+        claim.semanticKey === "user.residence.current"
+        && claim.metadata.migrationPendingConsolidation !== true
+      );
+    assert.equal(new Set(chain.map((claim) => claim.rootClaimId)).size, 1);
+    assert.deepEqual(
+      chain.filter((claim) => claim.state === "active").map((claim) => claim.claimId),
+      [liveClaim.claimId],
+      "the newer live claim must remain the only effective active version",
+    );
+  } finally {
+    joinedLedger.close();
+  }
+});
+
+const assistantDatabase = path.join(fixtureRoot, "assistant-only.sqlite");
+const assistantLedger = new AsukaMemoryLedger(assistantDatabase);
+const assistantEngine = new AsukaMemoryEngine(assistantLedger, {
+  model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        return JSON.stringify({
+          proposals: [{
+            subjectId: "user",
+            predicate: "residence.current_city",
+            value: "东京",
+            canonicalText: "用户住在东京",
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            sourceKind: "statement",
+            confidence: 0.99,
+          }],
+        });
+      }
+      const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+      return JSON.stringify({
+        claims: [{
+          semanticKey: "user.residence.current_city",
+          sourceItemIds: items.map((item) => item.itemId),
+          subjectId: "user",
+          predicate: "residence.current_city",
+          value: "东京",
+          canonicalText: "用户住在东京",
+          topLevelType: "fact",
+          epistemicStatus: "explicit",
+          confidence: 0.99,
+        }],
+        discarded: [],
+      });
+    },
+  },
+});
+migrateLegacyRecords(assistantEngine, [
+  legacyRecord("assistant-only", "你住在东京，我记住了。", 30_000, "asuka"),
+], scope);
+const assistantResult = await executeLegacyRejudgements(assistantEngine, { retryDelayMs: 0 });
+assert.equal(assistantResult.gateAfter.passed, true, assistantResult.gateAfter.blockers.join("; "));
+const assistantClaim = assistantLedger.listClaims()
+  .find((claim) =>
+    claim.canonicalText === "用户住在东京"
+    && claim.metadata.legacyConsolidationRunId
+  );
+assert.equal(assistantClaim?.authority, "summary");
+assert.equal(assistantClaim?.epistemicStatus, "inferred");
+assert.equal(assistantClaim?.state, "candidate");
+assert.equal(
+  assistantEngine.retrieveMemoryContextLocal({
+    accountId: "default",
+    peerKind: "direct",
+    peerId: "user-1",
+    query: "东京住所",
+  }).claimIds.length,
+  0,
+  "assistant-only evidence must not self-authorize a durable user fact",
+);
+assistantLedger.close();
+
+const inferenceConflictDatabase = path.join(fixtureRoot, "inference-conflict.sqlite");
+const inferenceConflictLedger = new AsukaMemoryLedger(inferenceConflictDatabase);
+const inferenceConflictEngine = new AsukaMemoryEngine(inferenceConflictLedger, {
+  model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        const { event } = promptPayload(request.prompt, "LEGACY_EXTRACTION_INPUT");
+        const explicit = event.text.includes("明确");
+        return JSON.stringify({
+          proposals: [{
+            subjectId: "user",
+            predicate: explicit ? "preference.explicit" : "preference.behavioral_pattern",
+            value: explicit ? "morning" : "night",
+            canonicalText: explicit ? "用户明确偏好早晨" : "从行为推断用户可能偏好夜晚",
+            topLevelType: "belief",
+            epistemicStatus: explicit ? "explicit" : "inferred",
+            sourceKind: explicit ? "statement" : "behavior",
+            confidence: 0.99,
+          }],
+        });
+      }
+      const { items } = promptPayload(request.prompt, "LEGACY_CONSOLIDATION_INPUT");
+      const explicitItems = items.filter((item) => item.epistemicStatus === "explicit");
+      const inferredItems = items.filter((item) => item.epistemicStatus === "inferred");
+      return JSON.stringify({
+        claims: [
+          {
+            semanticKey: "user.preference.daily_period",
+            sourceItemIds: explicitItems.map((item) => item.itemId),
+            subjectId: "user",
+            predicate: "preference.daily_period",
+            value: "morning",
+            canonicalText: "用户明确偏好早晨",
+            topLevelType: "belief",
+            epistemicStatus: "explicit",
+            confidence: 0.99,
+          },
+          {
+            semanticKey: "user.preference.daily_period",
+            sourceItemIds: inferredItems.map((item) => item.itemId),
+            subjectId: "user",
+            predicate: "preference.daily_period",
+            value: "night",
+            canonicalText: "从行为推断用户可能偏好夜晚",
+            topLevelType: "belief",
+            epistemicStatus: "explicit",
+            confidence: 0.99,
+          },
+        ],
+        discarded: [],
+      });
+    },
+  },
+});
+migrateLegacyRecords(inferenceConflictEngine, [
+  legacyRecord("explicit-preference", "我明确喜欢早晨", 50_000),
+  legacyRecord("inferred-preference-1", "最近一次深夜活动", 60_000),
+  legacyRecord("inferred-preference-2", "又一次深夜活动", 70_000),
+], scope);
+const inferenceConflictResult = await executeLegacyRejudgements(
+  inferenceConflictEngine,
+  { retryDelayMs: 0 },
+);
+assert.equal(
+  inferenceConflictResult.gateAfter.passed,
+  true,
+  inferenceConflictResult.gateAfter.blockers.join("; "),
+);
+const preferenceVersions = inferenceConflictLedger.listClaims()
+  .filter((claim) =>
+    claim.metadata.legacyConsolidationRunId
+    && claim.predicate === "preference.daily_period"
+  );
+const explicitPreference = preferenceVersions.find((claim) =>
+  claim.epistemicStatus === "explicit"
+);
+const inferredPreference = preferenceVersions.find((claim) =>
+  claim.epistemicStatus === "inferred"
+);
+assert.equal(explicitPreference?.state, "active");
+assert.equal(inferredPreference?.state, "candidate");
+assert.equal(explicitPreference?.rootClaimId, inferredPreference?.rootClaimId);
+inferenceConflictLedger.close();
+
+const coverageDatabase = path.join(fixtureRoot, "missing-coverage.sqlite");
+const coverageLedger = new AsukaMemoryLedger(coverageDatabase);
+const coverageEngine = new AsukaMemoryEngine(coverageLedger, {
+  maxJobAttempts: 1,
+  model: {
+    async complete(request) {
+      if (request.task === "legacy_extract") {
+        return JSON.stringify({
+          proposals: [{
+            subjectId: "user",
+            predicate: "dynamic.fact",
+            value: true,
+            canonicalText: "需要被覆盖的声明",
+            topLevelType: "fact",
+            epistemicStatus: "explicit",
+            sourceKind: "statement",
+            confidence: 0.9,
+          }],
+        });
+      }
+      return JSON.stringify({ claims: [], discarded: [] });
+    },
+  },
+});
+migrateLegacyRecords(coverageEngine, [
+  legacyRecord("missing-coverage", "必须覆盖", 40_000),
+], scope);
+const missingCoverage = await executeLegacyRejudgements(coverageEngine, { retryDelayMs: 0 });
+assert.equal(missingCoverage.gateAfter.passed, false);
+assert.equal(missingCoverage.gateAfter.consolidation.status, "failed");
+assert.match(missingCoverage.gateAfter.blockers.join("; "), /coverage|non-empty/i);
+coverageLedger.close();
+
+assert.deepEqual(
+  migrationInvariantFailures,
+  [],
+  `memory migration integrity invariant failures:\n${migrationInvariantFailures.join("\n")}`,
+);
+
+console.log("asuka-memory migration/wiki v15 tests passed");
