@@ -150,7 +150,6 @@ function reorderCandidates(
     ordered.push(candidate);
     byId.delete(claimId);
   }
-  ordered.push(...[...byId.values()].sort((a, b) => b.localScore - a.localScore));
   return ordered;
 }
 
@@ -338,10 +337,13 @@ export class AsukaMemoryEngine {
       });
       const judgement = parseMemoryJudgement(raw, event);
       const claimIds: string[] = [];
+      const deletedClaimIds: string[] = [];
       for (const proposal of judgement.proposals) {
         const result = this.ledger.applyClaimProposal(eventId, proposal);
         if (result.claimId) claimIds.push(result.claimId);
+        if (result.deletedClaimIds) deletedClaimIds.push(...result.deletedClaimIds);
       }
+      const uniqueDeletedClaimIds = unique(deletedClaimIds);
       this.ledger.recordModelRun({
         task: "adjudicate",
         promptVersion: JUDGEMENT_PROMPT_VERSION,
@@ -351,14 +353,15 @@ export class AsukaMemoryEngine {
         resultSummary: JSON.stringify({
           proposalCount: judgement.proposals.length,
           claimIds,
+          deletedClaimIds: uniqueDeletedClaimIds,
           noMemoryReason: judgement.noMemoryReason,
         }),
       });
-      if (claimIds.length > 0) {
+      if (claimIds.length > 0 || uniqueDeletedClaimIds.length > 0) {
         this.onProjectionChanged?.(event.identityId);
-        if (claimIds.length > 0 && this.model.embed) {
-          this.ledger.enqueueJob(eventId, "embed");
-        }
+      }
+      if (claimIds.length > 0 && this.model.embed) {
+        this.ledger.enqueueJob(eventId, "embed");
       }
       return { eventId, judgement, claimIds };
     } catch (error) {
@@ -1093,10 +1096,6 @@ export class AsukaMemoryEngine {
   async retrieveMemoryContext(request: MemoryRetrievalRequest): Promise<MemoryContextResult> {
     const startedAt = Date.now();
     const deadlineAt = startedAt + this.rerankDeadlineMs;
-    if (request.peerKind === "group") {
-      const local = this.retrieveMemoryContextLocal(request);
-      return { ...local, elapsedMs: Date.now() - startedAt };
-    }
     const embedding = await this.queryEmbedding(request.query, deadlineAt);
     const local = this.retrieveLocal(request, embedding);
     if (!this.model || local.result.claimIds.length === 0) {

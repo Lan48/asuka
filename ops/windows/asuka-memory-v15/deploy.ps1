@@ -19,7 +19,8 @@ $operation = "deploy"
 $lockStream = $null
 $backupPath = $null
 $backupComplete = $false
-$tasksStopped = $false
+$gatewayTaskTouched = $false
+$syncTaskTouched = $false
 $gatewaySnapshot = $null
 $syncSnapshot = $null
 
@@ -34,7 +35,12 @@ function Get-MigrationBackupSource {
     return Join-Path $Backup ("home\.openclaw\" + $normalized.Substring("home\.openclaw\".Length))
   }
   if ($normalized.StartsWith("obsidian-vault\", [StringComparison]::OrdinalIgnoreCase)) {
-    return Join-Path $Backup ("vault\" + $normalized.Substring("obsidian-vault\".Length))
+    $suffix = $normalized.Substring("obsidian-vault\".Length)
+    $frozenLayout = Join-Path $Backup ("obsidian-vault\" + $suffix)
+    if (Test-Path -LiteralPath $frozenLayout) {
+      return $frozenLayout
+    }
+    return Join-Path $Backup ("vault\" + $suffix)
   }
   throw "Migration source is outside the frozen backup map: $Relative"
 }
@@ -103,7 +109,7 @@ try {
   $frozenBackup = $null
   if (-not [string]::IsNullOrWhiteSpace($FrozenBackupPath)) {
     $frozenBackup = Read-AsukaFrozenBackup -Path $FrozenBackupPath -AppRoot $AppRoot `
-      -GatewayTaskName $gatewayTaskName -SyncTaskName $syncTaskName
+      -GatewayTaskName $gatewayTaskName -SyncTaskName $syncTaskName -VerifyCurrentHashes
   }
   $gatewayPort = [int]$manifest.requirements.gatewayPort
   $node = Join-Path $AppRoot (
@@ -186,13 +192,14 @@ try {
   Write-AsukaJsonFile -Path (Join-Path $backupPath "acl.json") -Value $aclRecords
 
   # Freeze writers in dependency order: sync first, then the Gateway.
+  $syncTaskTouched = $true
   Disable-AndStopAsukaTask -Name $syncTaskName -TimeoutSeconds $TaskStopTimeoutSeconds
   if (-not (Test-AsukaExclusiveFileAccess -Path $syncLock)) {
     throw "Memory sync lock remained owned after stopping $syncTaskName."
   }
+  $gatewayTaskTouched = $true
   Disable-AndStopAsukaTask -Name $gatewayTaskName -TimeoutSeconds $TaskStopTimeoutSeconds
   Assert-AsukaGatewayStopped -AppRoot $AppRoot -Port $gatewayPort
-  $tasksStopped = $true
 
   Copy-AsukaTree -Source (Join-Path $AppRoot "home\.openclaw") `
     -Destination (Join-Path $backupPath "home\.openclaw")
@@ -235,15 +242,20 @@ try {
     }
   )
   $backupTreeChecks = @($backupTrees | ForEach-Object {
-    $sourceBytes = Get-AsukaDirectoryBytes -Path ([string]$_.source)
-    $backupBytes = Get-AsukaDirectoryBytes -Path ([string]$_.backup)
-    if ($sourceBytes -ne $backupBytes) {
-      throw "Backup byte-count mismatch for $([string]$_.name): source=$sourceBytes backup=$backupBytes"
+    $sourceIntegrity = Get-AsukaDirectoryIntegrity -Path ([string]$_.source)
+    $backupIntegrity = Get-AsukaDirectoryIntegrity -Path ([string]$_.backup)
+    if (
+      [int]$sourceIntegrity.fileCount -ne [int]$backupIntegrity.fileCount -or
+      [int64]$sourceIntegrity.bytes -ne [int64]$backupIntegrity.bytes -or
+      [string]$sourceIntegrity.sha256 -ne [string]$backupIntegrity.sha256
+    ) {
+      throw "Backup tree integrity mismatch for $([string]$_.name)."
     }
     [pscustomobject]@{
       name = [string]$_.name
-      sourceBytes = $sourceBytes
-      backupBytes = $backupBytes
+      fileCount = [int]$sourceIntegrity.fileCount
+      bytes = [int64]$sourceIntegrity.bytes
+      sha256 = [string]$sourceIntegrity.sha256
     }
   })
 
@@ -267,8 +279,8 @@ try {
     trees = $backupTreeChecks
   }
   Write-AsukaJsonFile -Path (Join-Path $backupPath "backup.json") -Value $backupSummary
-  Set-Content -LiteralPath (Join-Path $backupPath "backup-complete.marker") `
-    -Value $backupSummary.createdAt -Encoding ASCII
+  $backupIntegrity = Write-AsukaBackupIntegrity -BackupPath $backupPath
+  [void](Test-AsukaBackupIntegrity -BackupPath $backupPath)
   $backupComplete = $true
 
   Copy-Item -LiteralPath $packagedSyncScript -Destination $syncScript -Force
@@ -302,7 +314,19 @@ try {
     throw "Configured OpenClaw configuration is invalid: $($configuredValidation.Output)"
   }
 
-  Copy-AsukaTree -Source $activePlugin -Destination $runtimeNext
+  if (Test-Path -LiteralPath $runtimeNext) {
+    throw "Staged runtime path already exists: $runtimeNext"
+  }
+  New-Item -ItemType Directory -Path $runtimeNext | Out-Null
+  foreach ($preservedDirectory in @($manifest.runtimePreservedDirectories)) {
+    $preservedSource = Resolve-AsukaChildPath -Root $activePlugin `
+      -Relative ([string]$preservedDirectory)
+    if (Test-Path -LiteralPath $preservedSource -PathType Container) {
+      $preservedDestination = Resolve-AsukaChildPath -Root $runtimeNext `
+        -Relative ([string]$preservedDirectory)
+      Copy-AsukaTree -Source $preservedSource -Destination $preservedDestination
+    }
+  }
   foreach ($entry in @($manifest.runtimeFiles)) {
     $source = Resolve-AsukaChildPath -Root $ReleaseRoot -Relative ([string]$entry.source)
     $activeDestination = Resolve-AsukaChildPath -Root $AppRoot -Relative ([string]$entry.destination)
@@ -316,6 +340,19 @@ try {
     Copy-Item -LiteralPath $source -Destination $stagedDestination -Force
     if ((Get-AsukaSha256 -Path $stagedDestination) -ne ([string]$entry.sha256).ToLowerInvariant()) {
       throw "Staged runtime hash mismatch: $($entry.destination)"
+    }
+  }
+  $expectedRuntimePaths = @($manifest.runtimeFiles | ForEach-Object {
+    $destination = Resolve-AsukaChildPath -Root $AppRoot -Relative ([string]$_.destination)
+    $destination.Substring($activePlugin.Length).TrimStart("\").Replace("\", "/")
+  })
+  foreach ($stagedFile in @(Get-ChildItem -LiteralPath $runtimeNext -File -Recurse -Force)) {
+    $stagedRelative = $stagedFile.FullName.Substring($runtimeNext.Length).TrimStart("\").Replace("\", "/")
+    $isPreservedDependency = @($manifest.runtimePreservedDirectories | Where-Object {
+      $stagedRelative.StartsWith("$($_)/", [StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
+    if (-not $isPreservedDependency -and $expectedRuntimePaths -notcontains $stagedRelative) {
+      throw "Staged runtime contains an unexpected file: $stagedRelative"
     }
   }
 
@@ -339,20 +376,25 @@ try {
 
   $sourceArguments = New-Object System.Collections.ArrayList
   $migrationSources = $manifest.migration.sources
+  $migrationBackupPath = if ($null -eq $frozenBackup) {
+    $backupPath
+  } else {
+    [string]$frozenBackup.path
+  }
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--memory" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.memory) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.memory) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--claims" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.claims) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.claims) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--state" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.state) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.state) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--digest" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.digest) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.digest) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--ref-index" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.refIndex) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.refIndex) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--sessions-index" `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.sessionsIndex) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.sessionsIndex) -Backup $migrationBackupPath)
   Add-MigrationSourceArgument -Arguments $sourceArguments -Flag "--sessions-dir" -Directory `
-    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.sessionsDirectory) -Backup $backupPath)
+    -Path (Get-MigrationBackupSource -Relative ([string]$migrationSources.sessionsDirectory) -Backup $migrationBackupPath)
 
   if (-not (@($sourceArguments) -contains "--memory")) {
     throw "Frozen legacy memory.json is required for migration."
@@ -469,11 +511,13 @@ try {
   $verifyLedger = Invoke-AsukaNative -FilePath $node -Arguments @(
     $ledgerVerifier,
     $activePlugin,
-    $ledger
+    $ledger,
+    $migrationReportPath
   )
   if ($verifyLedger.ExitCode -ne 0) {
     throw "Activated ledger verification failed: $($verifyLedger.Output)"
   }
+  $ledgerActivation = $verifyLedger.Output.Trim() | ConvertFrom-Json
 
   $env:OPENCLAW_HOME = $openClawHome
   $env:USERPROFILE = $openClawHome
@@ -517,6 +561,8 @@ try {
       rejudgementGate = $rejudgementGate
       integrity = $migrationReport.integrity
       stats = $migrationReport.stats
+      reportSha256 = Get-AsukaSha256 -Path $migrationReportPath
+      cohort = $ledgerActivation.cohort
     }
     startedAt = (Get-Date).ToUniversalTime().ToString("o")
   }
@@ -594,23 +640,45 @@ try {
       exitCode = $rollback.ExitCode
       output = $rollback.Output
     }
-  } elseif ($tasksStopped -and $null -ne $gatewaySnapshot -and $null -ne $syncSnapshot) {
+  } elseif (
+    ($gatewayTaskTouched -or $syncTaskTouched) -and
+    $null -ne $gatewaySnapshot -and
+    $null -ne $syncSnapshot
+  ) {
     try {
-      if ([bool]$gatewaySnapshot.enabled) {
-        Enable-ScheduledTask -TaskName ([string]$gatewaySnapshot.name) | Out-Null
-        if ([bool]$gatewaySnapshot.wasRunning) {
-          $recoveryLogOffset = Get-AsukaLogLength -Path $gatewayLog
-          Start-ScheduledTask -TaskName ([string]$gatewaySnapshot.name)
-          [void](Wait-AsukaGatewayReady -TaskName ([string]$gatewaySnapshot.name) `
-            -AppRoot $AppRoot -Port $gatewayPort -LogPath $gatewayLog `
-            -LogOffset $recoveryLogOffset -TimeoutSeconds $GatewayReadyTimeoutSeconds)
+      if ($gatewayTaskTouched) {
+        if ([bool]$gatewaySnapshot.enabled) {
+          Enable-ScheduledTask -TaskName ([string]$gatewaySnapshot.name) | Out-Null
+          if ([bool]$gatewaySnapshot.wasRunning) {
+            $recoveryLogOffset = Get-AsukaLogLength -Path $gatewayLog
+            Start-ScheduledTask -TaskName ([string]$gatewaySnapshot.name)
+            [void](Wait-AsukaGatewayReady -TaskName ([string]$gatewaySnapshot.name) `
+              -AppRoot $AppRoot -Port $gatewayPort -LogPath $gatewayLog `
+              -LogOffset $recoveryLogOffset -TimeoutSeconds $GatewayReadyTimeoutSeconds)
+          }
+        } else {
+          Disable-ScheduledTask -TaskName ([string]$gatewaySnapshot.name) | Out-Null
         }
       }
-      if ([bool]$syncSnapshot.enabled) {
-        Enable-ScheduledTask -TaskName ([string]$syncSnapshot.name) | Out-Null
-        if ([bool]$syncSnapshot.wasRunning) {
-          Start-ScheduledTask -TaskName ([string]$syncSnapshot.name)
+      if ($syncTaskTouched) {
+        if ([bool]$syncSnapshot.enabled) {
+          Enable-ScheduledTask -TaskName ([string]$syncSnapshot.name) | Out-Null
+          if ([bool]$syncSnapshot.wasRunning) {
+            Start-ScheduledTask -TaskName ([string]$syncSnapshot.name)
+          }
+        } else {
+          Disable-ScheduledTask -TaskName ([string]$syncSnapshot.name) | Out-Null
         }
+      }
+      $restoredGateway = Get-AsukaTaskSnapshot -Name ([string]$gatewaySnapshot.name)
+      $restoredSync = Get-AsukaTaskSnapshot -Name ([string]$syncSnapshot.name)
+      if (
+        [bool]$restoredGateway.enabled -ne [bool]$gatewaySnapshot.enabled -or
+        [bool]$restoredGateway.wasRunning -ne [bool]$gatewaySnapshot.wasRunning -or
+        [bool]$restoredSync.enabled -ne [bool]$syncSnapshot.enabled -or
+        [bool]$restoredSync.wasRunning -ne [bool]$syncSnapshot.wasRunning
+      ) {
+        throw "Scheduled task lifecycle restoration did not match the pre-deployment snapshot."
       }
     } catch {
       $recoveryError = Protect-AsukaText $_.Exception.Message

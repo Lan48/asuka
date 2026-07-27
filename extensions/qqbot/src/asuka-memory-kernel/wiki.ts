@@ -5,9 +5,11 @@ import type { AsukaMemoryEngine } from "./engine.js";
 import type {
   MemoryClaim,
   MemoryEventInput,
+  MemoryPeerKind,
   MemoryProjectionClaimEvidence,
   MemoryProjectionEventSummary,
   MemoryProjectionSnapshot,
+  MemoryVisibility,
 } from "./types.js";
 
 const GENERATED_MARKER = "<!-- ASUKA_MEMORY_V15_GENERATED -->";
@@ -18,10 +20,14 @@ const NOTES_END = "<!-- ASUKA_MEMORY_NOTES_END -->";
 const OVERRIDES_START = "<!-- ASUKA_MEMORY_OVERRIDES_START -->";
 const OVERRIDES_END = "<!-- ASUKA_MEMORY_OVERRIDES_END -->";
 const PENDING_FILE = ".asuka-memory-pending";
+const SCOPE_FILE = ".asuka-memory-scope.json";
+const SCOPE_MARKER_PREFIX = "<!-- ASUKA_MEMORY_SCOPE ";
 
 interface WikiProjectionOptions {
   memoryRoot: string;
   title?: string;
+  scope: WikiMemoryScope;
+  resolveEventScope(eventId: string): WikiMemoryScope | undefined;
 }
 
 interface WikiProjectionResult {
@@ -33,9 +39,15 @@ interface WikiProjectionResult {
 
 interface WikiOverrideImportOptions {
   memoryRoot: string;
+  expectedScope?: WikiMemoryScope;
+}
+
+export interface WikiMemoryScope {
+  identityId: string;
+  visibility: MemoryVisibility;
   accountId: string;
+  peerKind: MemoryPeerKind;
   peerId: string;
-  identityId?: string;
 }
 
 interface ManualBlocks {
@@ -47,6 +59,71 @@ const EMPTY_MANUAL_BLOCKS: ManualBlocks = {
   notes: "\n\n",
   overrides: "\n\n",
 };
+
+function normalizeWikiScope(scope: WikiMemoryScope): WikiMemoryScope {
+  const normalized: WikiMemoryScope = {
+    identityId: scope.identityId.trim(),
+    visibility: scope.visibility,
+    accountId: scope.accountId.trim(),
+    peerKind: scope.peerKind,
+    peerId: scope.peerId.trim(),
+  };
+  if (
+    !normalized.identityId
+    || !normalized.accountId
+    || !normalized.peerId
+    || !["private", "public"].includes(normalized.visibility)
+    || !["direct", "group"].includes(normalized.peerKind)
+  ) {
+    throw new Error("Invalid Memory Wiki scope binding");
+  }
+  if (normalized.peerKind === "group" && normalized.visibility === "private") {
+    throw new Error("Invalid Memory Wiki scope binding: group scope cannot be private");
+  }
+  return normalized;
+}
+
+function scopeContent(scope: WikiMemoryScope): string {
+  return `${JSON.stringify(normalizeWikiScope(scope), null, 2)}\n`;
+}
+
+function sameScope(left: WikiMemoryScope, right: WikiMemoryScope): boolean {
+  return scopeContent(left) === scopeContent(right);
+}
+
+function scopeMarker(scope: WikiMemoryScope): string {
+  return `${SCOPE_MARKER_PREFIX}${hashText(scopeContent(scope))} -->`;
+}
+
+function scopeFrontmatter(scope: WikiMemoryScope): string[] {
+  return [
+    `scope_identity_id: ${yamlScalar(scope.identityId)}`,
+    `scope_visibility: ${yamlScalar(scope.visibility)}`,
+    `scope_account_id: ${yamlScalar(scope.accountId)}`,
+    `scope_peer_kind: ${yamlScalar(scope.peerKind)}`,
+    `scope_peer_id: ${yamlScalar(scope.peerId)}`,
+    "editable: true",
+  ];
+}
+
+function readScopeBinding(memoryRoot: string): WikiMemoryScope | undefined {
+  const file = path.join(memoryRoot, SCOPE_FILE);
+  if (!fs.existsSync(file)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    throw new Error(`Invalid Memory Wiki scope binding in ${file}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Invalid Memory Wiki scope binding in ${file}`);
+  }
+  try {
+    return normalizeWikiScope(parsed as WikiMemoryScope);
+  } catch {
+    throw new Error(`Invalid Memory Wiki scope binding in ${file}`);
+  }
+}
 
 function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -151,12 +228,63 @@ function hasStandaloneMarker(content: string, marker: string): boolean {
   return markerLines(content).some((line) => line.value === marker);
 }
 
-function readExistingWikiPage(file: string): ManualBlocks {
+function assertPageScope(
+  content: string,
+  file: string,
+  scope: WikiMemoryScope,
+  allowLegacyUnbound: boolean,
+): void {
+  const expected = scopeMarker(scope);
+  const markers = markerLines(content)
+    .map((line) => line.value)
+    .filter((line) => /<!--\s*ASUKA_MEMORY_SCOPE/.test(line));
+  if (allowLegacyUnbound && markers.length === 0) return;
+  if (markers.length !== 1 || markers[0] !== expected) {
+    throw new Error(`Invalid Memory Wiki scope binding in ${file}`);
+  }
+}
+
+function readExistingWikiPage(
+  file: string,
+  scope: WikiMemoryScope,
+  allowLegacyUnbound: boolean,
+): ManualBlocks {
   const content = fs.readFileSync(file, "utf8");
   if (!hasStandaloneMarker(content, GENERATED_MARKER)) {
     throw new Error(`Invalid manual marker ownership in ${file}: generated marker is missing`);
   }
+  assertPageScope(content, file, scope, allowLegacyUnbound);
   return parseManualBlocks(content, file);
+}
+
+function readPageTitle(file: string): string {
+  const titleLine = markerLines(fs.readFileSync(file, "utf8"))
+    .map((line) => line.value)
+    .find((line) => line.startsWith("title: "));
+  if (titleLine) {
+    try {
+      const parsed = JSON.parse(titleLine.slice("title: ".length));
+      if (typeof parsed === "string" && parsed.trim()) return parsed.trim();
+    } catch {
+      // Fall back to the stable filename when legacy frontmatter is malformed.
+    }
+  }
+  return path.basename(file, path.extname(file));
+}
+
+function readPageUpdatedAt(file: string): number | undefined {
+  const updatedLine = markerLines(fs.readFileSync(file, "utf8"))
+    .map((line) => line.value)
+    .find((line) => line.startsWith("updated: "));
+  if (!updatedLine) return undefined;
+  try {
+    const parsed = JSON.parse(updatedLine.slice("updated: ".length));
+    if (typeof parsed !== "string") return undefined;
+    const timestamp = Date.parse(parsed);
+    return Number.isFinite(timestamp) ? timestamp : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function topicKey(claim: MemoryClaim): string {
@@ -228,21 +356,24 @@ function renderTopicPage(
   eventsById: ReadonlyMap<string, MemoryProjectionEventSummary>,
   blocks: ManualBlocks,
   updatedAt: number,
+  scope: WikiMemoryScope,
 ): string {
   const active = claims.filter((claim) => claim.state === "active");
   const history = claims.filter((claim) => claim.state !== "active");
   return [
     "---",
-    `id: ${yamlScalar(`asuka-memory-topic:${safeSlug(topic)}`)}`,
+    `id: ${yamlScalar(`asuka-memory-topic:${hashText(scopeContent(scope)).slice(0, 12)}:${safeSlug(topic)}`)}`,
     `title: ${yamlScalar(topic)}`,
     "type: memory-topic",
     `updated: ${yamlScalar(new Date(updatedAt).toISOString())}`,
     "generated: true",
+    ...scopeFrontmatter(scope),
     "tags:",
     "  - asuka/memory",
     "---",
     "",
     GENERATED_MARKER,
+    scopeMarker(scope),
     "",
     `# ${inlineText(topic)}`,
     "",
@@ -274,6 +405,7 @@ function renderIndex(
   pages: Array<{ topic: string; relativePath: string; active: number; history: number }>,
   blocks: ManualBlocks,
   updatedAt: number,
+  scope: WikiMemoryScope,
 ): string {
   const rows = pages
     .sort((a, b) => a.topic.localeCompare(b.topic))
@@ -283,16 +415,18 @@ function renderIndex(
     .join("\n");
   return [
     "---",
-    "id: asuka-memory-index",
+    `id: ${yamlScalar(`asuka-memory-index:${hashText(scopeContent(scope)).slice(0, 12)}`)}`,
     `title: ${yamlScalar(title)}`,
     "type: memory-index",
     `updated: ${yamlScalar(new Date(updatedAt).toISOString())}`,
     "generated: true",
+    ...scopeFrontmatter(scope),
     "tags:",
     "  - asuka/memory",
     "---",
     "",
     GENERATED_MARKER,
+    scopeMarker(scope),
     "",
     `# ${inlineText(title)}`,
     "",
@@ -328,15 +462,50 @@ export function projectMemoryWiki(
   options: WikiProjectionOptions,
 ): WikiProjectionResult {
   const memoryRoot = path.resolve(options.memoryRoot);
+  const scope = normalizeWikiScope(options.scope);
+  const existingBinding = readScopeBinding(memoryRoot);
+  if (existingBinding && !sameScope(existingBinding, scope)) {
+    throw new Error(`Memory Wiki scope binding mismatch in ${memoryRoot}`);
+  }
+  const allowLegacyUnbound = existingBinding === undefined;
   const entitiesDirectory = path.join(memoryRoot, "entities");
-  const claims = [...snapshot.claims, ...snapshot.history];
+  const indexFile = path.join(memoryRoot, "index.md");
+  const eventScopeMatches = new Map<string, boolean>();
+  const eventMatchesScope = (eventId: string): boolean => {
+    const cached = eventScopeMatches.get(eventId);
+    if (cached !== undefined) return cached;
+    const resolved = options.resolveEventScope(eventId);
+    const matches = resolved !== undefined
+      && sameScope(normalizeWikiScope(resolved), scope);
+    eventScopeMatches.set(eventId, matches);
+    return matches;
+  };
+  const claims = [...snapshot.claims, ...snapshot.history].filter((claim) =>
+    claim.identityId === scope.identityId
+    && claim.visibility === scope.visibility
+    && eventMatchesScope(claim.sourceEventId)
+  );
+  const selectedClaimIds = new Set(claims.map((claim) => claim.claimId));
+  const claimEvidence = snapshot.claimEvidence.filter((item) =>
+    selectedClaimIds.has(item.claimId) && eventMatchesScope(item.eventId)
+  );
+  const selectedEvidenceEventIds = new Set(claimEvidence.map((item) => item.eventId));
   const projectionUpdatedAt = claims.reduce(
     (latest, claim) => Math.max(latest, claim.updatedAt),
     0,
+  ) || (
+    fs.existsSync(indexFile)
+      ? readPageUpdatedAt(indexFile)
+      : undefined
   ) || snapshot.generatedAt;
   const grouped = new Map<string, MemoryClaim[]>();
   const eventsById = new Map(
-    snapshot.eventSummaries.map((event) => [event.eventId, event]),
+    snapshot.eventSummaries
+      .filter((event) =>
+        selectedEvidenceEventIds.has(event.eventId)
+        && eventMatchesScope(event.eventId)
+      )
+      .map((event) => [event.eventId, event]),
   );
   for (const claim of claims) {
     const topic = topicKey(claim);
@@ -371,7 +540,7 @@ export function projectMemoryWiki(
       file,
       updatedAt: topicUpdatedAt || projectionUpdatedAt,
       blocks: fs.existsSync(file)
-        ? readExistingWikiPage(file)
+        ? readExistingWikiPage(file, scope, allowLegacyUnbound)
         : EMPTY_MANUAL_BLOCKS,
     });
     pages.push({
@@ -384,20 +553,25 @@ export function projectMemoryWiki(
 
   const stalePages = generatedMarkdownFiles(entitiesDirectory)
     .filter((file) => !expectedEntityFiles.has(path.resolve(file)))
-    .map((file) => ({ file, blocks: readExistingWikiPage(file) }));
-  const indexFile = path.join(memoryRoot, "index.md");
+    .map((file) => ({
+      file,
+      topic: readPageTitle(file),
+      updatedAt: readPageUpdatedAt(file) ?? projectionUpdatedAt,
+      blocks: readExistingWikiPage(file, scope, allowLegacyUnbound),
+    }));
   const indexBlocks = fs.existsSync(indexFile)
-    ? readExistingWikiPage(indexFile)
+    ? readExistingWikiPage(indexFile, scope, allowLegacyUnbound)
     : EMPTY_MANUAL_BLOCKS;
   const topicWrites = topicPages.map((page) => ({
     file: page.file,
     content: renderTopicPage(
       page.topic,
       page.claims,
-      snapshot.claimEvidence,
+      claimEvidence,
       eventsById,
       page.blocks,
       page.updatedAt,
+      scope,
     ),
   }));
   const indexContent = renderIndex(
@@ -405,16 +579,34 @@ export function projectMemoryWiki(
     pages,
     indexBlocks,
     projectionUpdatedAt,
+    scope,
   );
 
   fs.mkdirSync(entitiesDirectory, { recursive: true });
+  const scopeFile = path.join(memoryRoot, SCOPE_FILE);
   for (const write of topicWrites) {
     if (atomicWrite(write.file, write.content)) changedFiles.push(write.file);
   }
   for (const stale of stalePages) {
-    if (stale.blocks.notes.trim() || stale.blocks.overrides.trim()) continue;
-    fs.unlinkSync(stale.file);
-    removedFiles.push(stale.file);
+    if (stale.blocks.notes.trim() || stale.blocks.overrides.trim()) {
+      if (atomicWrite(
+        stale.file,
+        renderTopicPage(
+          stale.topic,
+          [],
+          [],
+          new Map(),
+          stale.blocks,
+          stale.updatedAt,
+          scope,
+        ),
+      )) {
+        changedFiles.push(stale.file);
+      }
+    } else {
+      fs.unlinkSync(stale.file);
+      removedFiles.push(stale.file);
+    }
   }
   if (atomicWrite(
     indexFile,
@@ -422,6 +614,7 @@ export function projectMemoryWiki(
   )) {
     changedFiles.push(indexFile);
   }
+  if (atomicWrite(scopeFile, scopeContent(scope))) changedFiles.push(scopeFile);
 
   if (changedFiles.length > 0 || removedFiles.length > 0) {
     const pendingPath = path.join(memoryRoot, PENDING_FILE);
@@ -452,15 +645,17 @@ function listWikiMarkdownFiles(memoryRoot: string): string[] {
 function overrideEventInput(
   file: string,
   content: string,
-  options: WikiOverrideImportOptions,
+  memoryRoot: string,
+  scope: WikiMemoryScope,
 ): MemoryEventInput {
-  const relativePath = path.relative(options.memoryRoot, file).split(path.sep).join("/");
+  const relativePath = path.relative(memoryRoot, file).split(path.sep).join("/");
   const contentHash = hashText(content);
   return {
-    accountId: options.accountId,
-    peerKind: "direct",
-    peerId: options.peerId,
-    identityId: options.identityId,
+    accountId: scope.accountId,
+    peerKind: scope.peerKind,
+    peerId: scope.peerId,
+    identityId: scope.identityId,
+    visibility: scope.visibility,
     actor: "user",
     kind: "human_override",
     text: content,
@@ -487,6 +682,17 @@ export function importWikiOverrides(
   unchanged: number;
   eventIds: string[];
 } {
+  const memoryRoot = path.resolve(options.memoryRoot);
+  const scope = readScopeBinding(memoryRoot);
+  if (!scope) {
+    throw new Error(`Memory Wiki scope binding is missing in ${memoryRoot}`);
+  }
+  if (
+    options.expectedScope
+    && !sameScope(scope, normalizeWikiScope(options.expectedScope))
+  ) {
+    throw new Error(`Memory Wiki scope binding mismatch in ${memoryRoot}`);
+  }
   const pages = listWikiMarkdownFiles(options.memoryRoot)
     .map((file) => {
       const content = fs.readFileSync(file, "utf8");
@@ -496,6 +702,7 @@ export function importWikiOverrides(
       ) {
         return undefined;
       }
+      assertPageScope(content, file, scope, false);
       return {
         file,
         overrides: parseManualBlocks(content, file).overrides.trim(),
@@ -507,7 +714,7 @@ export function importWikiOverrides(
   const eventIds: string[] = [];
   for (const page of pages) {
     if (!page.overrides) continue;
-    const input = overrideEventInput(page.file, page.overrides, options);
+    const input = overrideEventInput(page.file, page.overrides, memoryRoot, scope);
     const result = engine.applyHumanOverride(input);
     if (!result.receipt) continue;
     eventIds.push(result.receipt.eventId);

@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 
 import { qqbotPlugin } from "./src/channel.js";
+import { shutdownAsukaMemoryRuntime } from "./src/asuka-memory-kernel/runtime.js";
 import { setQQBotCronService, setQQBotRuntime } from "./src/runtime.js";
 
 type GatewayHookContext = {
@@ -19,8 +20,9 @@ function installCronServiceCapture(api: HookRegistrar) {
   };
   api.on("gateway_start", capture);
   api.on("cron_changed", capture);
-  api.on("gateway_stop", (_event: unknown, _ctx: GatewayHookContext) => {
+  api.on("gateway_stop", async (_event: unknown, _ctx: GatewayHookContext) => {
     setQQBotCronService(null);
+    await shutdownAsukaMemoryRuntime();
   });
 }
 

@@ -14,6 +14,8 @@ const projectRoot = path.join(fixtureRoot, "project");
 const qqbotRoot = path.join(projectRoot, "extensions", "qqbot");
 const releaseOne = path.join(fixtureRoot, "release-one");
 const releaseTwo = path.join(fixtureRoot, "release-two");
+const releaseUnknown = path.join(fixtureRoot, "release-unknown");
+const occupiedRelease = path.join(fixtureRoot, "release-occupied");
 
 function write(relative, content) {
   const destination = path.join(qqbotRoot, relative);
@@ -44,10 +46,21 @@ function run(command, args, options = {}) {
   return result;
 }
 
-function generate(releaseRoot) {
+function runFailure(command, args, pattern, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd: projectRoot,
+    encoding: "utf8",
+    ...options,
+  });
+  assert.notEqual(result.status, 0, `${command} ${args.join(" ")} must fail`);
+  assert.match(`${result.stderr}\n${result.stdout}`, pattern);
+  return result;
+}
+
+function generate(releaseRoot, sourceRoot = projectRoot) {
   run(process.execPath, [
     path.join(opsRoot, "generate-manifest.mjs"),
-    "--project-root", projectRoot,
+    "--project-root", sourceRoot,
     "--release-root", releaseRoot,
     "--release-id", "test-release",
     "--account", "default",
@@ -84,8 +97,46 @@ try {
   write("src/tests/excluded.test.js", "must-not-ship\n");
   write("package.json", "{\"name\":\"fixture-qqbot\"}\n");
 
+  run("git", ["init"]);
+  run("git", ["add", "."]);
+  run("git", [
+    "-c", "user.name=Asuka Fixture",
+    "-c", "user.email=asuka-fixture.invalid",
+    "-c", "commit.gpgsign=false",
+    "commit", "-m", "fixture",
+  ]);
+
   const first = generate(releaseOne);
   const second = generate(releaseTwo);
+  assert.equal(first.source.provenance, "git");
+  assert.match(first.source.gitCommit, /^[a-f0-9]{40}$/);
+  assert.ok(first.source.gitBranch.length > 0);
+
+  fs.mkdirSync(occupiedRelease);
+  const sentinel = path.join(occupiedRelease, "do-not-delete.txt");
+  fs.writeFileSync(sentinel, "preserve-me\n");
+  runFailure(process.execPath, [
+    path.join(opsRoot, "generate-manifest.mjs"),
+    "--project-root", projectRoot,
+    "--release-root", occupiedRelease,
+    "--release-id", "occupied-release",
+    "--account", "default",
+    "--peer", "user-1",
+  ], /release root already exists/i);
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "preserve-me\n");
+  assert.equal(fs.existsSync(path.join(occupiedRelease, "manifest.json")), false);
+
+  const gitDirectory = path.join(projectRoot, ".git");
+  const hiddenGitDirectory = path.join(projectRoot, ".git-disabled-for-test");
+  fs.renameSync(gitDirectory, hiddenGitDirectory);
+  let unknown;
+  try {
+    unknown = generate(releaseUnknown);
+  } finally {
+    fs.renameSync(hiddenGitDirectory, gitDirectory);
+  }
+  assert.equal(unknown.source.provenance, "unknown");
+  assert.equal(unknown.source.worktreeDirty, true);
 
   assert.equal(first.appRoot, String.raw`D:\app\asuka`);
   assert.equal(first.releaseId, "test-release");
@@ -113,6 +164,7 @@ try {
     "ops/common.ps1",
     "ops/configure-memory-kernel.mjs",
     "ops/deploy.ps1",
+    "ops/freeze-and-backup-v15.ps1",
     "ops/preflight.ps1",
     "ops/rollback.ps1",
     "ops/verify.ps1",
@@ -254,10 +306,18 @@ try {
   assert.ok(vaultRestoreReport.retainedManualOnly.includes(path.join("entities", "manual-only.md")));
 
   const deploy = fs.readFileSync(path.join(opsRoot, "deploy.ps1"), "utf8");
+  const freeze = fs.readFileSync(
+    path.join(opsRoot, "freeze-and-backup-v15.ps1"),
+    "utf8",
+  );
   const preflight = fs.readFileSync(path.join(opsRoot, "preflight.ps1"), "utf8");
   const rollback = fs.readFileSync(path.join(opsRoot, "rollback.ps1"), "utf8");
   const verify = fs.readFileSync(path.join(opsRoot, "verify.ps1"), "utf8");
   const verifyLedger = fs.readFileSync(path.join(opsRoot, "verify-ledger.mjs"), "utf8");
+  const normalizeTaskActions = fs.readFileSync(
+    path.join(opsRoot, "normalize-task-actions.ps1"),
+    "utf8",
+  );
   const common = fs.readFileSync(path.join(opsRoot, "common.ps1"), "utf8");
   const configureMemory = fs.readFileSync(
     path.join(opsRoot, "configure-memory-kernel.mjs"),
@@ -276,6 +336,10 @@ try {
       "  }",
       "  integrityCheck() { return { ok: true, errors: [] }; }",
       "  getStats() { return { memory_events: 3 }; }",
+      "  getLegacyProjectionStatus() {",
+      "    return this.gate.projectionOutbox",
+      "      ?? { degraded: false, pendingCount: 0, failedCount: 0 };",
+      "  }",
       "  close() {}",
       "}",
       "",
@@ -322,7 +386,12 @@ try {
       versionRoots: 0,
     },
   };
-  const runLedgerGateCase = (name, gate, expectedSuccess) => {
+  const runLedgerGateCase = (
+    name,
+    gate,
+    expectedSuccess,
+    expectedError = /legacy rejudgement gate failed/i,
+  ) => {
     const database = path.join(fixtureRoot, `gate-${name}.json`);
     writeAbsolute(database, `${JSON.stringify(gate)}\n`);
     const result = spawnSync(process.execPath, [
@@ -344,7 +413,7 @@ try {
     assert.notEqual(result.status, 0, `${name} gate must fail`);
     assert.match(
       `${result.stderr}\n${result.stdout}`,
-      /legacy rejudgement gate failed/i,
+      expectedError,
     );
     return undefined;
   };
@@ -389,6 +458,24 @@ try {
       },
     },
     false,
+  );
+  runLedgerGateCase(
+    "projection-pending",
+    {
+      ...completeAllDiscardGate,
+      projectionOutbox: { degraded: false, pendingCount: 1, failedCount: 0 },
+    },
+    false,
+    /legacy projection outbox is not drained/i,
+  );
+  runLedgerGateCase(
+    "projection-failed",
+    {
+      ...completeAllDiscardGate,
+      projectionOutbox: { degraded: true, pendingCount: 1, failedCount: 1 },
+    },
+    false,
+    /legacy projection outbox is not drained/i,
   );
   const syncStop = deploy.indexOf("Disable-AndStopAsukaTask -Name $syncTaskName");
   const gatewayStop = deploy.indexOf("Disable-AndStopAsukaTask -Name $gatewayTaskName");
@@ -460,7 +547,31 @@ try {
   assert.match(deploy, /frozenBackupPath = if \(\$null -eq \$frozenBackup\)/);
   assert.match(deploy, /Configured OpenClaw configuration is invalid/);
   assert.match(deploy, /Installed sync worker does not match the release integrity contract/);
+  assert.match(freeze, /\[string\]\$SealExistingBackupPath/);
+  assert.match(freeze, /@\{upstream\}/);
+  assert.doesNotMatch(freeze, /origin\/main/);
+  assert.match(freeze, /Write-AsukaBackupIntegrity -BackupPath \$sealedPath/);
+  assert.match(freeze, /Test-AsukaFrozenCopyIntegrity/);
+  assert.match(freeze, /Sealing changed the existing frozen backup manifest/);
+  assert.match(freeze, /VerifiedCopies = \$verifiedCopies\.Count/);
+  assert.match(freeze, /TasksBeforePreserved = \$true/);
   assert.match(common, /function Read-AsukaFrozenBackup/);
+  assert.match(common, /function Test-AsukaFrozenCopyIntegrity/);
+  assert.match(
+    common,
+    /Read-AsukaFrozenBackup[\s\S]*Test-AsukaBackupIntegrity -BackupPath \$backupFull/,
+  );
+  assert.match(common, /source provenance must be git/);
+  assert.match(common, /source branch is empty/);
+  assert.match(common, /full 40-character Git commit/);
+  assert.match(common, /source worktree must be clean/);
+  assert.match(
+    common,
+    /function Get-AsukaDirectoryIntegrity[\s\S]*?Sort-Object path[\s\S]*?function Write-AsukaBackupIntegrity/,
+  );
+  assert.match(common, /unmanifested protected file/);
+  assert.match(common, /byte total is invalid/);
+  assert.match(common, /tree hash is invalid/);
   assert.match(common, /Current file changed after freeze/);
   assert.match(common, /scheduled-tasks\\\$GatewayTaskName\.xml/);
   assert.match(common, /syncWorker integrity contract/);
@@ -510,16 +621,51 @@ try {
   assert.match(verifyLedger, /coverage\.coveredSourceEvents/);
   assert.match(configureMemory, /current\.model !== undefined/);
   assert.match(configureMemory, /retrievalMs:\s*1_500/);
+  assert.match(configureMemory, /plugins\.active-memory\.config\.timeoutMs/);
+  assert.match(configureMemory, /actualActiveMemoryConfig\.timeoutMs !== 1_500/);
   assert.match(configureMemory, /debounceMs:\s*currentWiki\.debounceMs \?\? 60_000/);
   assert.match(configureMemory, /migration\.identityId \?\? `private:/);
+  assert.match(configureMemory, /const peerKind = "direct"/);
+  assert.match(configureMemory, /const visibility = "private"/);
+  assert.match(configureMemory, /mismatches\.push\("wiki\.peerKind"\)/);
+  assert.match(configureMemory, /mismatches\.push\("wiki\.visibility"\)/);
   assert.doesNotMatch(configureMemory, /apiKey\s*:/);
   assert.doesNotMatch(readme, /background LLM rejudgement/i);
+  assert.match(readme, /SealExistingBackupPath/);
+  assert.match(readme, /v15-20260727-124326-adaptive-memory-kernel/);
+  assert.match(readme, /preserves `backup-manifest\.json`[\s\S]*`tasksBefore`/);
+  assert.match(normalizeTaskActions, /Read-AsukaFrozenBackup[\s\S]*-VerifyCurrentHashes/);
+  assert.match(normalizeTaskActions, /Export-ScheduledTask/);
+  assert.match(normalizeTaskActions, /Test-AsukaPowerShellFileAction/);
+  assert.match(normalizeTaskActions, /Set-AsukaTaskFromSnapshot/);
+  assert.match(normalizeTaskActions, /argumentsPreserved/);
 
   const configuredOpenClaw = path.join(fixtureRoot, "configured-openclaw.json");
   writeAbsolute(
     configuredOpenClaw,
     `${JSON.stringify({
       untouchedRoot: "keep-root",
+      plugins: {
+        untouchedPluginRoot: "keep-plugin-root",
+        entries: {
+          "memory-core": {
+            enabled: false,
+            untouched: "keep-memory-core",
+          },
+          "active-memory": {
+            enabled: true,
+            untouched: "keep-active-memory",
+            config: {
+              timeoutMs: 15_000,
+              untouched: "keep-active-config",
+            },
+          },
+          "memory-wiki": {
+            enabled: false,
+            untouched: "keep-memory-wiki",
+          },
+        },
+      },
       channels: {
         qqbot: {
           untouchedChannel: "keep-channel",
@@ -566,6 +712,18 @@ try {
   assert.equal(configureReport.modelConfigurationPreserved, true);
   assert.doesNotMatch(configureRun.stdout, /memory-secret|embedding-secret/);
   assert.equal(configured.untouchedRoot, "keep-root");
+  assert.equal(configured.plugins.untouchedPluginRoot, "keep-plugin-root");
+  assert.equal(configured.plugins.entries["memory-core"].enabled, true);
+  assert.equal(configured.plugins.entries["memory-core"].untouched, "keep-memory-core");
+  assert.equal(configured.plugins.entries["active-memory"].enabled, true);
+  assert.equal(configured.plugins.entries["active-memory"].untouched, "keep-active-memory");
+  assert.equal(configured.plugins.entries["active-memory"].config.timeoutMs, 1_500);
+  assert.equal(
+    configured.plugins.entries["active-memory"].config.untouched,
+    "keep-active-config",
+  );
+  assert.equal(configured.plugins.entries["memory-wiki"].enabled, true);
+  assert.equal(configured.plugins.entries["memory-wiki"].untouched, "keep-memory-wiki");
   assert.equal(configured.channels.qqbot.untouchedChannel, "keep-channel");
   assert.equal(configuredKernel.enabled, true);
   assert.equal(
@@ -592,8 +750,55 @@ try {
   assert.equal(configuredKernel.wiki.identityId, "private:default:user-1");
   assert.equal(configuredKernel.wiki.accountId, "default");
   assert.equal(configuredKernel.wiki.peerId, "user-1");
+  assert.equal(configuredKernel.wiki.peerKind, "direct");
+  assert.equal(configuredKernel.wiki.visibility, "private");
   assert.equal(configuredKernel.wiki.debounceMs, 60_000);
   assert.equal(configuredKernel.wiki.overrideImportIntervalMs, 60_000);
+
+  const configuredBeforeVerify = fs.readFileSync(configuredOpenClaw, "utf8");
+  const verifyOnlyRun = run(process.execPath, [
+    path.join(opsRoot, "configure-memory-kernel.mjs"),
+    "--config", configuredOpenClaw,
+    "--manifest", path.join(releaseOne, "manifest.json"),
+    "--verify-only", "true",
+  ]);
+  const verifyOnlyReport = JSON.parse(verifyOnlyRun.stdout);
+  assert.equal(verifyOnlyReport.ok, true);
+  assert.equal(verifyOnlyReport.peerKind, "direct");
+  assert.equal(verifyOnlyReport.visibility, "private");
+  assert.equal(fs.readFileSync(configuredOpenClaw, "utf8"), configuredBeforeVerify);
+
+  for (const [field, invalidValue] of [
+    ["peerKind", "group"],
+    ["visibility", "public"],
+  ]) {
+    const invalidConfig = JSON.parse(configuredBeforeVerify);
+    invalidConfig.channels.qqbot.memoryKernel.wiki[field] = invalidValue;
+    const invalidConfigPath = path.join(fixtureRoot, `invalid-${field}.json`);
+    writeAbsolute(invalidConfigPath, `${JSON.stringify(invalidConfig, null, 2)}\n`);
+    runFailure(process.execPath, [
+      path.join(opsRoot, "configure-memory-kernel.mjs"),
+      "--config", invalidConfigPath,
+      "--manifest", path.join(releaseOne, "manifest.json"),
+      "--verify-only", "true",
+    ], new RegExp(`wiki\\.${field}`));
+  }
+  const invalidActiveTimeout = JSON.parse(configuredBeforeVerify);
+  invalidActiveTimeout.plugins.entries["active-memory"].config.timeoutMs = 15_000;
+  const invalidActiveTimeoutPath = path.join(
+    fixtureRoot,
+    "invalid-active-memory-timeout.json",
+  );
+  writeAbsolute(
+    invalidActiveTimeoutPath,
+    `${JSON.stringify(invalidActiveTimeout, null, 2)}\n`,
+  );
+  runFailure(process.execPath, [
+    path.join(opsRoot, "configure-memory-kernel.mjs"),
+    "--config", invalidActiveTimeoutPath,
+    "--manifest", path.join(releaseOne, "manifest.json"),
+    "--verify-only", "true",
+  ], /plugins\.active-memory\.config\.timeoutMs/);
 
   const rollbackSyncStop = rollback.indexOf("Disable-AndStopAsukaTask -Name $syncTaskName");
   const rollbackGatewayStop = rollback.indexOf("Disable-AndStopAsukaTask -Name $gatewayTaskName");
@@ -708,36 +913,46 @@ try {
     }
     if (process.platform === "win32") {
       const commonScript = path.join(opsRoot, "common.ps1").replace(/'/g, "''");
+      const unknownManifest = path.join(releaseUnknown, "manifest.json").replace(/'/g, "''");
+      const dirtyManifestPath = path.join(fixtureRoot, "dirty-manifest.json");
+      const dirtyManifest = JSON.parse(
+        fs.readFileSync(path.join(releaseOne, "manifest.json"), "utf8"),
+      );
+      dirtyManifest.source.worktreeDirty = true;
+      fs.writeFileSync(dirtyManifestPath, `${JSON.stringify(dirtyManifest, null, 2)}\n`);
+      const dirtyManifestPowerShell = dirtyManifestPath.replace(/'/g, "''");
       const actionValidation = [
         `. '${commonScript}'`,
         "$target = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'Asuka Memory\\asuka-memory-sync.ps1'))",
         "$trustedHost = Join-Path $PSHOME 'powershell.exe'",
         "$validArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + $target + '\"'",
         "$cases = @(",
-        "  @{ Name = 'valid bare host'; Expected = $true; Execute = 'powershell.exe'; Arguments = $validArguments },",
+        "  @{ Name = 'bare host'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'valid absolute host'; Expected = $true; Execute = $trustedHost; Arguments = $validArguments },",
-        "  @{ Name = 'valid case difference'; Expected = $true; Execute = 'POWERSHELL.EXE'; Arguments = '-File \"' + $target.ToUpperInvariant() + '\"' },",
+        "  @{ Name = 'valid absolute case difference'; Expected = $true; Execute = $trustedHost.ToUpperInvariant(); Arguments = '-File \"' + $target.ToUpperInvariant() + '\"' },",
+        "  @{ Name = 'working directory'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments; WorkingDirectory = 'C:\\Temp' },",
         "  @{ Name = 'evil executable'; Expected = $false; Execute = 'evilpowershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'alternate executable'; Expected = $false; Execute = 'C:\\Temp\\powershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'relative executable'; Expected = $false; Execute = '.\\powershell.exe'; Arguments = $validArguments },",
         "  @{ Name = 'extensionless executable'; Expected = $false; Execute = 'powershell'; Arguments = $validArguments },",
         "  @{ Name = 'pwsh executable'; Expected = $false; Execute = 'pwsh.exe'; Arguments = $validArguments },",
         "  @{ Name = 'environment executable'; Expected = $false; Execute = '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'; Arguments = $validArguments },",
-        "  @{ Name = 'decoy file first'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"C:\\evil.ps1\" -File \"' + $target + '\"' },",
-        "  @{ Name = 'command before file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-Command \"Write-Output bad\" -File \"' + $target + '\"' },",
-        "  @{ Name = 'encoded command before file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-EncodedCommand ZQB2AGkAbAA= -File \"' + $target + '\"' },",
-        "  @{ Name = 'command abbreviation'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-c bad -File \"' + $target + '\"' },",
-        "  @{ Name = 'encoded abbreviation'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-enc ZQB2AGkAbAA= -File \"' + $target + '\"' },",
-        "  @{ Name = 'file contains arguments'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + ' -Once\"' },",
-        "  @{ Name = 'file suffix'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + '.evil\"' },",
-        "  @{ Name = 'relative file'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File .\\asuka-memory-sync.ps1' },",
-        "  @{ Name = 'alternate stream'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File \"' + $target + ':evil\"' },",
-        "  @{ Name = 'missing file value'; Expected = $false; Execute = 'powershell.exe'; Arguments = '-File' },",
-        "  @{ Name = 'second file after script'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments + ' -File \"C:\\evil.ps1\"' },",
-        "  @{ Name = 'unexpected script argument'; Expected = $false; Execute = 'powershell.exe'; Arguments = $validArguments + ' -Once' },",
+        "  @{ Name = 'decoy file first'; Expected = $false; Execute = $trustedHost; Arguments = '-File \"C:\\evil.ps1\" -File \"' + $target + '\"' },",
+        "  @{ Name = 'command before file'; Expected = $false; Execute = $trustedHost; Arguments = '-Command \"Write-Output bad\" -File \"' + $target + '\"' },",
+        "  @{ Name = 'encoded command before file'; Expected = $false; Execute = $trustedHost; Arguments = '-EncodedCommand ZQB2AGkAbAA= -File \"' + $target + '\"' },",
+        "  @{ Name = 'command abbreviation'; Expected = $false; Execute = $trustedHost; Arguments = '-c bad -File \"' + $target + '\"' },",
+        "  @{ Name = 'encoded abbreviation'; Expected = $false; Execute = $trustedHost; Arguments = '-enc ZQB2AGkAbAA= -File \"' + $target + '\"' },",
+        "  @{ Name = 'file contains arguments'; Expected = $false; Execute = $trustedHost; Arguments = '-File \"' + $target + ' -Once\"' },",
+        "  @{ Name = 'file suffix'; Expected = $false; Execute = $trustedHost; Arguments = '-File \"' + $target + '.evil\"' },",
+        "  @{ Name = 'relative file'; Expected = $false; Execute = $trustedHost; Arguments = '-File .\\asuka-memory-sync.ps1' },",
+        "  @{ Name = 'alternate stream'; Expected = $false; Execute = $trustedHost; Arguments = '-File \"' + $target + ':evil\"' },",
+        "  @{ Name = 'missing file value'; Expected = $false; Execute = $trustedHost; Arguments = '-File' },",
+        "  @{ Name = 'second file after script'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments + ' -File \"C:\\evil.ps1\"' },",
+        "  @{ Name = 'unexpected script argument'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments + ' -Once' },",
         ")",
         "foreach ($case in $cases) {",
-        "  $action = [pscustomobject]@{ execute = $case.Execute; arguments = $case.Arguments }",
+        "  $workingDirectory = if ($case.ContainsKey('WorkingDirectory')) { $case.WorkingDirectory } else { '' }",
+        "  $action = [pscustomobject]@{ execute = $case.Execute; arguments = $case.Arguments; workingDirectory = $workingDirectory }",
         "  $actual = Test-AsukaPowerShellFileAction -Action $action -ScriptPath $target",
         "  if ($actual -ne $case.Expected) { throw \"Task action validation case failed: $($case.Name)\" }",
         "}",
@@ -745,6 +960,86 @@ try {
         "if ($parsed.Count -ne 3 -or $parsed[2] -ne 'C:\\Asuka Memory\\worker.ps1') { throw 'Quoted path parsing failed.' }",
         "$escaped = @(ConvertFrom-AsukaTaskArguments -Arguments 'one\\\\\\\"two')",
         "if ($escaped.Count -ne 1 -or $escaped[0] -ne 'one\\\"two') { throw 'Backslash-quote parsing failed.' }",
+        "function Assert-AsukaFailure {",
+        "  param([scriptblock]$Script, [string]$Pattern, [string]$Name)",
+        "  $sentinel = \"Expected failure was not observed: $Name\"",
+        "  try {",
+        "    & $Script",
+        "    throw $sentinel",
+        "  } catch {",
+        "    if ($_.Exception.Message -eq $sentinel) { throw }",
+        "    if ($_.Exception.Message -notmatch $Pattern) {",
+        "      throw \"$Name failed with an unexpected error: $($_.Exception.Message)\"",
+        "    }",
+        "  }",
+        "}",
+        `Assert-AsukaFailure { Read-AsukaManifest -Path '${unknownManifest}' | Out-Null } 'source provenance must be git' 'unknown provenance'`,
+        `Assert-AsukaFailure { Read-AsukaManifest -Path '${dirtyManifestPowerShell}' | Out-Null } 'source worktree must be clean' 'dirty provenance'`,
+        "$integrityRoot = Join-Path ([IO.Path]::GetTempPath()) ('asuka-backup-integrity-' + [guid]::NewGuid().ToString('N'))",
+        "$baseline = Join-Path $integrityRoot 'baseline'",
+        "try {",
+        "  New-Item -ItemType Directory -Force -Path (Join-Path $baseline 'payload') | Out-Null",
+        "  New-Item -ItemType Directory -Force -Path (Join-Path $baseline 'a') | Out-Null",
+        "  [IO.File]::WriteAllBytes((Join-Path $baseline 'payload\\data.bin'), [byte[]](1, 2, 3, 4))",
+        "  [IO.File]::WriteAllBytes((Join-Path $baseline 'a\\child.bin'), [byte[]](5))",
+        "  [IO.File]::WriteAllBytes((Join-Path $baseline 'a0.bin'), [byte[]](6))",
+        "  Set-Content -LiteralPath (Join-Path $baseline 'backup-manifest.json') -Value '{}' -Encoding UTF8",
+        "  Set-Content -LiteralPath (Join-Path $baseline 'BACKUP_COMPLETE') -Value 'complete' -Encoding ASCII",
+        "  [void](Write-AsukaBackupIntegrity -BackupPath $baseline)",
+        "  [void](Test-AsukaBackupIntegrity -BackupPath $baseline)",
+        "  function Copy-IntegrityFixture {",
+        "    param([string]$Name)",
+        "    $copy = Join-Path $integrityRoot $Name",
+        "    Copy-Item -LiteralPath $baseline -Destination $copy -Recurse",
+        "    return $copy",
+        "  }",
+        "  $missing = Copy-IntegrityFixture -Name 'missing'",
+        "  Remove-Item -LiteralPath (Join-Path $missing 'payload\\data.bin') -Force",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $missing | Out-Null } 'file is missing' 'missing protected file'",
+        "  $extra = Copy-IntegrityFixture -Name 'extra'",
+        "  Set-Content -LiteralPath (Join-Path $extra 'payload\\extra.txt') -Value 'extra' -Encoding ASCII",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $extra | Out-Null } 'missing, extra, or modified' 'extra protected file'",
+        "  $sameSize = Copy-IntegrityFixture -Name 'same-size-hash'",
+        "  $sameSizeFile = Join-Path $sameSize 'payload\\data.bin'",
+        "  $sameSizeBytes = [IO.File]::ReadAllBytes($sameSizeFile)",
+        "  $sameSizeBytes[0] = [byte]($sameSizeBytes[0] -bxor 255)",
+        "  [IO.File]::WriteAllBytes($sameSizeFile, $sameSizeBytes)",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $sameSize | Out-Null } 'failed integrity verification' 'same-size hash mutation'",
+        "  $changedSize = Copy-IntegrityFixture -Name 'changed-size'",
+        "  [IO.File]::WriteAllBytes((Join-Path $changedSize 'payload\\data.bin'), [byte[]](1, 2, 3, 4, 5))",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $changedSize | Out-Null } 'failed integrity verification' 'size mutation'",
+        "  $badTree = Copy-IntegrityFixture -Name 'bad-tree'",
+        "  $badTreeManifestPath = Join-Path $badTree 'backup-files.json'",
+        "  $badTreeMarkerPath = Join-Path $badTree 'backup-complete.marker'",
+        "  $badTreeManifest = Get-Content -LiteralPath $badTreeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json",
+        "  $badTreeManifest.treeSha256 = '0' * 64",
+        "  $badTreeManifest | ConvertTo-Json -Depth 24 | Set-Content -LiteralPath $badTreeManifestPath -Encoding UTF8",
+        "  $badTreeMarker = Get-Content -LiteralPath $badTreeMarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json",
+        "  $badTreeMarker.treeSha256 = '0' * 64",
+        "  $badTreeMarker.manifestSha256 = Get-AsukaSha256 -Path $badTreeManifestPath",
+        "  $badTreeMarker | ConvertTo-Json -Depth 24 | Set-Content -LiteralPath $badTreeMarkerPath -Encoding UTF8",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $badTree | Out-Null } 'tree hash is invalid' 'manifest tree mismatch'",
+        "  $badBytes = Copy-IntegrityFixture -Name 'bad-bytes'",
+        "  $badBytesMarkerPath = Join-Path $badBytes 'backup-complete.marker'",
+        "  $badBytesMarker = Get-Content -LiteralPath $badBytesMarkerPath -Raw -Encoding UTF8 | ConvertFrom-Json",
+        "  $badBytesMarker.bytes = [int64]$badBytesMarker.bytes + 1",
+        "  $badBytesMarker | ConvertTo-Json -Depth 24 | Set-Content -LiteralPath $badBytesMarkerPath -Encoding UTF8",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $badBytes | Out-Null } 'inconsistent totals' 'manifest marker bytes mismatch'",
+        "  $copyApp = Join-Path $integrityRoot 'copy-app'",
+        "  $copyBackup = Join-Path $integrityRoot 'copy-backup'",
+        "  $copySource = Join-Path $copyApp 'home'",
+        "  $copyDestination = Join-Path $copyBackup 'home'",
+        "  New-Item -ItemType Directory -Force -Path $copySource | Out-Null",
+        "  Set-Content -LiteralPath (Join-Path $copySource 'source.txt') -Value 'same' -Encoding ASCII",
+        "  Copy-Item -LiteralPath $copySource -Destination $copyDestination -Recurse",
+        "  $copyManifest = [pscustomobject]@{ copies = @([pscustomobject]@{ Source = $copySource; Destination = $copyDestination; Skipped = $false }) }",
+        "  $verifiedCopies = @(Test-AsukaFrozenCopyIntegrity -Manifest $copyManifest -AppRoot $copyApp -BackupPath $copyBackup)",
+        "  if ($verifiedCopies.Count -ne 1) { throw 'frozen copy verification did not return one tree' }",
+        "  Set-Content -LiteralPath (Join-Path $copyDestination 'source.txt') -Value 'evil' -Encoding ASCII",
+        "  Assert-AsukaFailure { Test-AsukaFrozenCopyIntegrity -Manifest $copyManifest -AppRoot $copyApp -BackupPath $copyBackup | Out-Null } 'copy tree does not match' 'frozen copy corruption'",
+        "} finally {",
+        "  if (Test-Path -LiteralPath $integrityRoot) { Remove-Item -LiteralPath $integrityRoot -Recurse -Force }",
+        "}",
       ].join("\n");
       run(parser[0], [...parser.slice(1), actionValidation], { cwd: opsRoot });
     }

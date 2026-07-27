@@ -70,16 +70,10 @@ try {
   ) {
     throw "Installed sync worker does not match the release integrity contract."
   }
-  if (
-    -not (Test-Path -LiteralPath ([string]$currentState.backupPath) -PathType Container) -or
-    -not (
-      Test-Path -LiteralPath (
-        Join-Path ([string]$currentState.backupPath) "backup-complete.marker"
-      ) -PathType Leaf
-    )
-  ) {
+  if (-not (Test-Path -LiteralPath ([string]$currentState.backupPath) -PathType Container)) {
     throw "The active deployment no longer has a complete rollback backup."
   }
+  $backupIntegrity = Test-AsukaBackupIntegrity -BackupPath ([string]$currentState.backupPath)
   if (
     -not ($currentState.PSObject.Properties.Name -contains "migration") -or
     $null -eq $currentState.migration
@@ -155,6 +149,19 @@ try {
       sha256 = $actualHash
     }
   }
+  $expectedRuntimePaths = @($manifest.runtimeFiles | ForEach-Object {
+    $destination = Resolve-AsukaChildPath -Root $AppRoot -Relative ([string]$_.destination)
+    $destination.Substring($activePlugin.Length).TrimStart("\").Replace("\", "/")
+  })
+  foreach ($activeFile in @(Get-ChildItem -LiteralPath $activePlugin -File -Recurse -Force)) {
+    $activeRelative = $activeFile.FullName.Substring($activePlugin.Length).TrimStart("\").Replace("\", "/")
+    $isPreservedDependency = @($manifest.runtimePreservedDirectories | Where-Object {
+      $activeRelative.StartsWith("$($_)/", [StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
+    if (-not $isPreservedDependency -and $expectedRuntimePaths -notcontains $activeRelative) {
+      throw "Active runtime contains an unexpected file: $activeRelative"
+    }
+  }
 
   $node = Join-Path $AppRoot (
     "tools\node-{0}\node.exe" -f [string]$manifest.requirements.nodeVersion
@@ -172,22 +179,96 @@ try {
   if ([string]$openClawPackageJson.version -ne [string]$manifest.requirements.openClawVersion) {
     throw "OpenClaw does not match the release requirement."
   }
+  $openClawHome = Join-Path $AppRoot "home"
+  $openClawConfig = Join-Path $AppRoot "home\.openclaw\openclaw.json"
+  $openClawEntry = Join-Path $AppRoot "tools\node_modules\openclaw\openclaw.mjs"
+  $env:OPENCLAW_HOME = $openClawHome
+  $env:USERPROFILE = $openClawHome
+  $env:OPENCLAW_STATE_DIR = Join-Path $AppRoot "home\.openclaw"
+  $env:OPENCLAW_CONFIG_PATH = $openClawConfig
+  $configValidation = Invoke-AsukaNative -FilePath $node -Arguments @(
+    $openClawEntry,
+    "config",
+    "validate"
+  )
+  if ($configValidation.ExitCode -ne 0) {
+    throw "Active OpenClaw configuration is invalid: $($configValidation.Output)"
+  }
+  $kernelConfigProbe = Invoke-AsukaNative -FilePath $node -Arguments @(
+    (Join-Path $ReleaseRoot "ops\configure-memory-kernel.mjs"),
+    "--config", $openClawConfig,
+    "--manifest", $ManifestPath,
+    "--verify-only", "true"
+  )
+  if ($kernelConfigProbe.ExitCode -ne 0) {
+    throw "Active memory kernel configuration does not match the release: $($kernelConfigProbe.Output)"
+  }
+  $modelConfigProbe = Invoke-AsukaNative -FilePath $node -Arguments @(
+    (Join-Path $ReleaseRoot "ops\verify-model-config.mjs"),
+    $activePlugin,
+    $openClawConfig,
+    [string]$manifest.migration.accountId
+  )
+  if ($modelConfigProbe.ExitCode -ne 0) {
+    throw "Active memory model configuration is not ready: $($modelConfigProbe.Output)"
+  }
 
   $ledger = Resolve-AsukaChildPath -Root $AppRoot -Relative ([string]$manifest.migration.database)
   $ledgerVerifier = Join-Path $ReleaseRoot "ops\verify-ledger.mjs"
   $ledgerResult = Invoke-AsukaNative -FilePath $node -Arguments @(
     $ledgerVerifier,
     $activePlugin,
-    $ledger
+    $ledger,
+    [string]$persistedMigration.reportPath,
+    [string]$persistedMigration.cohort.sha256
   )
   if ($ledgerResult.ExitCode -ne 0) {
     throw "Memory ledger verification failed: $($ledgerResult.Output)"
   }
-  $ledgerReport = $ledgerResult.Output.Trim()
+  $ledgerJsonLines = @(
+    $ledgerResult.Output -split "\r?\n" |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+  if ($ledgerJsonLines.Count -eq 0) {
+    throw "Memory ledger verification returned no JSON result."
+  }
   try {
-    $ledgerReport = $ledgerReport | ConvertFrom-Json
+    $ledgerReport = $ledgerJsonLines[-1] | ConvertFrom-Json
   } catch {
-    # Keep sanitized native output when a module warning precedes the JSON result.
+    throw "Memory ledger verification returned invalid JSON."
+  }
+  if (
+    -not ($ledgerReport.PSObject.Properties.Name -contains "ok") -or
+    -not ($ledgerReport.ok -is [bool]) -or
+    -not ([bool]$ledgerReport.ok) -or
+    -not ($ledgerReport.PSObject.Properties.Name -contains "projectionOutbox") -or
+    $null -eq $ledgerReport.projectionOutbox
+  ) {
+    throw "Memory ledger verification result is missing its outbox contract."
+  }
+  $projectionOutbox = $ledgerReport.projectionOutbox
+  [long]$projectionPending = 0
+  [long]$projectionFailed = 0
+  if (
+    $null -eq $projectionOutbox.pendingCount -or
+    -not ([long]::TryParse(
+      [string]$projectionOutbox.pendingCount,
+      [ref]$projectionPending
+    )) -or
+    $projectionPending -lt 0 -or
+    $null -eq $projectionOutbox.failedCount -or
+    -not ([long]::TryParse(
+      [string]$projectionOutbox.failedCount,
+      [ref]$projectionFailed
+    )) -or
+    $projectionFailed -lt 0 -or
+    $projectionFailed -gt $projectionPending -or
+    -not ($projectionOutbox.degraded -is [bool]) -or
+    $projectionPending -ne 0 -or
+    $projectionFailed -ne 0 -or
+    [bool]$projectionOutbox.degraded
+  ) {
+    throw "Memory ledger projection outbox is not clean."
   }
 
   $gatewayTaskName = [string]$manifest.requirements.tasks.gateway
@@ -301,6 +382,8 @@ try {
     activeRuntimeFiles = $activeHashes.Count
     node = $nodeVersionResult.Output.Trim()
     openClaw = [string]$openClawPackageJson.version
+    kernelConfig = ($kernelConfigProbe.Output.Trim() | ConvertFrom-Json)
+    modelConfig = ($modelConfigProbe.Output.Trim() | ConvertFrom-Json)
     ledger = $ledgerReport
     migration = $persistedMigration
     gateway = $gatewayReady
@@ -321,6 +404,7 @@ try {
       networkRetryIsRuntimeFailure = $false
     }
     backupPath = [string]$currentState.backupPath
+    backupIntegrity = $backupIntegrity
   }) -ErrorMessage $null -ExitCode 0
 } catch {
   Write-AsukaEnvelope -Ok $false -Operation "verify" -Data $null `

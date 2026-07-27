@@ -27,6 +27,12 @@ echo "[qqbot:test] behavior fixtures"
 node tests/asuka-media-caption.test.mjs
 node tests/asuka-narration.test.mjs
 node tests/asuka-memory.test.mjs
+node tests/asuka-memory-kernel.test.mjs
+node tests/asuka-memory-legacy-projection-v15.test.mjs
+node tests/asuka-memory-model-client.test.mjs
+node tests/asuka-memory-migration-v15.test.mjs
+node tests/asuka-memory-outbound-wiring.test.mjs
+node tests/asuka-memory-runtime-v15.test.mjs
 node tests/asuka-memory-wiki-pages.test.mjs
 node tests/asuka-conversation-digest.test.mjs
 node tests/asuka-promise.test.mjs

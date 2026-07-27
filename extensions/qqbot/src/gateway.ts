@@ -27,6 +27,7 @@ import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUser
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage } from "./asuka-memory.js";
 import {
   captureAsukaAssistantMemory,
+  captureAsukaMemoryControl,
   captureAsukaUserMemory,
   initializeQQBotAsukaMemory,
   retrieveQQBotAsukaMemory,
@@ -647,17 +648,13 @@ function buildDirectSelfiePromptFromContext(
     SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT,
     formatSelfiePromptContextSection("当前本地时间", context.currentLocalTime, 120),
     recentContext ? `最近对话摘要：${recentContext}` : "",
-    formatSelfiePromptContextSection("最近一周对话", context.recentChatTranscript, 1300),
     formatSelfiePromptContextSection("关系与场景状态", context.asukaStatePrompt),
-    formatSelfiePromptContextSection("长期记忆", context.asukaMemoryPrompt),
-    formatSelfiePromptContextSection("会话摘要", context.asukaConversationDigestPrompt),
     formatSelfiePromptContextSection("模型生成的生图意图", context.modelSelfiePrompt, 700),
     formatSelfiePromptContextSection("引用消息", context.replyToBody, 520),
     formatSelfiePromptContextSection("本轮媒体附件", context.receivedMediaSection, 520),
     formatSelfiePromptContextSection("图片理解", context.imageUnderstandingPrompt, 620),
     formatSelfiePromptContextSection("联网搜索", context.searchPrompt, 620),
     formatSelfiePromptContextSection("语音上下文", context.voiceAsrSection, 420),
-    formatSelfiePromptContextSection("当前轮次", context.currentTurnContext, 900),
     cleanedAssistant ? `当前回复语境：${cleanedAssistant}` : "",
   ].filter(Boolean);
   const contextClause = contextParts.length > 0
@@ -991,10 +988,15 @@ function isStudioMediaImageConfig(config: StudioSelfieConfig): boolean {
     || /^(?:apibusiness_media:)?gpt-image-2$/i.test(config.modelId);
 }
 
+function getStudioMediaReferenceImageField(config: StudioSelfieConfig): "image" | "image_url" {
+  return /(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?:[/:]|$)/i.test(config.baseUrl) ? "image" : "image_url";
+}
+
 function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
   const base = baseUrl.replace(/\/+$/, "");
   const path = resourcePath.replace(/^\/+/, "");
-  if (/\/studio\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  if (/(?:\/studio)?\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  if (/(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?::\d+)?$/i.test(base)) return `${base}/v1/${path}`;
   return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
 }
 
@@ -1176,14 +1178,15 @@ async function generateStudioMediaSelfieImageUrl(
   size = "1024x1024",
 ): Promise<string> {
   const urls = buildStudioMediaApiUrlCandidates(config.baseUrl, "images/generations");
-  const requestBody = JSON.stringify({
+  const requestPayload: Record<string, unknown> = {
     model: config.modelId.replace(/^apibusiness_media:/i, ""),
     prompt: buildStudioSelfiePrompt(prompt),
     image_size: normalizeStudioMediaImageSize(size),
     n: 1,
     response_format: "url",
-    image_url: buildImageDataUrlFromFile(referenceImagePath),
-  });
+  };
+  requestPayload[getStudioMediaReferenceImageField(config)] = buildImageDataUrlFromFile(referenceImagePath);
+  const requestBody = JSON.stringify(requestPayload);
   const errors: string[] = [];
 
   for (let index = 0; index < urls.length; index += 1) {
@@ -1313,7 +1316,6 @@ function resolveSelfieVisiblePayloadText(
   if (captionText) return captionText;
 
   return "";
-<<<<<<< HEAD
 }
 
 function resolveSelfieFlowContextText(
@@ -1325,8 +1327,6 @@ function resolveSelfieFlowContextText(
     || cleanOutgoingTextSegment(caption || "")
     || cleanOutgoingTextSegment(buildForcedSelfieUserText(userText))
     || DEFAULT_SELFIE_VISIBLE_REPLY;
-=======
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
 }
 
 function stripStructuredPayloadForVisibleText(text: string): string {
@@ -3009,10 +3009,38 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
             log?.error(`[qqbot:${account.accountId}] Failed to cancel pending ambient proactive jobs after user reply: ${cancelledAmbient.error}`);
           }
         }
-        const memoryControl: ReturnType<typeof handleAsukaMemoryControlMessage> = proactiveNudge.isNudge
+        const memoryKernelEnabled = (
+          cfg as {
+            channels?: {
+              qqbot?: {
+                memoryKernel?: {
+                  enabled?: boolean;
+                };
+              };
+            };
+          }
+        ).channels?.qqbot?.memoryKernel?.enabled === true;
+        const canonicalMemoryControl = (
+          !proactiveNudge.isNudge
+          && memoryKernelEnabled
+          && asukaPeerContext.peerKind === "direct"
+          && /^sudo(?:\s+|[：:])/i.test(userContent.trim())
+        );
+        if (canonicalMemoryControl) {
+          captureAsukaMemoryControl(asukaPeerContext, {
+            text: userContent,
+            occurredAt: new Date(event.timestamp).getTime(),
+            sourceMessageId: event.messageId,
+            metadata: {
+              source: "qqbot_gateway",
+              authorizationBoundary: "sudo_prefix",
+            },
+          }, log);
+        }
+        const memoryControl = proactiveNudge.isNudge || canonicalMemoryControl
           ? { handled: false }
           : handleAsukaMemoryControlMessage(asukaPeerContext, userContent);
-        if (!proactiveNudge.isNudge && !memoryControl.handled) {
+        if (!proactiveNudge.isNudge && !memoryControl.handled && !canonicalMemoryControl) {
           const imageSummary = imageUnderstandingResults
             .filter((item) => item.status === "summarized" && item.summary)
             .map((item) => item.summary)
@@ -3554,11 +3582,6 @@ ${ttsHint}${sttHint}`;
 
           const sendFallbackSelfieImage = async (): Promise<boolean> => {
             const candidates = getSelfieFallbackImageCandidates(selfieConfig.referenceImagePath);
-            if (candidates.length === 0) {
-              log?.info(`[qqbot:${account.accountId}] Selfie fallback skipped: no bundled images found`);
-              return false;
-            }
-
             for (const imagePath of candidates) {
               try {
                 const imageDataUrl = buildImageDataUrlFromFile(imagePath);
@@ -3572,20 +3595,16 @@ ${ttsHint}${sttHint}`;
                   if (event.type === "group" && event.groupOpenid) {
                     await sendGroupImageMessage(token, event.groupOpenid, imageDataUrl, event.messageId, undefined);
                     sent = true;
-                    return;
                   }
-                  log?.info(`[qqbot:${account.accountId}] Selfie fallback skipped: unsupported event type ${event.type}`);
                 });
                 if (sent) {
-                  log?.info(`[qqbot:${account.accountId}] Selfie fallback image sent: ${imagePath}`);
+                  log?.info(`[qqbot:${account.accountId}] Selfie fallback identity image sent: ${imagePath}`);
                   return true;
                 }
-                return false;
               } catch (fallbackErr) {
                 log?.error(`[qqbot:${account.accountId}] Failed to send selfie fallback image (${imagePath}): ${fallbackErr}`);
               }
             }
-
             return false;
           };
 
@@ -3627,7 +3646,7 @@ ${ttsHint}${sttHint}`;
                 });
                 log?.info(`[qqbot:${account.accountId}] OpenClaw official selfie image generated for ${event.senderId}`);
               } catch (officialError) {
-                if (!apiKey && !authProfile) throw officialError;
+                if (!studioImageConfigured) throw officialError;
                 log?.error(`[qqbot:${account.accountId}] OpenClaw official selfie image generation failed, falling back to Studio-compatible path: ${officialError instanceof Error ? officialError.message : String(officialError)}`);
                 imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
                 log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
@@ -3636,15 +3655,15 @@ ${ttsHint}${sttHint}`;
               imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
               log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
             } else {
-              imageUrl = await generateStudioSelfieImageUrl(prompt, studioImageConfig, referenceImagePath);
-              log?.info(`[qqbot:${account.accountId}] Studio-compatible selfie image generated for ${event.senderId}`);
+              throw new Error("no image generation provider configured");
             }
             return await sendGeneratedSelfieImage(imageUrl);
           };
 
           if (!apiKey && !authProfile && !officialImageConfigured) {
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow skipped: image generation config missing`);
-            return await sendFallbackSelfieImage();
+            if (!await sendFallbackSelfieImage()) await sendErrorMessage("图片这次没有成功生成，请稍后重试。");
+            return true;
           }
 
           try {
@@ -3654,17 +3673,13 @@ ${ttsHint}${sttHint}`;
                 try {
                   const sent = await generateAndSendSelfie();
                   if (!sent) {
-                    log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
-                    const sentFallback = await sendFallbackSelfieImage();
-                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+                    throw new Error("generated selfie image was not sent");
                   }
                   log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
                 } catch (err) {
                   log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
                   try {
-                    log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
-                    const sentFallback = await sendFallbackSelfieImage();
-                    if (!sentFallback) await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
+                    if (!await sendFallbackSelfieImage()) await sendErrorMessage("图片这次没有成功生成，请稍后重试。");
                   } catch (sendErr) {
                     log?.error(`[qqbot:${account.accountId}] Failed to send selfie background error: ${sendErr}`);
                   }
@@ -3676,21 +3691,13 @@ ${ttsHint}${sttHint}`;
 
             const sent = await generateAndSendSelfie();
             if (!sent) {
-              log?.error(`[qqbot:${account.accountId}] Generated selfie image was not sent; falling back to identity image`);
-              const sentFallback = await sendFallbackSelfieImage();
-              if (!sentFallback) {
-                await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
-              }
+              if (!await sendFallbackSelfieImage()) await sendErrorMessage("图片这次没有成功生成，请稍后重试。");
             }
             log?.info(`[qqbot:${account.accountId}] Direct selfie flow completed for ${event.senderId}`);
             return true;
           } catch (err) {
             log?.error(`[qqbot:${account.accountId}] Direct selfie flow failed: ${err}`);
-            log?.info(`[qqbot:${account.accountId}] Falling back to identity image after generated selfie flow failure`);
-            const sentFallback = await sendFallbackSelfieImage();
-            if (!sentFallback) {
-              await sendErrorMessage("⚠️ 自拍生成失败，请稍后重试。");
-            }
+            if (!await sendFallbackSelfieImage()) await sendErrorMessage("图片这次没有成功生成，请稍后重试。");
             return true;
           }
         };
@@ -4021,10 +4028,13 @@ ${ttsHint}${sttHint}`;
                           captureAsukaAssistantMemory(asukaPeerContext, {
                             text: durableReplyText,
                             sourceId: `qqbot-reply:${event.messageId}`,
+                            sourceMessageId: `qqbot-delivery:${account.accountId}:${event.messageId}`,
                             dedupeKey: `qqbot-assistant:${account.accountId}:${event.messageId}`,
                             generatedFromClaimIds: asukaKernelMemoryContext?.claimIds,
                             metadata: {
                               source: "qqbot_gateway",
+                              replyToMessageId: event.messageId,
+                              deliveryKind: "multi_segment_reply",
                               postprocessReason: reason,
                             },
                           }, log);
@@ -4520,7 +4530,6 @@ ${ttsHint}${sttHint}`;
                         recoveredVisibleText,
                         { forceImage: forceSelfieFromTrailingDash },
                       );
-<<<<<<< HEAD
                       const recoveredFlowText = resolveSelfieFlowContextText(
                         sentRecoveredVisibleText || recoveredVisibleText,
                         recoveredSelfie.payload.caption,
@@ -4528,11 +4537,6 @@ ${ttsHint}${sttHint}`;
                       );
                       if (!sentRecoveredVisibleText) {
                         log?.info(`[qqbot:${account.accountId}] Recovered selfie payload visible text not sent; continuing image flow with fallback context text`);
-=======
-                      if (!sentRecoveredVisibleText) {
-                        log?.info(`[qqbot:${account.accountId}] Recovered selfie payload skipped: no safe natural visible reply text`);
-                        return;
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                       }
                       const recoveredSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
@@ -4540,11 +4544,7 @@ ${ttsHint}${sttHint}`;
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
-<<<<<<< HEAD
                         recoveredFlowText,
-=======
-                        sentRecoveredVisibleText,
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                         event.senderId,
                         recoveredSelfieContext,
                       );
@@ -4664,7 +4664,6 @@ ${ttsHint}${sttHint}`;
                         selfieVisibleText,
                         { forceImage: forceSelfieFromTrailingDash },
                       );
-<<<<<<< HEAD
                       const selfieFlowText = resolveSelfieFlowContextText(
                         sentSelfieVisibleText || selfieVisibleText,
                         parsedPayload.caption,
@@ -4672,11 +4671,6 @@ ${ttsHint}${sttHint}`;
                       );
                       if (!sentSelfieVisibleText) {
                         log?.info(`[qqbot:${account.accountId}] Selfie payload visible text not sent; continuing image flow with fallback context text`);
-=======
-                      if (!sentSelfieVisibleText) {
-                        log?.info(`[qqbot:${account.accountId}] Selfie payload skipped: no safe natural visible reply text`);
-                        return;
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                       }
                       const payloadSelfieContext: DirectSelfiePromptContext = {
                         ...directSelfieContext,
@@ -4684,11 +4678,7 @@ ${ttsHint}${sttHint}`;
                       };
                       const selfiePrompt = buildDirectSelfiePromptFromContext(
                         userContent,
-<<<<<<< HEAD
                         selfieFlowText,
-=======
-                        sentSelfieVisibleText,
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                         event.senderId,
                         payloadSelfieContext,
                       );
@@ -4935,7 +4925,6 @@ ${ttsHint}${sttHint}`;
                     selfieVisibleText,
                     { forceImage: true },
                   );
-<<<<<<< HEAD
                   const selfieFlowText = resolveSelfieFlowContextText(
                     sentSelfieVisibleText || selfieVisibleText,
                     undefined,
@@ -4943,20 +4932,11 @@ ${ttsHint}${sttHint}`;
                   );
                   if (!sentSelfieVisibleText) {
                     log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image visible text not sent; continuing image flow with fallback context text`);
-=======
-                  if (!sentSelfieVisibleText) {
-                    log?.info(`[qqbot:${account.accountId}] Forced trailing-dash image turn skipped: no safe natural visible reply text`);
-                    return;
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                   }
                   log?.info(`[qqbot:${account.accountId}] Building post-reply image prompt for trailing-dash request`);
                   const selfiePrompt = buildDirectSelfiePromptFromContext(
                     userContent,
-<<<<<<< HEAD
                     selfieFlowText,
-=======
-                    sentSelfieVisibleText,
->>>>>>> 9fa7781 (Add modeled self-signal personality memory)
                     event.senderId,
                     directSelfieContext,
                   );

@@ -1192,7 +1192,7 @@ async function sendStructuredPayloadFromOutbound(ctx: OutboundContext): Promise<
     const target = parseTarget(ctx.to);
     if (target.type !== "c2c") {
       console.warn("[qqbot] sendText: structured selfie payload ignored because target is not c2c");
-      return { channel: "qqbot" };
+      return { channel: "qqbot", skipped: true, skipReason: "structured_selfie_non_c2c" };
     }
     const caption = mergeVisibleTextAndCaption(visibleText, parsedPayload.caption) || "刚拍好。";
     const selfiePayload: DecodedCronPayload = {
@@ -1965,10 +1965,15 @@ function isStudioMediaImageConfig(config: StudioSelfieConfig): boolean {
     || /^(?:apibusiness_media:)?gpt-image-2$/i.test(config.modelId);
 }
 
+function getStudioMediaReferenceImageField(config: StudioSelfieConfig): "image" | "image_url" {
+  return /(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?:[/:]|$)/i.test(config.baseUrl) ? "image" : "image_url";
+}
+
 function buildStudioMediaApiUrl(baseUrl: string, resourcePath: string): string {
   const base = baseUrl.replace(/\/+$/, "");
   const path = resourcePath.replace(/^\/+/, "");
-  if (/\/studio\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  if (/(?:\/studio)?\/v1$/i.test(base)) return `${base}/${path.replace(/^studio\/v1\//i, "")}`;
+  if (/(^|\/\/)(?:www\.|code\.)?xmapi\.cc(?::\d+)?$/i.test(base)) return `${base}/v1/${path}`;
   return `${base}/studio/v1/${path.replace(/^studio\/v1\//i, "")}`;
 }
 
@@ -2149,14 +2154,15 @@ async function generateStudioMediaSelfieImageUrl(
   size = "1024x1024",
 ): Promise<string> {
   const urls = buildStudioMediaApiUrlCandidates(config.baseUrl, "images/generations");
-  const requestBody = JSON.stringify({
+  const requestPayload: Record<string, unknown> = {
     model: config.modelId.replace(/^apibusiness_media:/i, ""),
     prompt: buildStudioSelfiePrompt(prompt),
     image_size: normalizeStudioMediaImageSize(size),
     n: 1,
     response_format: "url",
-    image_url: buildImageDataUrlFromFile(referenceImagePath),
-  });
+  };
+  requestPayload[getStudioMediaReferenceImageField(config)] = buildImageDataUrlFromFile(referenceImagePath);
+  const requestBody = JSON.stringify(requestPayload);
   const errors: string[] = [];
 
   for (let index = 0; index < urls.length; index += 1) {
@@ -3237,7 +3243,13 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
 
   if (typeof text === "string" && !cronProbe.isCronPayload) {
-    const structuredResult = await sendStructuredPayloadFromOutbound({ to, text, accountId: ctx.accountId, replyToId, account });
+    const structuredResult = await sendStructuredPayloadFromOutbound({
+      ...ctx,
+      to,
+      text,
+      replyToId,
+      account,
+    });
     if (structuredResult) {
       return structuredResult;
     }
@@ -3248,18 +3260,18 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
         return await sendText({ ...ctx, text: fallbackText });
       }
       console.warn(`[qqbot] sendText: suppressed unhandled structured payload: ${text.slice(0, 160)}`);
-      return { channel: "qqbot" };
+      return { channel: "qqbot", skipped: true, skipReason: "unhandled_structured_payload" };
     }
   }
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed internal delivery leak: ${text.slice(0, 160)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "internal_delivery_leak" };
   }
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeIncompleteDeliveryText(text)) {
     console.warn(`[qqbot] sendText: suppressed incomplete delivery text: ${text.slice(0, 160)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "incomplete_delivery_text" };
   }
 
   const recoveredBareCronMessage = !replyToId && typeof text === "string" && !cronProbe.isCronPayload
@@ -3272,12 +3284,12 @@ export async function sendText(ctx: OutboundContext): Promise<OutboundResult> {
 
   if (!replyToId && typeof text === "string" && !cronProbe.isCronPayload && looksLikeBareEncodedPayloadLeak(text)) {
     console.warn(`[qqbot] sendText: suppressed bare encoded payload leak: ${text.slice(0, 80)}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "encoded_payload_leak" };
   }
 
   if (!replyToId && typeof text === "string" && looksLikeDebugProbeText(text)) {
     console.warn(`[qqbot] sendText: suppressed debug probe text: ${text}`);
-    return { channel: "qqbot" };
+    return { channel: "qqbot", skipped: true, skipReason: "debug_probe" };
   }
 
   if (!replyToId && typeof text === "string" && cronProbe.isCronPayload) {

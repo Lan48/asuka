@@ -14,7 +14,10 @@ import type {
   ApplyClaimResult,
   ClaimProposal,
   EvidenceStance,
+  IdentityLink,
   IdentityLinkInput,
+  LegacyProjectionStatus,
+  LegacyProjectionTask,
   LegacyConsolidationClaim,
   LegacyConsolidationDiscard,
   LegacyConsolidationRun,
@@ -34,7 +37,7 @@ import type {
   MemoryVisibility,
 } from "./types.js";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DEFAULT_INFERENCE_PROMOTION_CONFIDENCE = 0.74;
 const DEFAULT_JOB_LEASE_MS = 60_000;
 const DEFAULT_MAX_JOB_ATTEMPTS = 8;
@@ -134,6 +137,19 @@ interface LegacyConsolidationRunRow {
   error: string | null;
   created_at: number;
   updated_at: number;
+}
+
+interface LegacyProjectionTaskRow {
+  identity_id: string;
+  account_id: string;
+  peer_kind: "direct" | "group";
+  peer_id: string;
+  visibility: MemoryVisibility;
+  revision: number;
+  attempts: number;
+  last_error: string | null;
+  requested_at: number;
+  last_attempt_at: number | null;
 }
 
 function parseJson<T>(value: string | null | undefined, fallback: T): T {
@@ -242,6 +258,21 @@ function asLegacyConsolidationRun(row: LegacyConsolidationRunRow): LegacyConsoli
     error: row.error ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function asLegacyProjectionTask(row: LegacyProjectionTaskRow): LegacyProjectionTask {
+  return {
+    identityId: row.identity_id,
+    accountId: row.account_id,
+    peerKind: row.peer_kind,
+    peerId: row.peer_id,
+    visibility: row.visibility,
+    revision: row.revision,
+    attempts: row.attempts,
+    lastError: row.last_error ?? undefined,
+    requestedAt: row.requested_at,
+    lastAttemptAt: row.last_attempt_at ?? undefined,
   };
 }
 
@@ -520,6 +551,22 @@ export class AsukaMemoryLedger {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS legacy_projection_outbox (
+        account_id TEXT NOT NULL,
+        peer_kind TEXT NOT NULL CHECK (peer_kind IN ('direct', 'group')),
+        peer_id TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
+        revision INTEGER NOT NULL DEFAULT 1,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        requested_at INTEGER NOT NULL,
+        last_attempt_at INTEGER,
+        PRIMARY KEY (account_id, peer_kind, peer_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_legacy_projection_outbox_requested
+        ON legacy_projection_outbox(requested_at, account_id, peer_kind, peer_id);
+
       CREATE TABLE IF NOT EXISTS model_runs (
         run_id TEXT PRIMARY KEY,
         task TEXT NOT NULL,
@@ -656,6 +703,42 @@ export class AsukaMemoryLedger {
       at,
       at,
     );
+  }
+
+  listIdentityLinks(options: {
+    identityId?: string;
+    visibility?: MemoryVisibility;
+  } = {}): IdentityLink[] {
+    const conditions: string[] = [];
+    const parameters: SQLInputValue[] = [];
+    if (options.identityId) {
+      conditions.push("identity_id = ?");
+      parameters.push(options.identityId);
+    }
+    if (options.visibility) {
+      conditions.push("visibility = ?");
+      parameters.push(options.visibility);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db.prepare(`
+      SELECT identity_id, account_id, peer_kind, peer_id, visibility
+      FROM identity_links
+      ${where}
+      ORDER BY account_id, peer_kind, peer_id
+    `).all(...parameters) as unknown as Array<{
+      identity_id: string;
+      account_id: string;
+      peer_kind: IdentityLink["peerKind"];
+      peer_id: string;
+      visibility: MemoryVisibility;
+    }>;
+    return rows.map((row) => ({
+      identityId: row.identity_id,
+      accountId: row.account_id,
+      peerKind: row.peer_kind,
+      peerId: row.peer_id,
+      visibility: row.visibility,
+    }));
   }
 
   resolveIdentity(
@@ -2153,15 +2236,21 @@ export class AsukaMemoryLedger {
     return rows.map(asClaim);
   }
 
-  getProjectionSnapshot(identityId?: string, now = Date.now()): MemoryProjectionSnapshot {
+  getProjectionSnapshot(
+    identityId?: string,
+    now = Date.now(),
+    visibility?: MemoryVisibility,
+  ): MemoryProjectionSnapshot {
     const claims = this.listClaims({
       identityId,
       states: ["active"],
+      visibility,
       now,
     });
     const history = this.listClaims({
       identityId,
       states: ["candidate", "superseded", "refuted", "forgotten"],
+      visibility,
     });
     const claimEvidence: MemoryProjectionClaimEvidence[] = [];
     const eventSummaries = new Map<string, MemoryProjectionEventSummary>();
@@ -2510,6 +2599,91 @@ export class AsukaMemoryLedger {
     } : undefined;
   }
 
+  enqueueLegacyProjection(scope: IdentityLink, at = Date.now()): void {
+    this.db.prepare(`
+      INSERT INTO legacy_projection_outbox(
+        account_id, peer_kind, peer_id, identity_id, visibility,
+        revision, attempts, last_error, requested_at, last_attempt_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 0, NULL, ?, NULL)
+      ON CONFLICT(account_id, peer_kind, peer_id) DO UPDATE SET
+        identity_id = excluded.identity_id,
+        visibility = excluded.visibility,
+        revision = legacy_projection_outbox.revision + 1,
+        requested_at = excluded.requested_at
+    `).run(
+      scope.accountId,
+      scope.peerKind,
+      scope.peerId,
+      scope.identityId,
+      scope.visibility,
+      at,
+    );
+  }
+
+  listPendingLegacyProjections(): LegacyProjectionTask[] {
+    const rows = this.db.prepare(`
+      SELECT *
+      FROM legacy_projection_outbox
+      ORDER BY requested_at, account_id, peer_kind, peer_id
+    `).all() as unknown as LegacyProjectionTaskRow[];
+    return rows.map(asLegacyProjectionTask);
+  }
+
+  completeLegacyProjection(task: LegacyProjectionTask): boolean {
+    const result = this.db.prepare(`
+      DELETE FROM legacy_projection_outbox
+      WHERE account_id = ? AND peer_kind = ? AND peer_id = ? AND revision = ?
+    `).run(task.accountId, task.peerKind, task.peerId, task.revision);
+    return result.changes > 0;
+  }
+
+  failLegacyProjection(
+    task: LegacyProjectionTask,
+    error: string,
+    at = Date.now(),
+  ): boolean {
+    const result = this.db.prepare(`
+      UPDATE legacy_projection_outbox
+      SET attempts = attempts + 1, last_error = ?, last_attempt_at = ?
+      WHERE account_id = ? AND peer_kind = ? AND peer_id = ? AND revision = ?
+    `).run(
+      error.slice(0, 1_000),
+      at,
+      task.accountId,
+      task.peerKind,
+      task.peerId,
+      task.revision,
+    );
+    return result.changes > 0;
+  }
+
+  getLegacyProjectionStatus(): LegacyProjectionStatus {
+    const counts = this.db.prepare(`
+      SELECT
+        COUNT(*) AS pending_count,
+        SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END) AS failed_count
+      FROM legacy_projection_outbox
+    `).get() as {
+      pending_count: number;
+      failed_count: number | null;
+    };
+    const latestFailure = this.db.prepare(`
+      SELECT last_error
+      FROM legacy_projection_outbox
+      WHERE last_error IS NOT NULL
+      ORDER BY last_attempt_at DESC, account_id, peer_kind, peer_id
+      LIMIT 1
+    `).get() as { last_error: string } | undefined;
+    const pendingCount = counts.pending_count;
+    const failedCount = counts.failed_count ?? 0;
+    return {
+      degraded: failedCount > 0,
+      pendingCount,
+      failedCount,
+      ...(latestFailure ? { lastError: latestFailure.last_error } : {}),
+    };
+  }
+
   integrityCheck(): {
     ok: boolean;
     integrity: string;
@@ -2538,6 +2712,7 @@ export class AsukaMemoryLedger {
       "memory_jobs",
       "model_runs",
       "retrieval_feedback",
+      "legacy_projection_outbox",
     ];
     return Object.fromEntries(tables.map((table) => {
       const row = this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };

@@ -29,14 +29,21 @@ function sha256(file) {
   return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function git(projectRoot, args, fallback = "") {
+function git(projectRoot, args) {
   try {
-    return execFileSync("git", ["-C", projectRoot, ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
-    return fallback;
+    return {
+      ok: true,
+      output: execFileSync("git", ["-C", projectRoot, ...args], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).trim(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      output: "",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -80,8 +87,11 @@ const accountId = required(values, "account");
 const peerId = required(values, "peer");
 const identityId = values.get("identity") || undefined;
 const appRoot = values.get("app-root") || String.raw`D:\app\asuka`;
+const gitHead = git(projectRoot, ["rev-parse", "HEAD"]);
+const gitBranch = git(projectRoot, ["branch", "--show-current"]);
+const gitStatus = git(projectRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
 const releaseId = values.get("release-id")
-  || `${git(projectRoot, ["rev-parse", "--short", "HEAD"], "worktree")}-${Date.now()}`;
+  || `${gitHead.ok ? gitHead.output.slice(0, 12) : "worktree"}-${Date.now()}`;
 if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(releaseId)) {
   throw new Error("releaseId must contain only letters, numbers, dot, underscore, or hyphen");
 }
@@ -91,6 +101,9 @@ if (
   || isSameOrInside(releaseRoot, projectRoot)
 ) {
   throw new Error("release root must be a dedicated directory outside the project tree");
+}
+if (fs.existsSync(releaseRoot)) {
+  throw new Error("release root already exists; choose a new dedicated directory");
 }
 const expectedOpenClawVersion = values.get("openclaw-version") || "2026.7.1-2";
 const expectedNodeVersion = values.get("node-version") || "v24.18.0";
@@ -130,7 +143,7 @@ if (!fs.existsSync(path.join(qqbotRoot, migrationRelative))) {
   throw new Error(`migration script is missing: ${migrationRelative}`);
 }
 
-fs.rmSync(releaseRoot, { recursive: true, force: true });
+fs.mkdirSync(releaseRoot, { recursive: true });
 const payloadRoot = path.join(releaseRoot, "payload", "qqbot");
 for (const directory of requiredDirectories) {
   for (const source of walkFiles(path.join(qqbotRoot, directory))) {
@@ -185,17 +198,21 @@ if (!syncWorkerEntry) {
   throw new Error(`sync worker is missing from the release: ${syncWorkerSource}`);
 }
 
-const status = git(projectRoot, ["status", "--porcelain=v1", "--untracked-files=all"], "");
+const gitProbeOk = gitHead.ok && gitBranch.ok && gitStatus.ok;
+const status = gitStatus.ok ? gitStatus.output : "";
 const manifest = {
   schemaVersion: 1,
   releaseId,
   generatedAt: new Date().toISOString(),
   appRoot,
   source: {
-    gitCommit: git(projectRoot, ["rev-parse", "HEAD"], "unknown"),
-    gitBranch: git(projectRoot, ["branch", "--show-current"], "unknown"),
-    worktreeDirty: status.length > 0,
-    worktreeStatus: status ? status.split(/\r?\n/) : [],
+    provenance: gitProbeOk ? "git" : "unknown",
+    gitCommit: gitHead.ok ? gitHead.output : "unknown",
+    gitBranch: gitBranch.ok ? gitBranch.output : "unknown",
+    worktreeDirty: !gitProbeOk || status.length > 0,
+    worktreeStatus: gitProbeOk
+      ? (status ? status.split(/\r?\n/) : [])
+      : ["git provenance unavailable; release must be treated as dirty"],
     runtimeTreeSha256: createHash("sha256")
       .update(runtimeFiles.map((entry) => `${entry.sha256}  ${entry.destination}`).join("\n"))
       .digest("hex"),
@@ -212,6 +229,7 @@ const manifest = {
     requiredModules: ["sqlite-vec"],
   },
   runtimeFiles,
+  runtimePreservedDirectories: ["node_modules"],
   opsFiles,
   syncWorker: {
     source: syncWorkerEntry.source,

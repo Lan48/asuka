@@ -2,15 +2,20 @@ import path from "node:path";
 import { AsukaMemoryEngine } from "./engine.js";
 import { AsukaMemoryLedger, getDefaultMemoryLedgerPath } from "./ledger.js";
 import { importWikiOverrides, projectMemoryWiki } from "./wiki.js";
+import type { WikiMemoryScope } from "./wiki.js";
 import type {
+  IdentityLink,
+  LegacyProjectionStatus,
   MemoryContextResult,
   MemoryEvent,
   MemoryEventInput,
   MemoryIngestResult,
   MemoryJobBatchResult,
   MemoryModelAdapter,
+  MemoryPeerKind,
   MemoryProjectionSnapshot,
   MemoryRetrievalRequest,
+  MemoryVisibility,
 } from "./types.js";
 
 const DEFAULT_WORKER_INTERVAL_MS = 1_000;
@@ -56,7 +61,9 @@ export interface ResolvedAsukaMemoryKernelConfig {
     title?: string;
     identityId?: string;
     accountId?: string;
+    peerKind: MemoryPeerKind;
     peerId?: string;
+    visibility: MemoryVisibility;
     debounceMs: number;
     overrideImportIntervalMs: number;
   };
@@ -79,12 +86,7 @@ export interface AsukaLegacyMemoryWriteContext {
   reason: "event_ingested" | "claims_changed";
   occurredAt: number;
   event?: MemoryEvent;
-  scope?: {
-    identityId: string;
-    accountId: string;
-    peerKind: MemoryEvent["peerKind"];
-    peerId: string;
-  };
+  scope?: IdentityLink;
   snapshot: MemoryProjectionSnapshot;
 }
 
@@ -104,6 +106,28 @@ function optionalString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+function configuredPeerKind(value: unknown): MemoryPeerKind {
+  if (value === undefined) return "direct";
+  if (value === "direct" || value === "group") return value;
+  throw new Error("channels.qqbot.memoryKernel.wiki.peerKind must be direct or group");
+}
+
+function configuredVisibility(
+  value: unknown,
+  peerKind: MemoryPeerKind,
+): MemoryVisibility {
+  if (value === undefined) return peerKind === "group" ? "public" : "private";
+  if (value !== "private" && value !== "public") {
+    throw new Error(
+      "channels.qqbot.memoryKernel.wiki.visibility must be private or public",
+    );
+  }
+  if (peerKind === "group" && value === "private") {
+    throw new Error("channels.qqbot.memoryKernel.wiki group scope cannot be private");
+  }
+  return value;
 }
 
 function optionalNumber(
@@ -136,9 +160,24 @@ export function resolveAsukaMemoryKernelConfig(
   const memoryRoot = configuredPath(
     optionalString(wiki.memoryRoot) ?? optionalString(paths.wiki),
   );
+  const wikiEnabled = wiki.enabled === true;
+  const wikiIdentityId = optionalString(wiki.identityId);
+  const wikiAccountId = optionalString(wiki.accountId);
+  const wikiPeerKind = configuredPeerKind(wiki.peerKind);
+  const wikiPeerId = optionalString(wiki.peerId);
+  const wikiVisibility = configuredVisibility(wiki.visibility, wikiPeerKind);
   if (enabled && wiki.enabled === true && !memoryRoot) {
     throw new Error(
       "channels.qqbot.memoryKernel.wiki.memoryRoot is required when Memory Wiki is enabled",
+    );
+  }
+  if (
+    enabled
+    && wikiEnabled
+    && (!wikiIdentityId || !wikiAccountId || !wikiPeerId)
+  ) {
+    throw new Error(
+      "channels.qqbot.memoryKernel.wiki identityId, accountId, and peerId are required for an editable scoped Memory Wiki",
     );
   }
 
@@ -220,12 +259,14 @@ export function resolveAsukaMemoryKernelConfig(
       maxJobs: optionalNumber(worker.maxJobs, 1, 500) ?? DEFAULT_WORKER_MAX_JOBS,
     },
     wiki: {
-      enabled: wiki.enabled === true,
+      enabled: wikiEnabled,
       memoryRoot,
       title: optionalString(wiki.title),
-      identityId: optionalString(wiki.identityId),
-      accountId: optionalString(wiki.accountId),
-      peerId: optionalString(wiki.peerId),
+      identityId: wikiIdentityId,
+      accountId: wikiAccountId,
+      peerKind: wikiPeerKind,
+      peerId: wikiPeerId,
+      visibility: wikiVisibility,
       debounceMs: optionalNumber(wiki.debounceMs, 10, 3_600_000)
         ?? DEFAULT_WIKI_DEBOUNCE_MS,
       overrideImportIntervalMs: optionalNumber(
@@ -241,6 +282,19 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function configuredWikiScope(
+  wiki: ResolvedAsukaMemoryKernelConfig["wiki"],
+): WikiMemoryScope | undefined {
+  if (!wiki.identityId || !wiki.accountId || !wiki.peerId) return undefined;
+  return {
+    identityId: wiki.identityId,
+    visibility: wiki.visibility,
+    accountId: wiki.accountId,
+    peerKind: wiki.peerKind,
+    peerId: wiki.peerId,
+  };
+}
+
 export class AsukaMemoryRuntime {
   readonly ledger: AsukaMemoryLedger;
   readonly engine: AsukaMemoryEngine;
@@ -249,6 +303,9 @@ export class AsukaMemoryRuntime {
   private readonly logger: AsukaMemoryRuntimeLogger;
   private readonly legacyWriters = new Set<AsukaLegacyMemoryWriter>();
   private readonly pendingLegacyWrites = new Set<Promise<void>>();
+  private activeLegacyProjection?: Promise<LegacyProjectionStatus>;
+  private legacyProjectionRetryTimer?: NodeJS.Timeout;
+  private legacyProjectionRerunRequested = false;
   private workerTimer?: NodeJS.Timeout;
   private wikiTimer?: NodeJS.Timeout;
   private activeWorker?: Promise<MemoryJobBatchResult>;
@@ -288,7 +345,7 @@ export class AsukaMemoryRuntime {
       model,
       onProjectionChanged: (identityId) => {
         this.scheduleWikiProjection();
-        this.notifyLegacyWriters("claims_changed", undefined, identityId);
+        this.enqueueLegacyProjections(identityId);
       },
     });
     this.start();
@@ -328,11 +385,11 @@ export class AsukaMemoryRuntime {
 
   private importOverrides(force: boolean): void {
     const wiki = this.config.wiki;
+    const scope = configuredWikiScope(wiki);
     if (
       !wiki.enabled
       || !wiki.memoryRoot
-      || !wiki.accountId
-      || !wiki.peerId
+      || !scope
     ) {
       return;
     }
@@ -342,9 +399,7 @@ export class AsukaMemoryRuntime {
     try {
       const result = importWikiOverrides(this.engine, {
         memoryRoot: wiki.memoryRoot,
-        accountId: wiki.accountId,
-        peerId: wiki.peerId,
-        identityId: wiki.identityId,
+        expectedScope: scope,
       });
       if (result.imported > 0) {
         this.logger.info?.(
@@ -411,42 +466,50 @@ export class AsukaMemoryRuntime {
     if (this.closed) throw new Error("Asuka memory runtime is closed");
     const wiki = this.config.wiki;
     if (!wiki.enabled || !wiki.memoryRoot) return undefined;
-    this.importOverrides(true);
-    return projectMemoryWiki(
-      this.ledger.getProjectionSnapshot(wiki.identityId),
+    const scope = configuredWikiScope(wiki);
+    if (!scope) {
+      throw new Error("Memory Wiki scope is not configured");
+    }
+    const result = projectMemoryWiki(
+      this.ledger.getProjectionSnapshot(scope.identityId),
       {
         memoryRoot: wiki.memoryRoot,
         title: wiki.title,
+        scope,
+        resolveEventScope: (eventId) => {
+          const event = this.ledger.getEvent(eventId);
+          return event && {
+            identityId: event.identityId,
+            visibility: event.visibility,
+            accountId: event.accountId,
+            peerKind: event.peerKind,
+            peerId: event.peerId,
+          };
+        },
       },
     );
+    this.importOverrides(true);
+    return result;
   }
 
-  private notifyLegacyWriters(
-    reason: AsukaLegacyMemoryWriteContext["reason"],
-    event?: MemoryEvent,
-    identityId?: string,
-  ): void {
+  private notifyLegacyWritersForEvent(event: MemoryEvent): void {
     if (this.legacyWriters.size === 0) return;
-    const scopedIdentityId = event?.identityId ?? identityId;
-    const snapshot = this.ledger.getProjectionSnapshot(scopedIdentityId);
-    const scopeEvent = event ?? (
-      scopedIdentityId
-        ? this.ledger.listEvents(scopedIdentityId)[0]
-        : undefined
-    );
     const context: AsukaLegacyMemoryWriteContext = {
-      reason,
+      reason: "event_ingested",
       occurredAt: Date.now(),
       event,
-      scope: scopeEvent
-        ? {
-          identityId: scopeEvent.identityId,
-          accountId: scopeEvent.accountId,
-          peerKind: scopeEvent.peerKind,
-          peerId: scopeEvent.peerId,
-        }
-        : undefined,
-      snapshot,
+      scope: {
+        identityId: event.identityId,
+        accountId: event.accountId,
+        peerKind: event.peerKind,
+        peerId: event.peerId,
+        visibility: event.visibility,
+      },
+      snapshot: this.ledger.getProjectionSnapshot(
+        event.identityId,
+        Date.now(),
+        event.visibility,
+      ),
     };
     for (const writer of this.legacyWriters) {
       const task = (async () => {
@@ -465,9 +528,113 @@ export class AsukaMemoryRuntime {
     }
   }
 
+  private enqueueLegacyProjections(identityId?: string): void {
+    if (this.closed) return;
+    for (const scope of this.ledger.listIdentityLinks({ identityId })) {
+      this.ledger.enqueueLegacyProjection(scope);
+    }
+    if (!this.closing) this.kickLegacyProjectionWorker();
+  }
+
+  private kickLegacyProjectionWorker(): void {
+    if (this.closing || this.closed || this.legacyWriters.size === 0) return;
+    if (this.activeLegacyProjection) {
+      this.legacyProjectionRerunRequested = true;
+      return;
+    }
+    queueMicrotask(() => {
+      if (this.closing || this.closed) return;
+      void this.processPendingLegacyProjections();
+    });
+  }
+
+  private scheduleLegacyProjectionRetry(): void {
+    if (
+      this.closing
+      || this.closed
+      || this.legacyProjectionRetryTimer
+      || this.legacyWriters.size === 0
+    ) {
+      return;
+    }
+    this.legacyProjectionRetryTimer = setTimeout(() => {
+      this.legacyProjectionRetryTimer = undefined;
+      this.kickLegacyProjectionWorker();
+    }, Math.max(1_000, this.config.worker.intervalMs));
+    this.legacyProjectionRetryTimer.unref?.();
+  }
+
+  refreshLegacyProjections(identityId?: string): void {
+    this.ensureOpen();
+    this.enqueueLegacyProjections(identityId);
+  }
+
+  getLegacyProjectionStatus(): LegacyProjectionStatus {
+    this.ensureOpen();
+    return this.ledger.getLegacyProjectionStatus();
+  }
+
+  async processPendingLegacyProjections(): Promise<LegacyProjectionStatus> {
+    if (this.closed) throw new Error("Asuka memory runtime is closed");
+    if (this.activeLegacyProjection) return this.activeLegacyProjection;
+    if (this.legacyWriters.size === 0) {
+      return this.ledger.getLegacyProjectionStatus();
+    }
+    const worker = (async () => {
+      for (const task of this.ledger.listPendingLegacyProjections()) {
+        const writers = [...this.legacyWriters];
+        if (writers.length === 0) break;
+        const context: AsukaLegacyMemoryWriteContext = {
+          reason: "claims_changed",
+          occurredAt: Date.now(),
+          scope: {
+            identityId: task.identityId,
+            accountId: task.accountId,
+            peerKind: task.peerKind,
+            peerId: task.peerId,
+            visibility: task.visibility,
+          },
+          snapshot: this.ledger.getProjectionSnapshot(
+            task.identityId,
+            Date.now(),
+            task.visibility,
+          ),
+        };
+        try {
+          for (const writer of writers) await writer(context);
+          if (!this.ledger.completeLegacyProjection(task)) {
+            this.legacyProjectionRerunRequested = true;
+          }
+        } catch (error) {
+          const message = errorMessage(error);
+          this.ledger.failLegacyProjection(task, message);
+          this.logger.warn?.(
+            `[asuka-memory] legacy memory dual-write failed: ${message}`,
+          );
+        }
+      }
+      return this.ledger.getLegacyProjectionStatus();
+    })();
+    this.activeLegacyProjection = worker;
+    try {
+      return await worker;
+    } finally {
+      if (this.activeLegacyProjection === worker) {
+        this.activeLegacyProjection = undefined;
+      }
+      if (this.legacyProjectionRerunRequested) {
+        this.legacyProjectionRerunRequested = false;
+        this.kickLegacyProjectionWorker();
+      } else if (this.ledger.getLegacyProjectionStatus().pendingCount > 0) {
+        this.scheduleLegacyProjectionRetry();
+      }
+    }
+  }
+
   registerLegacyWriter(writer: AsukaLegacyMemoryWriter): () => void {
     this.ensureOpen();
     this.legacyWriters.add(writer);
+    this.enqueueLegacyProjections();
     return () => {
       this.legacyWriters.delete(writer);
     };
@@ -477,10 +644,23 @@ export class AsukaMemoryRuntime {
     this.ensureOpen();
     const result = this.engine.ingestMemoryEvent(input);
     if (result.receipt?.inserted) {
-      this.notifyLegacyWriters(
-        "event_ingested",
-        this.ledger.getEvent(result.receipt.eventId),
-      );
+      const event = this.ledger.getEvent(result.receipt.eventId);
+      if (event) {
+        this.notifyLegacyWritersForEvent(event);
+        if (this.ledger.listClaims({
+          identityId: event.identityId,
+          visibility: event.visibility,
+        }).length > 0) {
+          this.ledger.enqueueLegacyProjection({
+            identityId: event.identityId,
+            accountId: event.accountId,
+            peerKind: event.peerKind,
+            peerId: event.peerId,
+            visibility: event.visibility,
+          });
+          this.kickLegacyProjectionWorker();
+        }
+      }
       this.kickWorker();
     }
     return result;
@@ -529,6 +709,10 @@ export class AsukaMemoryRuntime {
         clearTimeout(this.wikiTimer);
         this.wikiTimer = undefined;
       }
+      if (this.legacyProjectionRetryTimer) {
+        clearTimeout(this.legacyProjectionRetryTimer);
+        this.legacyProjectionRetryTimer = undefined;
+      }
       if (this.activeWorker) {
         try {
           await this.activeWorker;
@@ -538,6 +722,10 @@ export class AsukaMemoryRuntime {
           );
         }
       }
+      if (this.activeLegacyProjection) {
+        await this.activeLegacyProjection;
+      }
+      await this.processPendingLegacyProjections();
       try {
         await this.flushWiki();
       } catch (error) {

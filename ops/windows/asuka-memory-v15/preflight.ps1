@@ -64,7 +64,7 @@ try {
     $parsedPowerShellScripts += [string]$entry.source
   }
 
-  if ($PSVersionTable.PSVersion.Major -lt 5) {
+  if ([version]$PSVersionTable.PSVersion -lt [version]"5.1") {
     throw "PowerShell 5.1 or newer is required."
   }
   $os = Get-CimInstance Win32_OperatingSystem

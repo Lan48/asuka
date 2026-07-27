@@ -67,7 +67,7 @@ function Protect-LogText {
 
   $safe = $Text
   $safe = $safe -replace "(?i)(https?://[^:/@\s]+:)[^@\s]+@", '$1***@'
-  $safe = $safe -replace "(?i)((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)[^\s,;]+", '$1***'
+  $safe = $safe -replace "(?i)((?:api[_-]?key|token|secret|password|passwd|authorization)\s*['""]?\s*[:=]\s*['""]?)[^'""\s,;}]+", '$1***'
   $safe = $safe -replace "(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+", '$1***'
   $safe = $safe -replace "(?i)\bgh[pousr]_[A-Za-z0-9_]+\b", "***"
   $safe = $safe -replace "(?i)\bsk-[A-Za-z0-9_-]{12,}\b", "***"
@@ -185,28 +185,34 @@ function Get-ConflictState {
 }
 
 function Get-NodePath {
-  $versionedNodes = @(
-    Get-ChildItem -LiteralPath (Join-Path $AppRoot "tools") -Directory -Filter "node-v*" -ErrorAction SilentlyContinue |
-      Sort-Object Name -Descending |
-      ForEach-Object { Join-Path $_.FullName "node.exe" }
-  )
-  $candidates = @($versionedNodes)
-  $candidates += (Join-Path $AppRoot "tools\node.exe")
-
-  foreach ($candidate in $candidates) {
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-      return $candidate
-    }
+  $deploymentStatePath = Join-Path $runtimeDirectory "asuka-memory-v15-current.json"
+  if (-not (Test-Path -LiteralPath $deploymentStatePath -PathType Leaf)) {
+    throw "Active deployment state is missing: $deploymentStatePath"
   }
-
-  $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
-  if ($null -eq $nodeCommand) {
-    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  $deploymentState = Get-Content -LiteralPath $deploymentStatePath -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+  if (
+    [string]$deploymentState.phase -ne "active" -or
+    [string]::IsNullOrWhiteSpace([string]$deploymentState.manifestPath) -or
+    -not (Test-Path -LiteralPath ([string]$deploymentState.manifestPath) -PathType Leaf)
+  ) {
+    throw "Active deployment state does not reference an active release manifest."
   }
-  if ($null -ne $nodeCommand) {
-    return $nodeCommand.Source
+  $manifest = Get-Content -LiteralPath ([string]$deploymentState.manifestPath) -Raw -Encoding UTF8 |
+    ConvertFrom-Json
+  $expectedVersion = [string]$manifest.requirements.nodeVersion
+  if ($expectedVersion -notmatch "^v[0-9]+\.[0-9]+\.[0-9]+$") {
+    throw "Release manifest contains an invalid Node.js version."
   }
-  throw "Node.js executable was not found under '$AppRoot\tools' or PATH."
+  $candidate = Join-Path $AppRoot "tools\node-$expectedVersion\node.exe"
+  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    throw "Pinned Node.js executable is missing: $candidate"
+  }
+  $version = Invoke-NativeCommand -FilePath $candidate -Arguments @("--version")
+  if ($version.ExitCode -ne 0 -or $version.Output.Trim() -ne $expectedVersion) {
+    throw "Pinned Node.js version does not match the active release manifest."
+  }
+  return $candidate
 }
 
 function Get-WikiFingerprint {
@@ -234,7 +240,7 @@ function Get-WikiFingerprint {
 function Get-AheadCount {
   $upstream = Invoke-Git -Arguments @("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
   if ($upstream.ExitCode -ne 0) {
-    return 0
+    throw "Vault branch has no readable upstream; queued commits cannot be synchronized: $($upstream.Output)"
   }
 
   $ahead = Invoke-Git -Arguments @("rev-list", "--count", "@{upstream}..HEAD")
@@ -247,6 +253,31 @@ function Get-AheadCount {
     throw "Unexpected pending commit count: $($ahead.Output)"
   }
   return $count
+}
+
+function Assert-AheadCommitsAreMemoryOnly {
+  $paths = Invoke-Git -Arguments @(
+    "log",
+    "--format=",
+    "--name-only",
+    "@{upstream}..HEAD"
+  )
+  if ($paths.ExitCode -ne 0) {
+    throw "Unable to inspect queued commit paths: $($paths.Output)"
+  }
+  $outside = @(
+    $paths.Output -split "\r?\n" |
+      ForEach-Object { $_.Trim().Replace("\", "/") } |
+      Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        $_ -ne $memoryPath -and
+        -not $_.StartsWith("$memoryPath/", [StringComparison]::Ordinal)
+      } |
+      Sort-Object -Unique
+  )
+  if ($outside.Count -gt 0) {
+    throw "Queued commits touch paths outside ${memoryPath}; automatic push is paused: $($outside -join ', ')"
+  }
 }
 
 function Test-WikiDirty {
@@ -332,6 +363,7 @@ function Invoke-SyncCycle {
 
   $aheadCount = Get-AheadCount
   if ($aheadCount -gt 0) {
+    Assert-AheadCommitsAreMemoryOnly
     $push = Invoke-Git -Arguments @("push")
     if ($push.ExitCode -ne 0) {
       throw "git push failed; $aheadCount local commit(s) remain queued for retry: $($push.Output)"
@@ -444,9 +476,17 @@ try {
       try {
         $cycleResult = Invoke-SyncCycle
         if ($cycleResult -eq "success") {
-          $lastFingerprint = Get-WikiFingerprint
-          $pendingSince = $null
+          $cycleFingerprint = Get-WikiFingerprint
+          $cycleStillPending = (Test-WikiDirty) -or (Get-AheadCount) -gt 0
+          $lastFingerprint = $cycleFingerprint
           $retryAt = $null
+          if ($cycleStillPending) {
+            $pendingSince = Get-Date
+            Write-SyncStatus -State "debouncing" -Detail "Memory changed during the completed sync cycle."
+            Write-SyncLog -Level "INFO" -Message "Memory changed during the completed sync cycle; another cycle is pending."
+          } else {
+            $pendingSince = $null
+          }
         }
       } catch {
         Write-SyncStatus -State "retry" -Detail $_.Exception.Message

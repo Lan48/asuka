@@ -280,6 +280,288 @@ async function verifyIntegrityInvariant(name, run) {
   }
 }
 
+await verifyIntegrityInvariant("adjudicated deletes refresh projections once", async () => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-delete-callback-"));
+  const databasePath = path.join(fixtureRoot, "ledger.sqlite");
+  const deletionLedger = new AsukaMemoryLedger(databasePath);
+  const projectionChanges = [];
+  try {
+    const firstEvent = deletionLedger.appendEvent(eventInput({
+      text: "我喜欢清晨散步",
+      sourceMessageId: "delete-callback-first",
+    }));
+    const firstApplied = deletionLedger.applyClaimProposal(firstEvent.eventId, {
+      semanticKey: "user.preference.morning_walk",
+      subjectId: "user",
+      predicate: "preference.morning_walk",
+      value: true,
+      canonicalText: "用户喜欢清晨散步",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const firstClaim = deletionLedger.getClaim(firstApplied.claimId);
+    const secondEvent = deletionLedger.appendEvent(eventInput({
+      text: "我喜欢夜间阅读",
+      sourceMessageId: "delete-callback-second",
+    }));
+    const secondApplied = deletionLedger.applyClaimProposal(secondEvent.eventId, {
+      semanticKey: "user.preference.night_reading",
+      subjectId: "user",
+      predicate: "preference.night_reading",
+      value: true,
+      canonicalText: "用户喜欢夜间阅读",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const secondClaim = deletionLedger.getClaim(secondApplied.claimId);
+    const deletionEngine = new AsukaMemoryEngine(deletionLedger, {
+      onProjectionChanged: (identityId) => projectionChanges.push(identityId),
+      model: {
+        async complete(request) {
+          assert.equal(request.task, "adjudicate");
+          return JSON.stringify({
+            proposals: [
+              {
+                semanticKey: firstClaim.semanticKey,
+                subjectId: firstClaim.subjectId,
+                predicate: firstClaim.predicate,
+                value: null,
+                canonicalText: "删除清晨散步偏好",
+                topLevelType: "fact",
+                epistemicStatus: "explicit",
+                confidence: 1,
+                action: "delete",
+                targetClaimId: firstClaim.claimId,
+              },
+              {
+                semanticKey: secondClaim.semanticKey,
+                subjectId: secondClaim.subjectId,
+                predicate: secondClaim.predicate,
+                value: null,
+                canonicalText: "删除夜间阅读偏好",
+                topLevelType: "fact",
+                epistemicStatus: "explicit",
+                confidence: 1,
+                action: "delete",
+                targetClaimId: secondClaim.claimId,
+              },
+            ],
+          });
+        },
+      },
+    });
+    const controlEvent = deletionEngine.ingestMemoryEvent(eventInput({
+      kind: "memory_control",
+      text: "删除这两条偏好",
+      sourceMessageId: "delete-callback-control",
+    }), { enqueue: false });
+    await deletionEngine.adjudicateEvent(controlEvent.receipt.eventId);
+
+    assert.equal(deletionLedger.getClaim(firstClaim.claimId), undefined);
+    assert.equal(deletionLedger.getClaim(secondClaim.claimId), undefined);
+    assert.deepEqual(projectionChanges, [controlEvent.receipt.identityId]);
+  } finally {
+    deletionLedger.close();
+  }
+
+  try {
+    const database = new DatabaseSync(databasePath);
+    const row = database.prepare(`
+      SELECT result_summary
+      FROM model_runs
+      WHERE task = 'adjudicate' AND status = 'completed'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get();
+    database.close();
+    const summary = JSON.parse(row.result_summary);
+    assert.deepEqual(summary.claimIds, []);
+    assert.equal(summary.deletedClaimIds.length, 2);
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+await verifyIntegrityInvariant("rerank may exclude local candidates", async () => {
+  const subsetLedger = new AsukaMemoryLedger(":memory:");
+  let rerankCalls = 0;
+  try {
+    const selectedEvent = subsetLedger.appendEvent(eventInput({
+      text: "我喜欢清晨散步",
+      sourceMessageId: "rerank-subset-selected",
+    }));
+    const selected = subsetLedger.applyClaimProposal(selectedEvent.eventId, {
+      semanticKey: "user.preference.morning_walk",
+      subjectId: "user",
+      predicate: "preference.morning_walk",
+      value: true,
+      canonicalText: "用户喜欢清晨散步",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const excludedEvent = subsetLedger.appendEvent(eventInput({
+      text: "我常在周末整理书架",
+      sourceMessageId: "rerank-subset-excluded",
+    }));
+    const excluded = subsetLedger.applyClaimProposal(excludedEvent.eventId, {
+      semanticKey: "user.habit.bookshelf",
+      subjectId: "user",
+      predicate: "habit.bookshelf",
+      value: true,
+      canonicalText: "用户常在周末整理书架",
+      topLevelType: "fact",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const subsetEngine = new AsukaMemoryEngine(subsetLedger, {
+      rerankDeadlineMs: 500,
+      model: {
+        async complete(request) {
+          assert.equal(request.task, "rerank");
+          rerankCalls += 1;
+          return JSON.stringify({ claimIds: [selected.claimId], reason: "only relevant item" });
+        },
+      },
+    });
+    const request = {
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      query: "清晨散步",
+    };
+    const result = await subsetEngine.retrieveMemoryContext(request);
+    assert.equal(result.usedFallback, false);
+    assert.deepEqual(result.claimIds, [selected.claimId]);
+    assert.ok(!result.claimIds.includes(excluded.claimId));
+    assert.doesNotMatch(result.prompt, /整理书架/);
+
+    const cachedResult = subsetEngine.retrieveMemoryContextLocal(request);
+    assert.equal(cachedResult.usedFallback, false);
+    assert.deepEqual(cachedResult.claimIds, [selected.claimId]);
+    assert.equal(rerankCalls, 1);
+  } finally {
+    subsetLedger.close();
+  }
+});
+
+await verifyIntegrityInvariant("group recall shares the rerank deadline path", async () => {
+  const groupLedger = new AsukaMemoryLedger(":memory:");
+  let rerankCalls = 0;
+  try {
+    const publicEvent = groupLedger.appendEvent(eventInput({
+      peerKind: "group",
+      peerId: "group-rerank",
+      text: "群里约定周五晚上看电影",
+      sourceMessageId: "group-rerank-source",
+    }));
+    const publicClaim = groupLedger.applyClaimProposal(publicEvent.eventId, {
+      semanticKey: "group.plan.friday_movie",
+      subjectId: "group",
+      predicate: "plan.friday_movie",
+      value: true,
+      canonicalText: "群里约定周五晚上看电影",
+      topLevelType: "event",
+      epistemicStatus: "explicit",
+      authority: "user_explicit",
+      confidence: 1,
+    });
+    const groupEngine = new AsukaMemoryEngine(groupLedger, {
+      rerankDeadlineMs: 10,
+      rerankTaskTimeoutMs: 1_000,
+      model: {
+        async complete(request) {
+          assert.equal(request.task, "rerank");
+          rerankCalls += 1;
+          await wait(40);
+          return JSON.stringify({ claimIds: [], reason: "not relevant after rerank" });
+        },
+      },
+    });
+    const request = {
+      accountId: "default",
+      peerKind: "group",
+      peerId: "group-rerank",
+      query: "周五安排",
+    };
+    const fallbackResult = await groupEngine.retrieveMemoryContext(request);
+    assert.equal(fallbackResult.usedFallback, true);
+    assert.ok(fallbackResult.claimIds.includes(publicClaim.claimId));
+    assert.equal(rerankCalls, 1, "group recall must invoke the same reranker as direct recall");
+
+    await wait(60);
+    const cachedResult = groupEngine.retrieveMemoryContextLocal(request);
+    assert.equal(cachedResult.usedFallback, false);
+    assert.deepEqual(cachedResult.claimIds, []);
+  } finally {
+    groupLedger.close();
+  }
+});
+
+await verifyIntegrityInvariant("candidate and provisional claims never enter recall", async () => {
+  const provisionalLedger = new AsukaMemoryLedger(":memory:");
+  try {
+    const assistantEvent = provisionalLedger.appendEvent(eventInput({
+      actor: "asuka",
+      kind: "assistant_reply",
+      text: "我猜用户也许喜欢午夜跑步",
+      sourceMessageId: "candidate-recall-source",
+    }));
+    const candidate = provisionalLedger.applyClaimProposal(assistantEvent.eventId, {
+      semanticKey: "user.preference.midnight_run",
+      subjectId: "user",
+      predicate: "preference.midnight_run",
+      value: true,
+      canonicalText: "用户也许喜欢午夜跑步",
+      topLevelType: "belief",
+      epistemicStatus: "inferred",
+      authority: "inferred",
+      confidence: 0.95,
+    });
+    assert.equal(candidate.state, "candidate");
+
+    const migrationEvent = provisionalLedger.appendEvent(eventInput({
+      text: "旧框架暂存的偏好",
+      sourceMessageId: "provisional-recall-source",
+    }));
+    const provisional = provisionalLedger.applyClaimProposal(migrationEvent.eventId, {
+      semanticKey: "user.preference.provisional",
+      subjectId: "user",
+      predicate: "preference.provisional",
+      value: true,
+      canonicalText: "用户可能有一条尚未重判的旧偏好",
+      topLevelType: "belief",
+      epistemicStatus: "inferred",
+      authority: "migration_untrusted",
+      confidence: 0.99,
+      metadata: { migrationPendingRejudge: true },
+    });
+    assert.equal(provisional.state, "candidate");
+
+    const local = provisionalLedger.searchLocal({
+      identityId: assistantEvent.identityId,
+      visibility: "private",
+      query: "午夜跑步 旧偏好",
+    });
+    assert.deepEqual(local, []);
+    const result = new AsukaMemoryEngine(provisionalLedger).retrieveMemoryContextLocal({
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      query: "午夜跑步 旧偏好",
+    });
+    assert.deepEqual(result.claimIds, []);
+  } finally {
+    provisionalLedger.close();
+  }
+});
+
 await verifyIntegrityInvariant("forget/delete authority", async () => {
   const authorityLedger = new AsukaMemoryLedger(":memory:");
   try {

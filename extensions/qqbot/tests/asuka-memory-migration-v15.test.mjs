@@ -589,9 +589,31 @@ ledger.enqueueJob(untrackedLegacyEvent.receipt.eventId, "legacy_rejudge");
 assert.equal(getLegacyRejudgementGate(engine).events.untracked, 0);
 
 const wikiRoot = path.join(fixtureRoot, "Memory");
-const firstProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
+const wikiScope = {
+  identityId: "private:default:user-1",
+  visibility: "private",
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+};
+const wikiProjectionOptions = {
   memoryRoot: wikiRoot,
-});
+  scope: wikiScope,
+  resolveEventScope(eventId) {
+    const event = ledger.getEvent(eventId);
+    return event && {
+      identityId: event.identityId,
+      visibility: event.visibility,
+      accountId: event.accountId,
+      peerKind: event.peerKind,
+      peerId: event.peerId,
+    };
+  },
+};
+const firstProjection = projectMemoryWiki(
+  ledger.getProjectionSnapshot(undefined, 1_000),
+  wikiProjectionOptions,
+);
 assert.equal(firstProjection.pageCount, 1, "only a topic with real claims should generate a page");
 assert.ok(firstProjection.changedFiles.some((file) => file.endsWith("index.md")));
 const entityFile = firstProjection.changedFiles.find((file) => file.includes(`${path.sep}entities${path.sep}`));
@@ -608,15 +630,17 @@ entityContent = entityContent
     `${memoryWikiMarkers.overridesStart}\n用户明确纠正：我睡觉其实很安稳。`,
   );
 fs.writeFileSync(entityFile, entityContent);
-const secondProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
-  memoryRoot: wikiRoot,
-});
+const secondProjection = projectMemoryWiki(
+  ledger.getProjectionSnapshot(undefined, 1_000),
+  wikiProjectionOptions,
+);
 const preserved = fs.readFileSync(entityFile, "utf8");
 assert.match(preserved, /用户自由 Notes/);
 assert.match(preserved, /用户明确纠正/);
-const thirdProjection = projectMemoryWiki(ledger.getProjectionSnapshot(undefined, 1_000), {
-  memoryRoot: wikiRoot,
-});
+const thirdProjection = projectMemoryWiki(
+  ledger.getProjectionSnapshot(undefined, 1_000),
+  wikiProjectionOptions,
+);
 assert.equal(
   thirdProjection.changedFiles.length,
   0,
@@ -625,20 +649,23 @@ assert.equal(
 
 const overrideImport = importWikiOverrides(engine, {
   memoryRoot: wikiRoot,
-  accountId: "default",
-  peerId: "user-1",
+  expectedScope: wikiScope,
 });
 assert.equal(overrideImport.imported, 1);
 const repeatedOverrideImport = importWikiOverrides(engine, {
   memoryRoot: wikiRoot,
-  accountId: "default",
-  peerId: "user-1",
+  expectedScope: wikiScope,
 });
 assert.equal(repeatedOverrideImport.imported, 0);
 assert.equal(repeatedOverrideImport.unchanged, 1);
 const overrideEvent = ledger.getEvent(overrideImport.eventIds[0]);
 assert.equal(overrideEvent.kind, "human_override");
 assert.equal(overrideEvent.actor, "user");
+assert.equal(overrideEvent.identityId, wikiScope.identityId);
+assert.equal(overrideEvent.visibility, wikiScope.visibility);
+assert.equal(overrideEvent.accountId, wikiScope.accountId);
+assert.equal(overrideEvent.peerKind, wikiScope.peerKind);
+assert.equal(overrideEvent.peerId, wikiScope.peerId);
 assert.equal(ledger.integrityCheck().ok, true);
 
 ledger.close();

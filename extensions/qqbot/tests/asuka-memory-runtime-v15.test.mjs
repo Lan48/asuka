@@ -13,7 +13,10 @@ import {
   resolveAsukaMemoryKernelConfig,
 } from "../dist/src/asuka-memory-kernel/runtime.js";
 import {
+  captureAsukaMemoryControl,
+  captureAsukaUserMemory,
   initializeQQBotAsukaMemory,
+  retrieveQQBotAsukaMemory,
 } from "../dist/src/asuka-memory-kernel/qqbot-adapter.js";
 import {
   writeAsukaLegacyMemoryProjection,
@@ -133,6 +136,13 @@ const databasePath = path.join(temporaryRoot, "memory.sqlite");
 const legacyMemoryFile = path.join(temporaryRoot, "legacy", "memory.json");
 const memoryRoot = path.join(temporaryRoot, "vault", "Asuka", "Memory");
 const identityId = "private:default:user-1";
+const wikiScope = {
+  identityId,
+  visibility: "private",
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "user-1",
+};
 const atomicProjectionFile = path.join(temporaryRoot, "atomic", "memory.json");
 const originalProjection = `${JSON.stringify({
   version: 1,
@@ -204,8 +214,10 @@ const persistentRoot = rootConfig({
     enabled: true,
     memoryRoot,
     accountId: "default",
+    peerKind: "direct",
     peerId: "user-1",
     identityId,
+    visibility: "private",
     debounceMs: 20,
     overrideImportIntervalMs: 20,
   },
@@ -242,6 +254,7 @@ await firstRuntime.shutdown();
 
 let activeModelCalls = 0;
 let maximumConcurrentModelCalls = 0;
+let deleteTargetClaimId;
 const model = {
   async complete(request) {
     if (request.task === "rerank") {
@@ -258,6 +271,23 @@ const model = {
     activeModelCalls -= 1;
     const eventLine = request.prompt.match(/当前事件：(\{[^\n]+\})/);
     const event = eventLine ? JSON.parse(eventLine[1]) : {};
+    if (event.kind === "memory_control" && deleteTargetClaimId) {
+      return JSON.stringify({
+        proposals: [{
+          action: "delete",
+          targetClaimId: deleteTargetClaimId,
+          subjectId: "user",
+          predicate: "wiki.delete_refresh",
+          value: null,
+          canonicalText: "彻底删除 Wiki 刷新测试记忆",
+          topLevelType: "fact",
+          epistemicStatus: "explicit",
+          sourceKind: "correction",
+          confidence: 1,
+          topic: "删除刷新测试",
+        }],
+      });
+    }
     if (event.actor === "asuka") {
       return JSON.stringify({
         proposals: [{
@@ -494,6 +524,52 @@ secondRuntime.ledger.applyClaimProposal(foreignEvent.eventId, {
   topic: "居住状态",
 });
 
+const publicEventForSameIdentity = secondRuntime.ledger.appendEvent({
+  accountId: "default",
+  peerKind: "group",
+  peerId: "shared-room",
+  identityId,
+  visibility: "public",
+  actor: "user",
+  kind: "user_message",
+  text: "同一 identity 的公开记忆也不能混入私有 Wiki",
+  sourceId: "fixture:same-identity-public",
+});
+secondRuntime.ledger.applyClaimProposal(publicEventForSameIdentity.eventId, {
+  subjectId: "user",
+  predicate: "public_scope.marker",
+  value: "公开地点",
+  canonicalText: "同一 identity 的公开 scope 记忆",
+  topLevelType: "fact",
+  epistemicStatus: "explicit",
+  authority: "user_explicit",
+  confidence: 1,
+  topic: "居住状态",
+});
+
+const otherPeerEventForSameIdentity = secondRuntime.ledger.appendEvent({
+  accountId: "default",
+  peerKind: "direct",
+  peerId: "other-direct-peer",
+  identityId,
+  visibility: "private",
+  actor: "user",
+  kind: "user_message",
+  text: "同一 identity 和 visibility 的其他私聊也不能混入",
+  sourceId: "fixture:same-identity-other-peer",
+});
+secondRuntime.ledger.applyClaimProposal(otherPeerEventForSameIdentity.eventId, {
+  subjectId: "user",
+  predicate: "other_peer.marker",
+  value: "其他私聊地点",
+  canonicalText: "同一 identity 的其他 peer scope 记忆",
+  topLevelType: "fact",
+  epistemicStatus: "explicit",
+  authority: "user_explicit",
+  confidence: 1,
+  topic: "居住状态",
+});
+
 const projected = await secondRuntime.flushWiki();
 assert.ok(projected?.pageCount);
 assert.equal(fs.existsSync(path.join(memoryRoot, ".asuka-memory-pending")), true);
@@ -513,6 +589,11 @@ const firstTopicPage = fs.readFileSync(entityFile, "utf8");
 const firstIndexPage = fs.readFileSync(indexFile, "utf8");
 assert.match(firstTopicPage, /^---\n[\s\S]*\ntype: memory-topic\n[\s\S]*\n---\n/);
 assert.match(firstIndexPage, /^---\n[\s\S]*\ntype: memory-index\n[\s\S]*\n---\n/);
+assert.match(firstTopicPage, /scope_identity_id: "private:default:user-1"/);
+assert.match(firstTopicPage, /scope_visibility: "private"/);
+assert.match(firstTopicPage, /scope_account_id: "default"/);
+assert.match(firstTopicPage, /scope_peer_kind: "direct"/);
+assert.match(firstTopicPage, /scope_peer_id: "user-1"/);
 assert.ok(
   firstIndexPage.includes(`[[${relativeEntity}|居住状态]]`),
   "the index must use a valid topic wikilink",
@@ -532,6 +613,14 @@ assert.doesNotMatch(firstTopicPage, /支持证据 1：已经在苏州稳定居�
 assert.doesNotMatch(firstTopicPage, /反对证据 1：旧资料仍写着杭州/);
 assert.doesNotMatch(firstTopicPage, /跨身份跨可见性证据绝不能泄漏/);
 assert.doesNotMatch(firstTopicPage, /跨 scope 的秘密记忆/);
+const projectedMarkdown = [
+  fs.readFileSync(indexFile, "utf8"),
+  ...fs.readdirSync(path.join(memoryRoot, "entities"))
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => fs.readFileSync(path.join(memoryRoot, "entities", name), "utf8")),
+].join("\n");
+assert.doesNotMatch(projectedMarkdown, /同一 identity 的公开 scope 记忆/);
+assert.doesNotMatch(projectedMarkdown, /同一 identity 的其他 peer scope 记忆/);
 
 const generatedEventCount = secondRuntime.ledger.listEvents(identityId).length;
 await secondRuntime.flushWiki();
@@ -598,6 +687,20 @@ assert.equal(
   "Overrides bytes must survive recompilation exactly",
 );
 await secondRuntime.processPendingMemoryJobs();
+const importedOverride = secondRuntime.ledger.listEvents(identityId)
+  .find((event) => event.kind === "human_override");
+assert.ok(importedOverride);
+assert.deepEqual(
+  {
+    identityId: importedOverride.identityId,
+    visibility: importedOverride.visibility,
+    accountId: importedOverride.accountId,
+    peerKind: importedOverride.peerKind,
+    peerId: importedOverride.peerId,
+  },
+  wikiScope,
+  "Wiki Overrides must use the exact scope bound to the editable page",
+);
 assert.equal(
   secondRuntime.ledger.listEvents(identityId).length,
   generatedEventCount + 1,
@@ -615,6 +718,62 @@ assert.equal(
   secondRuntime.ledger.listEvents(identityId).length,
   generatedEventCount + 1,
   "an unchanged override must be idempotent",
+);
+
+await wait(100);
+const deleteRefreshEvent = secondRuntime.ledger.appendEvent({
+  accountId: wikiScope.accountId,
+  peerKind: wikiScope.peerKind,
+  peerId: wikiScope.peerId,
+  identityId: wikiScope.identityId,
+  visibility: wikiScope.visibility,
+  actor: "user",
+  kind: "user_message",
+  text: "这条记忆只用于验证删除后刷新",
+  sourceId: "fixture:wiki-delete-refresh",
+});
+const deleteRefreshClaim = secondRuntime.ledger.applyClaimProposal(
+  deleteRefreshEvent.eventId,
+  {
+    subjectId: "user",
+    predicate: "wiki.delete_refresh",
+    value: true,
+    canonicalText: "Wiki 删除刷新测试记忆",
+    topLevelType: "fact",
+    epistemicStatus: "explicit",
+    authority: "user_explicit",
+    confidence: 1,
+    topic: "删除刷新测试",
+  },
+);
+deleteTargetClaimId = deleteRefreshClaim.claimId;
+await secondRuntime.flushWiki();
+assert.ok(
+  fs.readdirSync(path.join(memoryRoot, "entities"))
+    .some((name) =>
+      fs.readFileSync(path.join(memoryRoot, "entities", name), "utf8")
+        .includes("Wiki 删除刷新测试记忆")
+    ),
+  "the deletion fixture must be visible before the canonical delete",
+);
+secondRuntime.ingestMemoryEvent({
+  accountId: wikiScope.accountId,
+  peerKind: wikiScope.peerKind,
+  peerId: wikiScope.peerId,
+  identityId: wikiScope.identityId,
+  visibility: wikiScope.visibility,
+  actor: "user",
+  kind: "memory_control",
+  text: "彻底删除 Wiki 刷新测试记忆",
+  sourceMessageId: "fixture:wiki-delete-control",
+});
+await waitFor(() => secondRuntime.ledger.getClaim(deleteRefreshClaim.claimId) === undefined);
+await waitFor(() =>
+  fs.readdirSync(path.join(memoryRoot, "entities"))
+    .every((name) =>
+      !fs.readFileSync(path.join(memoryRoot, "entities", name), "utf8")
+        .includes("Wiki 删除刷新测试记忆")
+    )
 );
 
 const validWikiRoot = path.join(temporaryRoot, "valid-wiki-copy");
@@ -677,7 +836,20 @@ for (const fixture of corruptions) {
   assert.throws(
     () => projectMemoryWiki(
       secondRuntime.ledger.getProjectionSnapshot(identityId),
-      { memoryRoot: fixtureRoot },
+      {
+        memoryRoot: fixtureRoot,
+        scope: wikiScope,
+        resolveEventScope(eventId) {
+          const event = secondRuntime.ledger.getEvent(eventId);
+          return event && {
+            identityId: event.identityId,
+            visibility: event.visibility,
+            accountId: event.accountId,
+            peerKind: event.peerKind,
+            peerId: event.peerId,
+          };
+        },
+      },
     ),
     /manual marker/i,
     fixture.name,
@@ -688,6 +860,27 @@ for (const fixture of corruptions) {
     `${fixture.name} must leave the complete Memory directory unchanged`,
   );
 }
+
+assert.throws(
+  () => projectMemoryWiki(
+    secondRuntime.ledger.getProjectionSnapshot(identityId),
+    {
+      memoryRoot,
+      scope: {
+        ...wikiScope,
+        peerId: "other-direct-peer",
+      },
+      resolveEventScope() {
+        return {
+          ...wikiScope,
+          peerId: "other-direct-peer",
+        };
+      },
+    },
+  ),
+  /scope binding/i,
+  "an editable Wiki root must not be rebound to another peer",
+);
 
 await secondRuntime.shutdown();
 assert.equal(
@@ -779,6 +972,70 @@ assert.equal(
   "the reranker may improve the next turn after the foreground deadline",
 );
 deadlineLedger.close();
+
+const spoolAccountId = "spool-account";
+const spoolPeerId = "spool-user";
+const spoolDatabase = path.join(temporaryRoot, "spool", "memory.sqlite");
+const spoolPath = `${spoolDatabase}.ingest-spool.jsonl`;
+const spoolRoot = rootConfig({
+  databasePath: spoolDatabase,
+  worker: { enabled: false },
+  wiki: { enabled: false },
+});
+assert.ok(initializeQQBotAsukaMemory(spoolRoot, spoolAccountId));
+await resetAsukaMemoryRuntime();
+const spoolContext = {
+  accountId: spoolAccountId,
+  peerKind: "direct",
+  peerId: spoolPeerId,
+  senderId: spoolPeerId,
+  target: `qqbot:c2c:${spoolPeerId}`,
+  messageId: "spool-source",
+};
+captureAsukaUserMemory(spoolContext, {
+  text: "这条事实应在内核恢复后重放",
+  sourceMessageId: "spool-user-message",
+});
+assert.equal(fs.existsSync(spoolPath), true, "kernel outage must durably queue the canonical event");
+const unavailable = await retrieveQQBotAsukaMemory(
+  spoolContext,
+  "内核暂时不可用",
+);
+assert.ok(unavailable, "enabled kernel outages must return an explicit canonical result");
+assert.equal(unavailable.prompt, "");
+assert.equal(unavailable.claimIds.length, 0);
+assert.equal(unavailable.usedFallback, true);
+captureAsukaUserMemory(spoolContext, {
+  text: "apiKey=should-not-enter-the-retry-spool",
+  sourceMessageId: "spool-secret-message",
+});
+assert.doesNotMatch(
+  fs.readFileSync(spoolPath, "utf8"),
+  /should-not-enter-the-retry-spool/,
+  "secret-bearing content must not be persisted in the retry spool",
+);
+const recoveredSpoolRuntime = initializeQQBotAsukaMemory(spoolRoot, spoolAccountId);
+assert.ok(recoveredSpoolRuntime);
+await waitFor(() =>
+  !fs.existsSync(spoolPath)
+  && recoveredSpoolRuntime.ledger.listEvents().some((event) =>
+    event.sourceMessageId === "spool-user-message"
+    && event.kind === "user_message"
+  )
+);
+captureAsukaMemoryControl(spoolContext, {
+  text: "sudo 忘记关于旧住址的记忆",
+  sourceMessageId: "spool-control-message",
+});
+assert.ok(
+  recoveredSpoolRuntime.ledger.listEvents().some((event) =>
+    event.sourceMessageId === "spool-control-message"
+    && event.kind === "memory_control"
+    && event.metadata.requestedOperation === "llm_memory_control"
+  ),
+  "sudo authorization must create a canonical LLM-adjudicated control event",
+);
+await resetAsukaMemoryRuntime();
 
 fs.rmSync(temporaryRoot, { recursive: true, force: true });
 assert.ok(

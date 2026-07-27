@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AsukaPeerContext } from "./asuka-state.js";
 import { makePeerKey } from "./asuka-state.js";
 import { getOpenAICompletionsThinkingParams, resolveQQBotSceneInferenceConfig, type OpenAICompletionsModelConfig } from "./config.js";
@@ -19,6 +19,7 @@ type AsukaMemoryType =
   | "active_thread"
   | "asuka_self_thread"
   | "asuka_self_signal"
+  | "inferred"
   | "explicit";
 
 type AsukaMemorySource = "user_explicit" | "user_inferred" | "assistant_self_thread" | "assistant_self_signal";
@@ -72,6 +73,7 @@ interface AsukaMemoryItem {
   type: AsukaMemoryType;
   text: string;
   source: AsukaMemorySource;
+  epistemicStatus?: "explicit" | "inferred";
   sourceMessageId?: string;
   createdAt: number;
   updatedAt: number;
@@ -284,6 +286,7 @@ export interface AsukaLegacyProjectionScope {
   accountId: string;
   peerKind: "direct" | "group";
   peerId: string;
+  visibility?: "private" | "public";
 }
 
 export interface AsukaLegacyProjectionWriteOptions {
@@ -341,6 +344,24 @@ function projectionSalience(claim: MemoryClaim): number {
   return claim.epistemicStatus === "inferred" ? 6 : 7;
 }
 
+function projectionMemoryId(
+  scope: AsukaLegacyProjectionScope,
+  claimId: string,
+): string {
+  const visibility = scope.visibility
+    ?? (scope.peerKind === "group" ? "public" : "private");
+  const scopeHash = createHash("sha256")
+    .update(JSON.stringify([
+      scope.accountId,
+      scope.peerKind,
+      scope.peerId,
+      visibility,
+    ]))
+    .digest("hex")
+    .slice(0, 16);
+  return `v15:${scopeHash}:${claimId}`;
+}
+
 export function writeAsukaLegacyMemoryProjection(
   scope: AsukaLegacyProjectionScope,
   snapshot: MemoryProjectionSnapshot,
@@ -349,8 +370,13 @@ export function writeAsukaLegacyMemoryProjection(
   const memoryFile = path.resolve(options.memoryFile ?? MEMORY_FILE);
   const state = readProjectionTarget(memoryFile);
   const peerKey = makePeerKey(scope);
+  const visibility = scope.visibility
+    ?? (scope.peerKind === "group" ? "public" : "private");
   const claims = [...snapshot.claims, ...snapshot.history]
-    .filter((claim) => claim.identityId === scope.identityId);
+    .filter((claim) =>
+      claim.identityId === scope.identityId
+      && claim.visibility === visibility
+    );
   const successorByClaimId = new Map<string, string>();
   for (const claim of claims) {
     if (claim.supersedesClaimId) {
@@ -374,17 +400,19 @@ export function writeAsukaLegacyMemoryProjection(
     if (!text) continue;
     const status = projectionMemoryStatus(claim);
     const successor = successorByClaimId.get(claim.claimId);
-    state.memories[claim.claimId] = {
-      id: claim.claimId,
+    const memoryId = projectionMemoryId(scope, claim.claimId);
+    state.memories[memoryId] = {
+      id: memoryId,
       accountId: scope.accountId,
       peerKey,
       peerKind: scope.peerKind,
       peerId: scope.peerId,
-      type: "explicit",
+      type: claim.epistemicStatus === "inferred" ? "inferred" : "explicit",
       text: text.length > MAX_MEMORY_TEXT_LENGTH
         ? `${text.slice(0, MAX_MEMORY_TEXT_LENGTH).trimEnd()}...`
         : text,
       source: projectionMemorySource(claim),
+      epistemicStatus: claim.epistemicStatus,
       sourceMessageId: claim.sourceEventId,
       createdAt: claim.createdAt,
       updatedAt: claim.updatedAt,
@@ -396,7 +424,9 @@ export function writeAsukaLegacyMemoryProjection(
       userMemoryEvidence: `v1.5 root=${claim.rootClaimId}`,
       extractionVersion: 2,
       status,
-      supersededBy: status === "superseded" ? successor : undefined,
+      supersededBy: status === "superseded" && successor
+        ? projectionMemoryId(scope, successor)
+        : undefined,
       supersededAt: status === "superseded" ? claim.updatedAt : undefined,
       forgottenAt: status === "forgotten" ? claim.updatedAt : undefined,
     };
@@ -1663,7 +1693,11 @@ function hasTokenOverlap(text: string, queryTokens: Set<string>): boolean {
 }
 
 function isStablePromptMemory(item: AsukaMemoryItem): boolean {
-  return item.type === "user_profile" || item.type === "boundary" || item.type === "preference" || item.type === "explicit";
+  return item.type === "user_profile"
+    || item.type === "boundary"
+    || item.type === "preference"
+    || item.type === "explicit"
+    || item.type === "inferred";
 }
 
 function shouldIncludeMemoryInPrompt(item: AsukaMemoryItem, queryTokens: Set<string>, now: number): boolean {
@@ -1716,6 +1750,9 @@ function formatSelfSignalMemoryGroup(title: string, items: AsukaMemoryItem[], li
 
 function formatMemoryFlags(item: AsukaMemoryItem): string {
   const flags: string[] = [];
+  if (item.epistemicStatus === "inferred" || item.type === "inferred") {
+    flags.push("推断");
+  }
   if (item.importance === "important") flags.push("重要");
   if (item.temporary) flags.push("临时");
   return flags.length > 0 ? `（${flags.join("，")}）` : "";
@@ -1821,7 +1858,11 @@ function formatListReply(memories: AsukaMemoryItem[]): string {
     })
     .slice(0, MAX_LIST_MEMORIES);
 
-  const profile = sorted.filter((item) => item.type === "user_profile" || item.type === "explicit");
+  const profile = sorted.filter((item) =>
+    item.type === "user_profile"
+    || item.type === "explicit"
+    || item.type === "inferred"
+  );
   const preferences = sorted.filter((item) => item.type === "preference" || item.type === "boundary");
   const relationship = sorted.filter((item) => item.type === "relationship");
   const active = sorted.filter((item) => item.type === "active_thread" || item.type === "asuka_self_thread");
@@ -2047,7 +2088,13 @@ export function buildAsukaLongTermMemoryPrompt(
     return "";
   }
 
-  const userFacts = memories.filter((item) => item.type === "user_profile" || item.type === "boundary" || item.type === "preference" || item.type === "explicit");
+  const userFacts = memories.filter((item) =>
+    item.type === "user_profile"
+    || item.type === "boundary"
+    || item.type === "preference"
+    || item.type === "explicit"
+    || item.type === "inferred"
+  );
   const relationship = memories.filter((item) => item.type === "relationship");
   const active = memories.filter((item) => item.type === "active_thread");
   const selfThreads = memories.filter((item) => item.type === "asuka_self_thread");

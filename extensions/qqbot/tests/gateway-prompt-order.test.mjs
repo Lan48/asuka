@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const source = fs.readFileSync(path.join(process.cwd(), "src", "gateway.ts"), "utf-8");
+const indexSource = fs.readFileSync(path.join(process.cwd(), "index.ts"), "utf-8");
 const outboundSource = fs.readFileSync(path.join(process.cwd(), "src", "outbound.ts"), "utf-8");
 const configSource = fs.readFileSync(path.join(process.cwd(), "src", "config.ts"), "utf-8");
 const asukaStateSource = fs.readFileSync(path.join(process.cwd(), "src", "asuka-state.ts"), "utf-8");
@@ -27,6 +28,27 @@ assert.ok(dynamicIndex >= 0, "gateway should build a dynamic context section");
 assert.ok(agentBodyIndex >= 0, "gateway should assemble agentBody explicitly");
 assert.ok(ctxPayloadIndex >= 0, "gateway should assemble ctxPayload explicitly");
 assert.ok(stableIndex < dynamicIndex, "stable prompt section should be constructed before dynamic context");
+assert.match(
+  indexSource,
+  /gateway_stop[\s\S]{0,300}await shutdownAsukaMemoryRuntime\(\)/,
+  "gateway shutdown must flush and close the canonical memory runtime",
+);
+const assistantMemoryCapture = requiredSlice(
+  source,
+  "assistant memory capture",
+  "captureAsukaAssistantMemory(asukaPeerContext",
+  "appendGatewayDiagnosticLine(account.accountId, `deliver postprocess parse-promises",
+);
+assert.match(
+  assistantMemoryCapture,
+  /sourceMessageId:\s*`qqbot-delivery:\$\{account\.accountId\}:\$\{event\.messageId\}`/,
+  "assistant evidence must use a delivery ID instead of the inbound user message ID",
+);
+assert.match(
+  assistantMemoryCapture,
+  /replyToMessageId:\s*event\.messageId/,
+  "assistant evidence must retain the inbound message only as an explicit reply relation",
+);
 assert.ok(
   source.includes("当前场景是两个人正在私聊，不是在写第三人称故事或摘要"),
   "private chat persona should softly anchor replies as direct two-person conversation"
@@ -117,10 +139,22 @@ for (const [label, text] of [["gateway", source], ["outbound", outboundSource]])
     /buildStudioMediaApiUrlCandidates\(config\.baseUrl,\s*"images\/generations"\)/,
     `${label} Studio Media fallback should use xmapi's documented image generation endpoint candidates`
   );
+  const studioUrlBuilder = requiredSlice(text, label, "function buildStudioMediaApiUrl", "function buildStudioMediaApiUrlCandidates");
+  assert.ok(
+    studioUrlBuilder.includes('if (/(?:\\/studio)?\\/v1$/i.test(base))') &&
+      studioUrlBuilder.includes('xmapi\\.cc') &&
+      studioUrlBuilder.includes('return `${base}/v1/${path}`'),
+    `${label} Studio Media URL builder should preserve configured v1 bases and add v1 once for bare xmapi hosts`
+  );
+  const referenceSupport = requiredSlice(text, label, "function getStudioMediaReferenceImageField", "function buildStudioMediaApiUrl");
+  assert.ok(
+    referenceSupport.includes("xmapi\\.cc") && referenceSupport.includes('? "image" : "image_url"'),
+    `${label} Studio Media fallback should use xmapi's verified image reference field`
+  );
   assert.match(
     text,
-    /const requestBody = JSON\.stringify\([\s\S]{0,700}image_url:\s*buildImageDataUrlFromFile\(referenceImagePath\)[\s\S]{0,900}"Content-Type":\s*"application\/json"/,
-    `${label} Studio Media fallback should send the reference image as JSON image_url`
+    /requestPayload\[getStudioMediaReferenceImageField\(config\)\] = buildImageDataUrlFromFile\(referenceImagePath\)/,
+    `${label} Studio Media fallback should embed the reference image with the provider-specific field`
   );
   assert.doesNotMatch(
     text,
@@ -164,8 +198,19 @@ for (const [label, text] of [["gateway", source], ["outbound", outboundSource]])
 }
 assert.match(
   source.slice(source.indexOf("const runDirectSelfieFlow = async"), source.indexOf("const sendDirectMediaPayload")),
-  /preferOfficialImageGeneration[\s\S]*officialImageConfigured[\s\S]*if \(preferOfficialImageGeneration\)[\s\S]*generateOfficialOpenClawImageDataUrl[\s\S]*falling back to Studio-compatible path/,
-  "direct selfie flow should prefer official OpenClaw image generation before Studio-compatible fallback"
+  /preferOfficialImageGeneration[\s\S]*if \(preferOfficialImageGeneration\)[\s\S]*generateOfficialOpenClawImageDataUrl[\s\S]*OpenClaw official selfie image generation failed, falling back to Studio-compatible path[\s\S]*generateStudioSelfieImageUrl/,
+  "direct selfie flow should prefer official OpenClaw generation and retain Studio as fallback"
+);
+const directSelfieFlow = source.slice(source.indexOf("const runDirectSelfieFlow = async"), source.indexOf("const sendDirectMediaPayload"));
+assert.match(
+  directSelfieFlow,
+  /sendFallbackSelfieImage[\s\S]*Selfie fallback identity image sent/,
+  "direct selfie flow should use the identity image only after generation paths fail"
+);
+assert.match(
+  directSelfieFlow,
+  /Direct selfie flow failed:[\s\S]*sendFallbackSelfieImage/,
+  "direct selfie failures should fall back to the identity image after both real generation paths fail"
 );
 assert.match(
   source.slice(source.indexOf("export function resolveDirectSelfieRuntimeConfig"), source.indexOf("const SELFIE_IDENTITY_LOCK_PROMPT")),
@@ -527,8 +572,13 @@ assert.ok(directSelfiePromptBuilderIndex >= 0, "gateway should define direct sel
 const directSelfiePromptBuilder = source.slice(directSelfiePromptBuilderIndex, directSelfiePromptBuilderIndex + 2600);
 assert.match(
   directSelfiePromptBuilder,
-  /formatSelfiePromptContextSection\("最近一周对话", context\.recentChatTranscript[\s\S]{0,520}formatSelfiePromptContextSection\("关系与场景状态", context\.asukaStatePrompt[\s\S]{0,520}formatSelfiePromptContextSection\("会话摘要", context\.asukaConversationDigestPrompt[\s\S]{0,760}formatSelfiePromptContextSection\("当前轮次", context\.currentTurnContext/,
-  "direct selfie prompt should serialize conversation transcript, state, digest, and current turn sections"
+  /recentContext \? `最近对话摘要：[\s\S]{0,520}formatSelfiePromptContextSection\("关系与场景状态", context\.asukaStatePrompt[\s\S]{0,760}formatSelfiePromptContextSection\("模型生成的生图意图", context\.modelSelfiePrompt/,
+  "direct selfie prompt should keep the recent visual scene, state, and explicit model image intent"
+);
+assert.doesNotMatch(
+  directSelfiePromptBuilder,
+  /context\.recentChatTranscript|context\.asukaMemoryPrompt|context\.asukaConversationDigestPrompt|context\.currentTurnContext/,
+  "direct selfie prompt should not copy broad weekly, durable-memory, digest, or full-turn context that can contaminate image safety"
 );
 assert.match(
   directSelfiePromptBuilder,
@@ -666,8 +716,8 @@ assert.match(
   "cron image delivery should define the same summer wardrobe strategy"
 );
 assert.match(
-  outboundSource,
-  /function buildCronSelfiePrompt[\s\S]{0,1600}loadAsukaVisualIdentityAnchor\(\)[\s\S]{0,160}SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT/,
+  cronSelfiePromptSlice,
+  /loadAsukaVisualIdentityAnchor\(\)[\s\S]{0,160}SELFIE_SUMMER_WARDROBE_STRATEGY_PROMPT/,
   "cron image prompts should include the summer wardrobe strategy after the visual identity anchor"
 );
 assert.ok(

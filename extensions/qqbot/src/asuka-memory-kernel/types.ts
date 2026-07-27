@@ -106,6 +106,25 @@ export interface IdentityLinkInput {
   visibility?: MemoryVisibility;
 }
 
+export interface IdentityLink extends Omit<IdentityLinkInput, "visibility"> {
+  visibility: MemoryVisibility;
+}
+
+export interface LegacyProjectionTask extends IdentityLink {
+  revision: number;
+  attempts: number;
+  lastError?: string;
+  requestedAt: number;
+  lastAttemptAt?: number;
+}
+
+export interface LegacyProjectionStatus {
+  degraded: boolean;
+  pendingCount: number;
+  failedCount: number;
+  lastError?: string;
+}
+
 export interface ClaimProposal {
   semanticKey?: string;
   subjectId: string;
