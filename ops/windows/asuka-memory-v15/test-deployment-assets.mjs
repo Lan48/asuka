@@ -929,6 +929,7 @@ try {
   ]) {
     run(process.execPath, ["--check", path.join(opsRoot, script)]);
   }
+  run(process.execPath, [path.join(opsRoot, "test-deployment-review-gates.mjs")]);
 
   const parser = process.platform === "win32"
     ? ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
