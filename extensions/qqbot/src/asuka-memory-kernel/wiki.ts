@@ -38,6 +38,16 @@ interface WikiOverrideImportOptions {
   identityId?: string;
 }
 
+interface ManualBlocks {
+  notes: string;
+  overrides: string;
+}
+
+const EMPTY_MANUAL_BLOCKS: ManualBlocks = {
+  notes: "\n\n",
+  overrides: "\n\n",
+};
+
 function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -48,6 +58,7 @@ function yamlScalar(value: string): string {
 
 function escapeTable(value: string): string {
   return value
+    .replace(/\]/g, "\\]")
     .replace(/\|/g, "\\|")
     .replace(/\r?\n/g, " ")
     .trim();
@@ -89,18 +100,63 @@ function atomicWrite(file: string, content: string): boolean {
   return true;
 }
 
-function extractBlock(content: string, startMarker: string, endMarker: string): string {
-  const start = content.indexOf(startMarker);
-  const end = content.indexOf(endMarker);
-  if (start < 0 || end < start) return "";
-  return content.slice(start + startMarker.length, end).trim();
+function markerLines(content: string): Array<{ value: string; start: number }> {
+  const lines: Array<{ value: string; start: number }> = [];
+  let start = 0;
+  while (start <= content.length) {
+    const newline = content.indexOf("\n", start);
+    const end = newline < 0 ? content.length : newline;
+    const valueEnd = end > start && content[end - 1] === "\r" ? end - 1 : end;
+    lines.push({ value: content.slice(start, valueEnd), start });
+    if (newline < 0) break;
+    start = newline + 1;
+  }
+  return lines;
 }
 
-function manualBlocks(current: string): { notes: string; overrides: string } {
+function parseManualBlocks(content: string, file: string): ManualBlocks {
+  const markers = [NOTES_START, NOTES_END, OVERRIDES_START, OVERRIDES_END];
+  const positions = new Map<string, number[]>(
+    markers.map((marker) => [marker, []]),
+  );
+  for (const line of markerLines(content)) {
+    const marker = markers.find((candidate) => line.value === candidate);
+    if (marker) {
+      positions.get(marker)!.push(line.start);
+      continue;
+    }
+    if (/<!--\s*ASUKA_MEMORY_(?:NOTES|OVERRIDES)/.test(line.value)) {
+      throw new Error(`Invalid manual marker in ${file}: partial or non-standalone marker`);
+    }
+  }
+  for (const marker of markers) {
+    if (positions.get(marker)!.length !== 1) {
+      throw new Error(`Invalid manual marker in ${file}: expected exactly one ${marker}`);
+    }
+  }
+  const notesStart = positions.get(NOTES_START)![0];
+  const notesEnd = positions.get(NOTES_END)![0];
+  const overridesStart = positions.get(OVERRIDES_START)![0];
+  const overridesEnd = positions.get(OVERRIDES_END)![0];
+  if (!(notesStart < notesEnd && notesEnd < overridesStart && overridesStart < overridesEnd)) {
+    throw new Error(`Invalid manual marker order in ${file}`);
+  }
   return {
-    notes: extractBlock(current, NOTES_START, NOTES_END),
-    overrides: extractBlock(current, OVERRIDES_START, OVERRIDES_END),
+    notes: content.slice(notesStart + NOTES_START.length, notesEnd),
+    overrides: content.slice(overridesStart + OVERRIDES_START.length, overridesEnd),
   };
+}
+
+function hasStandaloneMarker(content: string, marker: string): boolean {
+  return markerLines(content).some((line) => line.value === marker);
+}
+
+function readExistingWikiPage(file: string): ManualBlocks {
+  const content = fs.readFileSync(file, "utf8");
+  if (!hasStandaloneMarker(content, GENERATED_MARKER)) {
+    throw new Error(`Invalid manual marker ownership in ${file}: generated marker is missing`);
+  }
+  return parseManualBlocks(content, file);
 }
 
 function topicKey(claim: MemoryClaim): string {
@@ -149,7 +205,7 @@ function renderClaimEntries(
       `- Confidence: ${claim.confidence}`,
       `- Epistemic / type: ${claim.epistemicStatus} / ${claim.topLevelType}`,
       `- Predicate / value: ${inlineText(claim.predicate)} / ${inlineText(valueText(claim.value))}`,
-      `- Validity: ${claim.validFrom ? new Date(claim.validFrom).toISOString() : "open"} to ${claim.validTo ? new Date(claim.validTo).toISOString() : "open"}`,
+      `- Validity: ${claim.validFrom !== undefined ? new Date(claim.validFrom).toISOString() : "open"} to ${claim.validTo !== undefined ? new Date(claim.validTo).toISOString() : "open"}`,
       `- rootClaimId: ${claim.rootClaimId}`,
       `- supersedesClaimId: ${claim.supersedesClaimId ?? "none"}`,
       `- Source event: ${claim.sourceEventId}`,
@@ -170,10 +226,9 @@ function renderTopicPage(
   claims: MemoryClaim[],
   claimEvidence: MemoryProjectionClaimEvidence[],
   eventsById: ReadonlyMap<string, MemoryProjectionEventSummary>,
-  currentContent: string,
+  blocks: ManualBlocks,
   updatedAt: number,
 ): string {
-  const blocks = manualBlocks(currentContent);
   const active = claims.filter((claim) => claim.state === "active");
   const history = claims.filter((claim) => claim.state !== "active");
   return [
@@ -189,7 +244,7 @@ function renderTopicPage(
     "",
     GENERATED_MARKER,
     "",
-    `# ${topic}`,
+    `# ${inlineText(topic)}`,
     "",
     GENERATED_START,
     "",
@@ -205,15 +260,11 @@ function renderTopicPage(
     "",
     "## Notes",
     "",
-    NOTES_START,
-    blocks.notes,
-    NOTES_END,
+    `${NOTES_START}${blocks.notes}${NOTES_END}`,
     "",
     "## Corrections / Overrides",
     "",
-    OVERRIDES_START,
-    blocks.overrides,
-    OVERRIDES_END,
+    `${OVERRIDES_START}${blocks.overrides}${OVERRIDES_END}`,
     "",
   ].join("\n");
 }
@@ -221,10 +272,9 @@ function renderTopicPage(
 function renderIndex(
   title: string,
   pages: Array<{ topic: string; relativePath: string; active: number; history: number }>,
-  currentContent: string,
+  blocks: ManualBlocks,
   updatedAt: number,
 ): string {
-  const blocks = manualBlocks(currentContent);
   const rows = pages
     .sort((a, b) => a.topic.localeCompare(b.topic))
     .map((page) =>
@@ -244,7 +294,7 @@ function renderIndex(
     "",
     GENERATED_MARKER,
     "",
-    `# ${title}`,
+    `# ${inlineText(title)}`,
     "",
     GENERATED_START,
     "",
@@ -256,15 +306,11 @@ function renderIndex(
     "",
     "## Notes",
     "",
-    NOTES_START,
-    blocks.notes,
-    NOTES_END,
+    `${NOTES_START}${blocks.notes}${NOTES_END}`,
     "",
     "## Corrections / Overrides",
     "",
-    OVERRIDES_START,
-    blocks.overrides,
-    OVERRIDES_END,
+    `${OVERRIDES_START}${blocks.overrides}${OVERRIDES_END}`,
     "",
   ].join("\n");
 }
@@ -274,7 +320,7 @@ function generatedMarkdownFiles(directory: string): string[] {
   return fs.readdirSync(directory, { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
     .map((entry) => path.join(directory, entry.name))
-    .filter((file) => fs.readFileSync(file, "utf8").includes(GENERATED_MARKER));
+    .filter((file) => hasStandaloneMarker(fs.readFileSync(file, "utf8"), GENERATED_MARKER));
 }
 
 export function projectMemoryWiki(
@@ -283,7 +329,6 @@ export function projectMemoryWiki(
 ): WikiProjectionResult {
   const memoryRoot = path.resolve(options.memoryRoot);
   const entitiesDirectory = path.join(memoryRoot, "entities");
-  fs.mkdirSync(entitiesDirectory, { recursive: true });
   const claims = [...snapshot.claims, ...snapshot.history];
   const projectionUpdatedAt = claims.reduce(
     (latest, claim) => Math.max(latest, claim.updatedAt),
@@ -304,29 +349,31 @@ export function projectMemoryWiki(
   const removedFiles: string[] = [];
   const expectedEntityFiles = new Set<string>();
   const pages: Array<{ topic: string; relativePath: string; active: number; history: number }> = [];
+  const topicPages: Array<{
+    topic: string;
+    claims: MemoryClaim[];
+    file: string;
+    updatedAt: number;
+    blocks: ManualBlocks;
+  }> = [];
   for (const [topic, topicClaims] of grouped) {
     if (topicClaims.length === 0) continue;
     const relativePath = path.posix.join("entities", `${safeSlug(topic)}.md`);
     const file = path.join(memoryRoot, ...relativePath.split("/"));
     expectedEntityFiles.add(path.resolve(file));
-    const current = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
     const topicUpdatedAt = topicClaims.reduce(
       (latest, claim) => Math.max(latest, claim.updatedAt),
-      projectionUpdatedAt,
+      0,
     );
-    if (atomicWrite(
+    topicPages.push({
+      topic,
+      claims: topicClaims,
       file,
-      renderTopicPage(
-        topic,
-        topicClaims,
-        snapshot.claimEvidence,
-        eventsById,
-        current,
-        topicUpdatedAt,
-      ),
-    )) {
-      changedFiles.push(file);
-    }
+      updatedAt: topicUpdatedAt || projectionUpdatedAt,
+      blocks: fs.existsSync(file)
+        ? readExistingWikiPage(file)
+        : EMPTY_MANUAL_BLOCKS,
+    });
     pages.push({
       topic,
       relativePath,
@@ -335,20 +382,43 @@ export function projectMemoryWiki(
     });
   }
 
-  for (const file of generatedMarkdownFiles(entitiesDirectory)) {
-    if (expectedEntityFiles.has(path.resolve(file))) continue;
-    const current = fs.readFileSync(file, "utf8");
-    const blocks = manualBlocks(current);
-    if (blocks.notes || blocks.overrides) continue;
-    fs.unlinkSync(file);
-    removedFiles.push(file);
-  }
-
+  const stalePages = generatedMarkdownFiles(entitiesDirectory)
+    .filter((file) => !expectedEntityFiles.has(path.resolve(file)))
+    .map((file) => ({ file, blocks: readExistingWikiPage(file) }));
   const indexFile = path.join(memoryRoot, "index.md");
-  const currentIndex = fs.existsSync(indexFile) ? fs.readFileSync(indexFile, "utf8") : "";
+  const indexBlocks = fs.existsSync(indexFile)
+    ? readExistingWikiPage(indexFile)
+    : EMPTY_MANUAL_BLOCKS;
+  const topicWrites = topicPages.map((page) => ({
+    file: page.file,
+    content: renderTopicPage(
+      page.topic,
+      page.claims,
+      snapshot.claimEvidence,
+      eventsById,
+      page.blocks,
+      page.updatedAt,
+    ),
+  }));
+  const indexContent = renderIndex(
+    options.title ?? "Asuka Memory",
+    pages,
+    indexBlocks,
+    projectionUpdatedAt,
+  );
+
+  fs.mkdirSync(entitiesDirectory, { recursive: true });
+  for (const write of topicWrites) {
+    if (atomicWrite(write.file, write.content)) changedFiles.push(write.file);
+  }
+  for (const stale of stalePages) {
+    if (stale.blocks.notes.trim() || stale.blocks.overrides.trim()) continue;
+    fs.unlinkSync(stale.file);
+    removedFiles.push(stale.file);
+  }
   if (atomicWrite(
     indexFile,
-    renderIndex(options.title ?? "Asuka Memory", pages, currentIndex, projectionUpdatedAt),
+    indexContent,
   )) {
     changedFiles.push(indexFile);
   }
@@ -376,7 +446,7 @@ function listWikiMarkdownFiles(memoryRoot: string): string[] {
     }
   };
   visit(memoryRoot);
-  return files;
+  return files.sort((left, right) => left.localeCompare(right));
 }
 
 function overrideEventInput(
@@ -417,14 +487,27 @@ export function importWikiOverrides(
   unchanged: number;
   eventIds: string[];
 } {
+  const pages = listWikiMarkdownFiles(options.memoryRoot)
+    .map((file) => {
+      const content = fs.readFileSync(file, "utf8");
+      if (
+        !hasStandaloneMarker(content, GENERATED_MARKER)
+        && !/<!--\s*ASUKA_MEMORY_(?:NOTES|OVERRIDES)/.test(content)
+      ) {
+        return undefined;
+      }
+      return {
+        file,
+        overrides: parseManualBlocks(content, file).overrides.trim(),
+      };
+    })
+    .filter((page): page is { file: string; overrides: string } => page !== undefined);
   let imported = 0;
   let unchanged = 0;
   const eventIds: string[] = [];
-  for (const file of listWikiMarkdownFiles(options.memoryRoot)) {
-    const content = fs.readFileSync(file, "utf8");
-    const overrides = extractBlock(content, OVERRIDES_START, OVERRIDES_END);
-    if (!overrides) continue;
-    const input = overrideEventInput(file, overrides, options);
+  for (const page of pages) {
+    if (!page.overrides) continue;
+    const input = overrideEventInput(page.file, page.overrides, options);
     const result = engine.applyHumanOverride(input);
     if (!result.receipt) continue;
     eventIds.push(result.receipt.eventId);
