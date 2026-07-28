@@ -52,7 +52,8 @@ node "$build_root/ops/windows/asuka-memory-v15/attest-release-build.mjs" \
 
 The command requires a clean, named linked worktree with no existing QQBot
 `dist`, `node_modules`, or ignored build files. It runs
-`npm ci --ignore-scripts` and `npm test`, then records the built runtime tree.
+`npm ci --ignore-scripts`, the vendored-only QQBot cron patch, and `npm test`,
+then records the built runtime tree.
 
 Next, create the dependency attestation on native `win32/x64`. The Windows
 linked worktree must start clean at the same named branch and commit, with no
@@ -77,9 +78,10 @@ node "$windowsBuildRoot\ops\windows\asuka-memory-v15\attest-release-build.mjs" `
   --output "$attestationRoot\windows-dependencies.json"
 ```
 
-This command runs `npm ci --ignore-scripts` and records the complete Windows
-`node_modules` tree. Copy `windows-dependencies.json` back beside `build.json`
-without editing either file.
+This command runs `npm ci --ignore-scripts`, applies only the vendored QQBot
+cron patch, and records the complete Windows `node_modules` tree. Copy
+`windows-dependencies.json` back beside `build.json` without editing either
+file.
 
 Generate the release from the same local linked worktree:
 

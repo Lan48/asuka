@@ -316,8 +316,9 @@ export function getInstalledOpenClawBundlePaths(options = {}) {
 }
 
 export function runRuntimeCronPatch(options = {}) {
-  const installedRoots = getInstalledOpenClawPackageRoots(options);
-  const installedBundlePaths = getInstalledOpenClawBundlePaths(options);
+  const includeInstalled = options.includeInstalled ?? true;
+  const installedRoots = includeInstalled ? getInstalledOpenClawPackageRoots(options) : [];
+  const installedBundlePaths = includeInstalled ? getInstalledOpenClawBundlePaths(options) : [];
   const targets = [
     {
       path: path.join(packageRoot, "node_modules", "clawdbot", "dist", "cron", "isolated-agent", "run.js"),
@@ -351,6 +352,13 @@ export function runRuntimeCronPatch(options = {}) {
   return results;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runRuntimeCronPatch();
+if (
+  process.argv[1]
+  && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))
+) {
+  const args = process.argv.slice(2);
+  if (args.some((arg) => arg !== "--vendored-only") || args.length > 1) {
+    throw new Error("usage: patch-runtime-cron.mjs [--vendored-only]");
+  }
+  runRuntimeCronPatch({ includeInstalled: !args.includes("--vendored-only") });
 }

@@ -158,6 +158,9 @@ try {
     [
       'import fs from "node:fs";',
       'import path from "node:path";',
+      'if (!fs.existsSync(path.resolve("node_modules", ".vendored-cron-patched"))) {',
+      '  throw new Error("vendored cron patch must run before tests");',
+      "}",
       'const root = path.resolve("dist");',
       'fs.mkdirSync(path.join(root, "src", "asuka-memory-kernel"), { recursive: true });',
       'fs.writeFileSync(path.join(root, "index.js"), "export {};\\n");',
@@ -166,6 +169,19 @@ try {
       '  path.join(root, "src", "asuka-memory-kernel", "model-client.js"),',
       '  "export {};\\n",',
       ");",
+      "",
+    ].join("\n"),
+  );
+  write(
+    "scripts/patch-runtime-cron.mjs",
+    [
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      'if (process.argv.length !== 3 || process.argv[2] !== "--vendored-only") {',
+      '  throw new Error("fixture patch must be vendored-only");',
+      "}",
+      'fs.mkdirSync(path.resolve("node_modules"), { recursive: true });',
+      'fs.writeFileSync(path.resolve("node_modules", ".vendored-cron-patched"), "ok\\n");',
       "",
     ].join("\n"),
   );
@@ -281,7 +297,10 @@ try {
       npmVersion: buildAttestation.npmVersion,
       lockfilePath: buildAttestation.lockfilePath,
       lockfileSha256: buildAttestation.lockfileSha256,
-      commands: ["npm ci --ignore-scripts"],
+      commands: [
+        "npm ci --ignore-scripts",
+        "node scripts/patch-runtime-cron.mjs --vendored-only",
+      ],
       runtimeDependencyTree: {
         path: "node_modules",
         fileCount: 1,

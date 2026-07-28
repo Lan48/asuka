@@ -17,8 +17,16 @@ const OPTIONAL_RUNTIME_FILES = [
   "README.zh.md",
   "tsconfig.json",
 ];
-const BUILD_COMMANDS = ["npm ci --ignore-scripts", "npm test"];
-const WINDOWS_DEPENDENCY_COMMANDS = ["npm ci --ignore-scripts"];
+const VENDORED_CRON_PATCH_COMMAND = "node scripts/patch-runtime-cron.mjs --vendored-only";
+const BUILD_COMMANDS = [
+  "npm ci --ignore-scripts",
+  VENDORED_CRON_PATCH_COMMAND,
+  "npm test",
+];
+const WINDOWS_DEPENDENCY_COMMANDS = [
+  "npm ci --ignore-scripts",
+  VENDORED_CRON_PATCH_COMMAND,
+];
 const RUNTIME_EXCLUDED_DIRECTORIES = new Set([
   "node_modules",
   "test",

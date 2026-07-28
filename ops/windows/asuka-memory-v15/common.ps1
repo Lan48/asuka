@@ -1061,9 +1061,11 @@ function Read-AsukaManifest {
   }
   $buildCommands = @($buildAttestation.commands)
   if (
-    $buildCommands.Count -ne 2 -or
+    $buildCommands.Count -ne 3 -or
     [string]$buildCommands[0] -cne "npm ci --ignore-scripts" -or
-    [string]$buildCommands[1] -cne "npm test"
+    [string]$buildCommands[1] -cne
+      "node scripts/patch-runtime-cron.mjs --vendored-only" -or
+    [string]$buildCommands[2] -cne "npm test"
   ) {
     throw "Release build attestation has an unexpected command sequence."
   }
@@ -1093,8 +1095,10 @@ function Read-AsukaManifest {
   }
   $dependencyCommands = @($dependencyAttestation.commands)
   if (
-    $dependencyCommands.Count -ne 1 -or
-    [string]$dependencyCommands[0] -cne "npm ci --ignore-scripts"
+    $dependencyCommands.Count -ne 2 -or
+    [string]$dependencyCommands[0] -cne "npm ci --ignore-scripts" -or
+    [string]$dependencyCommands[1] -cne
+      "node scripts/patch-runtime-cron.mjs --vendored-only"
   ) {
     throw "Windows dependency attestation has an unexpected command sequence."
   }

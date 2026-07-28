@@ -17,8 +17,16 @@ const OPTIONAL_RUNTIME_FILES = [
   "README.zh.md",
   "tsconfig.json",
 ];
-const BUILD_COMMANDS = ["npm ci --ignore-scripts", "npm test"];
-const WINDOWS_DEPENDENCY_COMMANDS = ["npm ci --ignore-scripts"];
+const VENDORED_CRON_PATCH_COMMAND = "node scripts/patch-runtime-cron.mjs --vendored-only";
+const BUILD_COMMANDS = [
+  "npm ci --ignore-scripts",
+  VENDORED_CRON_PATCH_COMMAND,
+  "npm test",
+];
+const WINDOWS_DEPENDENCY_COMMANDS = [
+  "npm ci --ignore-scripts",
+  VENDORED_CRON_PATCH_COMMAND,
+];
 const RUNTIME_EXCLUDED_DIRECTORIES = new Set([
   "node_modules",
   "test",
@@ -257,11 +265,20 @@ if (
 ) {
   throw new Error("release build requires canonical Node.js and npm versions");
 }
-const commandArguments = kind === "build"
-  ? [["ci", "--ignore-scripts"], ["test"]]
-  : [["ci", "--ignore-scripts"]];
-for (const args of commandArguments) {
-  execFileSync(process.execPath, [npmCli, ...args], {
+execFileSync(process.execPath, [npmCli, "ci", "--ignore-scripts"], {
+  cwd: qqbotRoot,
+  stdio: "inherit",
+});
+execFileSync(
+  process.execPath,
+  [path.join(qqbotRoot, "scripts", "patch-runtime-cron.mjs"), "--vendored-only"],
+  {
+    cwd: qqbotRoot,
+    stdio: "inherit",
+  },
+);
+if (kind === "build") {
+  execFileSync(process.execPath, [npmCli, "test"], {
     cwd: qqbotRoot,
     stdio: "inherit",
   });
