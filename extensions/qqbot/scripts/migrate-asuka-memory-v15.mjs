@@ -9,6 +9,7 @@ import {
   executeLegacyRejudgements,
   getLegacyRejudgementGate,
   migrateLegacyRecords,
+  sanitizeLegacyMigrationSourcesForReport,
 } from "../dist/src/asuka-memory-kernel/legacy-migration.js";
 import { createOpenAICompatibleMemoryModelClient } from "../dist/src/asuka-memory-kernel/model-client.js";
 
@@ -241,6 +242,7 @@ const sources = {
   sessionsIndexJson: values.get("sessions-index"),
   sessionsDirectory: values.get("sessions-dir"),
 };
+const reportSources = sanitizeLegacyMigrationSourcesForReport(sources);
 const records = collectLegacyMigrationRecords(sources, scope);
 const sourceCounts = {
   memory: 0,
@@ -257,7 +259,7 @@ if (flags.has("dry-run")) {
     mode: "dry-run",
     generatedAt: new Date().toISOString(),
     scope,
-    sources,
+    sources: reportSources,
     sourceCounts,
     discoveredRecords: records.length,
     sourceMap: records.map((record) => ({
@@ -314,7 +316,7 @@ try {
     mode: flags.has("resume") ? "resume" : "migrate",
     database,
     scope,
-    sources,
+    sources: reportSources,
     migration,
     migrationGate,
     rejudgement: execution,

@@ -135,6 +135,8 @@ export interface ClaimProposal {
   epistemicStatus: MemoryEpistemicStatus;
   authority: MemoryAuthority;
   confidence: number;
+  disposition?: "active" | "candidate";
+  rationale?: string;
   action?: "add" | "revise" | "refute" | "forget" | "delete";
   targetClaimId?: string;
   validFrom?: number;
@@ -211,6 +213,8 @@ export interface LegacyConsolidationClaim {
   topLevelType: MemoryTopLevelType;
   epistemicStatus: MemoryEpistemicStatus;
   confidence: number;
+  disposition: "active" | "candidate";
+  rationale: string;
   validFrom?: number;
   validTo?: number;
   topic?: string;
@@ -218,6 +222,93 @@ export interface LegacyConsolidationClaim {
   lifecycle?: "stable" | "bounded" | "episodic" | "working";
   supportingEventIds: string[];
   opposingEventIds: string[];
+}
+
+export interface MemoryReflectionDecision {
+  claimId: string;
+  action: "retain" | "revise" | "refute" | "expire";
+  disposition?: "active" | "candidate";
+  confidence: number;
+  rationale: string;
+  revision?: {
+    value: unknown;
+    canonicalText: string;
+    validFrom?: number;
+    validTo?: number;
+    topic?: string;
+    entityIds?: string[];
+    lifecycle?: "stable" | "bounded" | "episodic" | "working";
+  };
+}
+
+export interface MemoryReflectionResult {
+  decisions: MemoryReflectionDecision[];
+}
+
+export interface MemoryEmbeddingHealth {
+  required: boolean;
+  ready: boolean;
+  model?: string;
+  dimensions?: number;
+  reason?: string;
+}
+
+export interface LegacySourceArchiveChunk {
+  index: number;
+  startChar: number;
+  endChar: number;
+  contentHash: string;
+  content: string;
+}
+
+export interface LegacySourceArchiveInspection {
+  eventId: string;
+  contentHash: string;
+  content: string;
+  contentChars: number;
+  coveredChars: number;
+  chunkCount: number;
+  manifestHash: string;
+  complete: boolean;
+  chunks: LegacySourceArchiveChunk[];
+}
+
+export interface LegacySourceArchive extends LegacySourceArchiveInspection {
+  complete: true;
+}
+
+export type LegacyMigrationDisposition =
+  | "imported"
+  | "audited_non_import"
+  | "redacted";
+
+export interface LegacyMigrationSourceLocator {
+  sourceId?: string;
+  sourcePath?: string;
+  sourceRecordId?: string;
+}
+
+export interface LegacyMigrationBinding {
+  eventId: string;
+  identityId: string;
+  accountId: string;
+  peerKind: MemoryPeerKind;
+  peerId: string;
+  visibility: MemoryVisibility;
+  sourceKind: string;
+  sourceLocator: LegacyMigrationSourceLocator;
+  contentHash: string;
+  contentChars: number;
+  chunkCount: number;
+  manifestHash: string;
+  disposition: LegacyMigrationDisposition;
+  createdAt: number;
+}
+
+export interface LegacyMigrationBindingVerification {
+  binding: LegacyMigrationBinding;
+  valid: boolean;
+  errors: string[];
 }
 
 export interface LegacyConsolidationDiscard {
@@ -229,6 +320,7 @@ export type LegacyConsolidationStatus = "running" | "completed" | "failed";
 
 export interface LegacyConsolidationRun {
   runId: string;
+  runToken: string;
   identityId: string;
   visibility: MemoryVisibility;
   inputHash: string;
@@ -253,14 +345,21 @@ export interface MemoryJob {
   attempts: number;
   availableAt: number;
   leaseUntil?: number;
+  leaseToken?: string;
   lastError?: string;
   createdAt: number;
   updatedAt: number;
 }
 
+export interface MemoryJobFailureResult {
+  applied: boolean;
+  terminal: boolean;
+}
+
 export interface MemorySearchCandidate {
   claim: MemoryClaim;
   lexicalScore: number;
+  exactLexicalMatch: boolean;
   vectorScore: number;
   recencyScore: number;
   authorityScore: number;
@@ -323,7 +422,12 @@ export interface MemoryEngineOptions {
   judgementTimeoutMs?: number;
   rerankDeadlineMs?: number;
   rerankTaskTimeoutMs?: number;
-  inferencePromotionConfidence?: number;
+  requireEmbeddings?: boolean;
+  maxJudgementProposals?: number;
+  autoReflection?: boolean;
+  reflectionIntervalMs?: number;
+  reflectionBatchSize?: number;
+  reflectionEventDelayMs?: number;
   maxJobAttempts?: number;
   legacyExtractionMaxInputChars?: number;
   legacyExtractionMaxProposals?: number;

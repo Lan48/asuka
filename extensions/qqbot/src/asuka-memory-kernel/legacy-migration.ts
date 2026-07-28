@@ -5,13 +5,19 @@ import {
   legacyConsolidationInputHash,
   type AsukaMemoryEngine,
 } from "./engine.js";
+import { containsDeterministicSecretValue } from "./policy.js";
 import type {
   MemoryActor,
   MemoryEventInput,
   MemoryJobBatchResult,
+  LegacyMigrationBindingVerification,
   MemoryPeerKind,
   MemoryTopLevelType,
 } from "./types.js";
+
+const LEGACY_SOURCE_MAX_NODES = 10_000;
+const LEGACY_SOURCE_MAX_DEPTH = 128;
+const LEGACY_LOCATOR_HASH_DOMAIN = "asuka-legacy-locator-v1";
 
 export interface LegacyMigrationScope {
   accountId: string;
@@ -83,16 +89,105 @@ function isAuditedNonImport(value: unknown): boolean {
 
 class LegacyContentHashMismatchError extends Error {}
 
+class LegacySourceLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LegacySourceLimitError";
+  }
+}
+
 function stableJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableJsonValue);
-  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([, item]) => item !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, item]) => [key, stableJsonValue(item)]),
-  );
+  const normalizeScalar = (item: unknown): unknown =>
+    typeof item === "string" ? item.replace(/\s+/g, " ").trim() : item;
+  if (!value || typeof value !== "object") return normalizeScalar(value);
+
+  type Container = unknown[] | Record<string, unknown>;
+  interface Frame {
+    source: Container;
+    target: Container;
+    keys?: string[];
+    index: number;
+    depth: number;
+  }
+
+  const seen = new WeakSet<object>();
+  let scheduled = 1;
+  const prepareFrame = (
+    source: Container,
+    target: Container,
+    depth: number,
+  ): Frame => {
+    if (depth > LEGACY_SOURCE_MAX_DEPTH) {
+      throw new LegacySourceLimitError(
+        `legacy source canonicalization exceeds depth limit ${LEGACY_SOURCE_MAX_DEPTH}`,
+      );
+    }
+    let keys: string[] | undefined;
+    let childCount: number;
+    try {
+      if (Array.isArray(source)) {
+        childCount = source.length;
+      } else {
+        keys = Object.keys(source)
+          .filter((key) => source[key] !== undefined)
+          .sort((left, right) => left.localeCompare(right));
+        childCount = keys.length;
+      }
+    } catch {
+      throw new LegacySourceLimitError(
+        "legacy source canonicalization cannot enumerate source values",
+      );
+    }
+    if (childCount > LEGACY_SOURCE_MAX_NODES - scheduled) {
+      throw new LegacySourceLimitError(
+        `legacy source canonicalization exceeds node limit ${LEGACY_SOURCE_MAX_NODES}`,
+      );
+    }
+    scheduled += childCount;
+    return { source, target, keys, index: 0, depth };
+  };
+
+  const root: Container = Array.isArray(value) ? new Array(value.length) : {};
+  seen.add(value);
+  const stack: Frame[] = [
+    prepareFrame(value as Container, root, 0),
+  ];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const childCount = Array.isArray(frame.source)
+      ? frame.source.length
+      : frame.keys!.length;
+    if (frame.index >= childCount) {
+      stack.pop();
+      continue;
+    }
+    const sourceKey = Array.isArray(frame.source)
+      ? frame.index
+      : frame.keys![frame.index];
+    frame.index += 1;
+    let item: unknown;
+    try {
+      item = frame.source[sourceKey as never];
+    } catch {
+      throw new LegacySourceLimitError(
+        "legacy source canonicalization cannot read source values",
+      );
+    }
+    if (!item || typeof item !== "object") {
+      frame.target[sourceKey as never] = normalizeScalar(item) as never;
+      continue;
+    }
+    if (seen.has(item)) {
+      throw new LegacySourceLimitError(
+        "legacy source canonicalization cannot process circular references",
+      );
+    }
+    seen.add(item);
+    const target: Container = Array.isArray(item) ? new Array(item.length) : {};
+    frame.target[sourceKey as never] = target as never;
+    stack.push(prepareFrame(item as Container, target, frame.depth + 1));
+  }
+  return root;
 }
 
 function legacyContentHash(input: {
@@ -103,21 +198,27 @@ function legacyContentHash(input: {
   metadata: Record<string, unknown>;
   provisional?: LegacyMigrationRecord["provisional"];
 }): string {
-  const material = input.sourceContent === undefined
-    ? {
-      sourceKind: input.sourceKind,
-      actor: input.actor,
-      text: input.text.replace(/\s+/g, " ").trim(),
-      metadata: input.metadata,
-      provisional: input.provisional,
-    }
-    : {
-      sourceKind: input.sourceKind,
-      sourceContent: input.sourceContent,
-    };
   return createHash("sha256")
-    .update(JSON.stringify(stableJsonValue(material)))
+    .update(legacyArchiveContent(input))
     .digest("hex");
+}
+
+function legacyArchiveContent(input: {
+  sourceKind: LegacyMigrationRecord["sourceKind"];
+  actor: MemoryActor;
+  text: string;
+  sourceContent?: string;
+  metadata: Record<string, unknown>;
+  provisional?: LegacyMigrationRecord["provisional"];
+}): string {
+  if (input.sourceContent !== undefined) return input.sourceContent;
+  return JSON.stringify(stableJsonValue({
+    sourceKind: input.sourceKind,
+    actor: input.actor,
+    text: input.text.replace(/\s+/g, " ").trim(),
+    metadata: input.metadata,
+    provisional: input.provisional,
+  }));
 }
 
 function storedLegacyContentHash(event: ReturnType<AsukaMemoryEngine["ledger"]["getEvent"]>): string | undefined {
@@ -207,6 +308,10 @@ export interface LegacyRejudgementGate {
   coverage: {
     sourceEvents: number;
     coveredSourceEvents: number;
+    archivedSourceEvents: number;
+    completeSourceArchives: number;
+    redactedSourceEvents: number;
+    completeRedactions: number;
   };
   claims: {
     provisionalOpen: number;
@@ -241,12 +346,16 @@ export interface LegacyRejudgementExecutionReport {
 
 function readJson(file: string | undefined): unknown {
   if (!file) return undefined;
-  if (!fs.existsSync(file)) throw new Error(`legacy source does not exist: ${file}`);
+  const safeFile = sanitizeLegacyLocator(file, "source-path");
+  if (!fs.existsSync(file)) throw new Error(`legacy source does not exist: ${safeFile}`);
   try {
     return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`cannot parse legacy JSON source ${file}: ${detail}`);
+    const safeDetail = containsDeterministicSecretValue(detail)
+      ? "sensitive detail omitted"
+      : detail.split(file).join(safeFile);
+    throw new Error(`cannot parse legacy JSON source ${safeFile}: ${safeDetail}`);
   }
 }
 
@@ -255,11 +364,9 @@ interface LegacyJsonLine {
   lineNumber: number;
 }
 
-function readJsonLines(file: string | undefined): LegacyJsonLine[] {
-  if (!file) return [];
-  if (!fs.existsSync(file)) throw new Error(`legacy source does not exist: ${file}`);
+function parseJsonLines(file: string, content: string): LegacyJsonLine[] {
   const values: LegacyJsonLine[] = [];
-  for (const [index, rawLine] of fs.readFileSync(file, "utf8").split(/\r?\n/).entries()) {
+  for (const [index, rawLine] of content.split(/\r?\n/).entries()) {
     const line = rawLine.trim();
     if (!line) continue;
     try {
@@ -273,6 +380,22 @@ function readJsonLines(file: string | undefined): LegacyJsonLine[] {
     }
   }
   return values;
+}
+
+function readJsonLines(file: string | undefined): LegacyJsonLine[] {
+  if (!file) return [];
+  const safeFile = sanitizeLegacyLocator(file, "source-path");
+  if (!fs.existsSync(file)) throw new Error(`legacy source does not exist: ${safeFile}`);
+  try {
+    return parseJsonLines(safeFile, fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail.startsWith("cannot parse legacy JSONL source")) throw error;
+    const safeDetail = containsDeterministicSecretValue(detail)
+      ? "sensitive detail omitted"
+      : detail.split(file).join(safeFile);
+    throw new Error(`cannot read legacy JSONL source ${safeFile}: ${safeDetail}`);
+  }
 }
 
 function canonicalSourceContent(value: unknown): string {
@@ -300,6 +423,46 @@ function sourceRecordId(record: LegacyMigrationRecord): string {
   return record.sourceRecordId?.trim() || record.legacyId;
 }
 
+function sanitizeLegacyLocator(value: string, field: string): string {
+  const normalized = value.trim();
+  if (!containsDeterministicSecretValue(normalized)) return normalized;
+  const digest = createHash("sha256")
+    .update(`${LEGACY_LOCATOR_HASH_DOMAIN}\0${field}\0${normalized}`)
+    .digest("hex");
+  return `redacted-${field}-${digest}`;
+}
+
+function sanitizedRecordLocators(record: LegacyMigrationRecord): {
+  sourcePath: string;
+  sourceRecordId: string;
+  legacyId: string;
+} {
+  return {
+    sourcePath: sanitizeLegacyLocator(record.sourcePath, "source-path"),
+    sourceRecordId: sanitizeLegacyLocator(sourceRecordId(record), "source-record"),
+    legacyId: sanitizeLegacyLocator(record.legacyId, "legacy-id"),
+  };
+}
+
+function sanitizeMigrationError(
+  error: unknown,
+  record: LegacyMigrationRecord,
+): string {
+  let detail = error instanceof Error ? error.message : String(error);
+  const locators = [
+    [record.sourcePath, "source-path"],
+    [sourceRecordId(record), "source-record"],
+    [record.legacyId, "legacy-id"],
+  ] as const;
+  for (const [raw, field] of locators) {
+    if (!raw || !containsDeterministicSecretValue(raw)) continue;
+    detail = detail.split(raw).join(sanitizeLegacyLocator(raw, field));
+  }
+  return containsDeterministicSecretValue(detail)
+    ? "legacy migration record failed with sensitive detail omitted"
+    : detail;
+}
+
 function sourceMapBase(
   record: LegacyMigrationRecord,
   contentHash: string,
@@ -307,11 +470,12 @@ function sourceMapBase(
   LegacyMigrationReport["sourceMap"][number],
   "sourceKind" | "sourcePath" | "sourceRecordId" | "legacyId" | "legacyContentHash"
 > {
+  const locators = sanitizedRecordLocators(record);
   return {
     sourceKind: record.sourceKind,
-    sourcePath: record.sourcePath,
-    sourceRecordId: sourceRecordId(record),
-    legacyId: record.legacyId,
+    sourcePath: locators.sourcePath,
+    sourceRecordId: locators.sourceRecordId,
+    legacyId: locators.legacyId,
     legacyContentHash: contentHash,
   };
 }
@@ -379,11 +543,16 @@ function collectMemoryRecords(
   file: string | undefined,
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
-  const parsed = readJson(file) as {
-    memories?: Record<string, unknown>;
-  } | undefined;
-  if (!parsed?.memories || !file) return [];
-  return Object.entries(parsed.memories).flatMap(([id, item]) => {
+  if (!file) return [];
+  const root = objectRecord(readJson(file));
+  const memories = objectRecord(root?.memories);
+  if (!root || !memories) {
+    throw new Error(
+      "legacy memory source must contain an object-valued memories root: "
+      + sanitizeLegacyLocator(file, "source-path"),
+    );
+  }
+  return Object.entries(memories).flatMap(([id, item]) => {
     if (!matchesScope(item, scope)) return [];
     const record = objectRecord(item);
     const preferredText = record ? textValue(record.text) : "";
@@ -494,7 +663,10 @@ function collectSnapshotRecord(
   if (!file || value === undefined) return [];
   const root = objectRecord(value);
   if (!root) {
-    throw new Error(`legacy ${sourceKind} source has an unsupported parsed shape: ${file}`);
+    throw new Error(
+      `legacy ${sourceKind} source has an unsupported parsed shape: `
+      + sanitizeLegacyLocator(file, "source-path"),
+    );
   }
   const peerKey = scopePeerKey(scope);
   let scopedValue: Record<string, unknown>;
@@ -575,7 +747,9 @@ function collectRefIndexRecords(
     const record = envelope ? objectRecord(envelope.v) : undefined;
     if (!envelope || !logicalId || !record || !("t" in envelope)) {
       throw new Error(
-        `legacy ref-index row ${file}:${lineNumber} must use the production {k,v,t} schema`,
+        "legacy ref-index row "
+        + `${sanitizeLegacyLocator(file, "source-path")}:${lineNumber} `
+        + "must use the production {k,v,t} schema",
       );
     }
     if (!matchesScope(record, scope)) return [];
@@ -625,22 +799,117 @@ function qqDirectSessionIds(
   scope: LegacyMigrationScope,
 ): string[] {
   const parsed = readJson(indexFile);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  if (!indexFile) return [];
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      "legacy sessions index must be an object: "
+      + sanitizeLegacyLocator(indexFile, "source-path"),
+    );
+  }
   const ids: string[] = [];
   for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!key.includes(`:qqbot:${scopePeerKind(scope)}:`)) continue;
     if (!key.toLowerCase().endsWith(`:${scope.peerId.toLowerCase()}`)) continue;
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const safeKey = sanitizeLegacyLocator(key, "session-index-key");
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`legacy sessions index entry must be an object: ${safeKey}`);
+    }
     const session = value as Record<string, unknown>;
     if (!matchesScope(session, scope)) continue;
     const sessionId = textValue(session.sessionId, 200);
-    if (!sessionId) continue;
+    if (!sessionId) {
+      throw new Error(`legacy sessions index entry has no session id: ${safeKey}`);
+    }
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(sessionId)) {
-      throw new Error(`invalid legacy session id for ${key}`);
+      throw new Error(`invalid legacy session id for ${safeKey}`);
     }
     ids.push(sessionId);
   }
   return [...new Set(ids)];
+}
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === ""
+    || (
+      relative !== ".."
+      && !relative.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relative)
+    );
+}
+
+function readValidatedSessionJsonLines(
+  sessionsRoot: string,
+  sessionId: string,
+): { file: string; lines: LegacyJsonLine[] } {
+  const safeSessionId = sanitizeLegacyLocator(sessionId, "session-id");
+  const file = path.resolve(sessionsRoot, `${sessionId}.jsonl`);
+  if (!pathIsWithin(sessionsRoot, file)) {
+    throw new Error(`invalid legacy session id: ${safeSessionId}`);
+  }
+
+  let entry: fs.Stats;
+  try {
+    entry = fs.lstatSync(file);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const safeDetail = containsDeterministicSecretValue(detail)
+      ? "sensitive detail omitted"
+      : detail;
+    throw new Error(
+      `cannot inspect legacy session source ${safeSessionId}: ${safeDetail}`,
+    );
+  }
+  if (entry.isSymbolicLink()) {
+    throw new Error(`legacy session source must not be a symlink or junction: ${safeSessionId}`);
+  }
+  if (!entry.isFile()) {
+    throw new Error(`legacy session source is not a regular file: ${safeSessionId}`);
+  }
+
+  let realFile: string;
+  try {
+    realFile = fs.realpathSync(file);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const safeDetail = containsDeterministicSecretValue(detail)
+      ? "sensitive detail omitted"
+      : detail;
+    throw new Error(
+      `cannot resolve legacy session source ${safeSessionId}: ${safeDetail}`,
+    );
+  }
+  if (!pathIsWithin(sessionsRoot, realFile)) {
+    throw new Error(`legacy session source escapes the sessions directory: ${safeSessionId}`);
+  }
+
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(descriptor);
+    if (
+      !opened.isFile()
+      || opened.dev !== entry.dev
+      || opened.ino !== entry.ino
+    ) {
+      throw new Error("session source changed during validation");
+    }
+    return {
+      file,
+      lines: parseJsonLines(file, fs.readFileSync(descriptor, "utf8")),
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const safeDetail = containsDeterministicSecretValue(detail)
+      ? "sensitive detail omitted"
+      : detail;
+    throw new Error(
+      `cannot securely read legacy session source ${safeSessionId}: ${safeDetail}`,
+    );
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
 }
 
 function collectSessionRecords(
@@ -648,24 +917,30 @@ function collectSessionRecords(
   sessionsDirectory: string | undefined,
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
-  if (!sessionsDirectory) return [];
+  if (Boolean(indexFile) !== Boolean(sessionsDirectory)) {
+    throw new Error(
+      "legacy sessions index and sessions directory must be configured together",
+    );
+  }
+  if (!sessionsDirectory || !indexFile) return [];
   if (!fs.existsSync(sessionsDirectory)) {
-    throw new Error(`legacy sessions directory does not exist: ${sessionsDirectory}`);
+    throw new Error(
+      "legacy sessions directory does not exist: "
+      + sanitizeLegacyLocator(sessionsDirectory, "source-path"),
+    );
+  }
+  if (!fs.statSync(sessionsDirectory).isDirectory()) {
+    throw new Error(
+      "legacy sessions source is not a directory: "
+      + sanitizeLegacyLocator(sessionsDirectory, "source-path"),
+    );
   }
   const sessionIds = qqDirectSessionIds(indexFile, scope);
-  const sessionsRoot = path.resolve(sessionsDirectory);
+  const sessionsRoot = fs.realpathSync(sessionsDirectory);
   const records: LegacyMigrationRecord[] = [];
   for (const sessionId of sessionIds) {
-    const file = path.resolve(sessionsRoot, `${sessionId}.jsonl`);
-    const relative = path.relative(sessionsRoot, file);
-    if (
-      relative.startsWith(`..${path.sep}`)
-      || relative === ".."
-      || path.isAbsolute(relative)
-    ) {
-      throw new Error(`invalid legacy session id: ${sessionId}`);
-    }
-    for (const { value, lineNumber } of readJsonLines(file)) {
+    const { file, lines } = readValidatedSessionJsonLines(sessionsRoot, sessionId);
+    for (const { value, lineNumber } of lines) {
       const row = objectRecord(value);
       const message = row?.type === "message"
         ? objectRecord(row.message)
@@ -705,7 +980,7 @@ export function collectLegacyMigrationRecords(
   sources: LegacyMigrationSources,
   scope: LegacyMigrationScope,
 ): LegacyMigrationRecord[] {
-  return [
+  const records = [
     ...collectMemoryRecords(sources.memoryJson, scope),
     ...collectClaimRecords(sources.claimsJsonl, scope),
     ...collectSnapshotRecord(sources.stateJson, "state", scope),
@@ -717,6 +992,23 @@ export function collectLegacyMigrationRecords(
       scope,
     ),
   ];
+  return records.map((record) => ({
+    ...record,
+    ...sanitizedRecordLocators(record),
+  }));
+}
+
+export function sanitizeLegacyMigrationSourcesForReport(
+  sources: LegacyMigrationSources,
+): LegacyMigrationSources {
+  return Object.fromEntries(
+    Object.entries(sources).map(([key, value]) => [
+      key,
+      typeof value === "string"
+        ? sanitizeLegacyLocator(value, `configured-${key}`)
+        : value,
+    ]),
+  ) as LegacyMigrationSources;
 }
 
 function eventInputForRecord(
@@ -724,7 +1016,8 @@ function eventInputForRecord(
   scope: LegacyMigrationScope,
 ): MemoryEventInput {
   const contentHash = legacyContentHash(record);
-  const physicalRecordId = sourceRecordId(record);
+  const locators = sanitizedRecordLocators(record);
+  const physicalRecordId = locators.sourceRecordId;
   const boundedText = textValue(record.text);
   return {
     accountId: scope.accountId,
@@ -745,14 +1038,14 @@ function eventInputForRecord(
     ])}`,
     evidence: {
       excerpt: boundedText.slice(0, 2_000),
-      sourcePath: record.sourcePath,
+      sourcePath: locators.sourcePath,
       mediaType: "text",
     },
     metadata: {
       ...record.metadata,
       legacySourceKind: record.sourceKind,
-      legacySourcePath: record.sourcePath,
-      legacyId: record.legacyId,
+      legacySourcePath: locators.sourcePath,
+      legacyId: locators.legacyId,
       legacySourceRecordId: physicalRecordId,
       legacyContentHash: contentHash,
       legacyAuditedNonImport: record.auditedNonImport,
@@ -788,10 +1081,15 @@ export function migrateLegacyRecords(
   for (const record of records) {
     sourceCounts[record.sourceKind] += 1;
     const input = eventInputForRecord(record, scope);
+    const sourceContent = legacyArchiveContent(record);
     try {
       const result = engine.ingestMemoryEvent(input, {
         enqueue: record.auditedNonImport ? false : undefined,
         jobKind: "legacy_rejudge",
+        legacySource: {
+          content: sourceContent,
+          contentHash: input.metadata?.legacyContentHash as string,
+        },
       });
       if (!result.receipt) {
         report.skippedRecords += 1;
@@ -810,7 +1108,7 @@ export function migrateLegacyRecords(
         const incomingHash = input.metadata?.legacyContentHash;
         if (storedHash !== incomingHash) {
           throw new LegacyContentHashMismatchError(
-            `legacy content hash mismatch for ${record.sourceKind}:${record.legacyId}`,
+            `legacy content hash mismatch for ${record.sourceKind}:${sanitizedRecordLocators(record).legacyId}`,
           );
         }
         report.duplicateEvents += 1;
@@ -842,7 +1140,7 @@ export function migrateLegacyRecords(
           metadata: {
             migrationPendingRejudge: true,
             legacyType: record.provisional.legacyType,
-            legacyId: record.legacyId,
+            legacyId: sanitizedRecordLocators(record).legacyId,
           },
         });
         claimId = candidate.claimId;
@@ -855,12 +1153,23 @@ export function migrateLegacyRecords(
         status: result.receipt.inserted ? "imported" : "duplicate",
       });
     } catch (error) {
-      if (error instanceof LegacyContentHashMismatchError) throw error;
+      if (
+        error instanceof LegacyContentHashMismatchError
+        || (
+          error instanceof Error
+          && /legacy source archive (?:hash does not match event|content hash mismatch|is immutable)/i
+            .test(error.message)
+        )
+      ) {
+        throw new LegacyContentHashMismatchError(
+          `legacy content hash mismatch for ${record.sourceKind}:${sanitizedRecordLocators(record).legacyId}`,
+        );
+      }
       report.skippedRecords += 1;
       report.sourceMap.push({
         ...sourceMapBase(record, input.metadata?.legacyContentHash as string),
         status: "skipped",
-        reason: error instanceof Error ? error.message : String(error),
+        reason: sanitizeMigrationError(error, record),
       });
     }
   }
@@ -872,19 +1181,63 @@ export function getLegacyRejudgementGate(
 ): LegacyRejudgementGate {
   const events = engine.ledger.listEvents()
     .filter((event) => event.kind === "legacy_import");
-  const eligibleEvents = events
-    .filter((event) =>
-      event.metadata.secretRedacted !== true
-      && !isAuditedNonImport(event.metadata.legacyAuditedNonImport)
+  const eventIds = new Set(events.map((event) => event.eventId));
+  const bindings = engine.ledger.listLegacyMigrationBindings();
+  const bindingByEventId = new Map(
+    bindings.map((binding) => [binding.eventId, binding]),
+  );
+  const bindingVerificationByEventId = new Map<
+    string,
+    LegacyMigrationBindingVerification
+  >();
+  for (const binding of bindings) {
+    try {
+      bindingVerificationByEventId.set(
+        binding.eventId,
+        engine.ledger.verifyLegacyMigrationBinding(binding.eventId),
+      );
+    } catch (error) {
+      bindingVerificationByEventId.set(binding.eventId, {
+        binding,
+        valid: false,
+        errors: [error instanceof Error ? error.message : String(error)],
+      });
+    }
+  }
+  const dispositionForEvent = (event: (typeof events)[number]) =>
+    bindingByEventId.get(event.eventId)?.disposition
+    ?? (
+      event.metadata.secretRedacted === true
+        ? "redacted"
+        : isAuditedNonImport(event.metadata.legacyAuditedNonImport)
+          ? "audited_non_import"
+          : "imported"
     );
+  const redactedEvents = events
+    .filter((event) => dispositionForEvent(event) === "redacted");
+  const eligibleEvents = events
+    .filter((event) => dispositionForEvent(event) === "imported");
+  const archivedEvents = events
+    .filter((event) => dispositionForEvent(event) !== "redacted");
   const eligibleEventIds = new Set(eligibleEvents.map((event) => event.eventId));
+  const sourceArchives = archivedEvents.map((event) => ({
+    event,
+    archive: engine.ledger.inspectLegacySourceArchive(event.eventId),
+  }));
+  const archivedSourceEvents = sourceArchives.filter(({ archive }) => Boolean(archive)).length;
+  const completeSourceArchives = sourceArchives.filter(({ event, archive }) =>
+    archive?.complete === true
+    && bindingVerificationByEventId.get(event.eventId)?.valid === true
+  ).length;
+  const completeRedactions = redactedEvents.filter((event) =>
+    bindingVerificationByEventId.get(event.eventId)?.valid === true
+  ).length;
   const jobs = engine.ledger.listJobs()
     .filter((job) =>
       job.kind === "legacy_rejudge"
       && eligibleEventIds.has(job.eventId)
     );
   const trackedEventIds = new Set(jobs.map((job) => job.eventId));
-  const eventIds = new Set(events.map((event) => event.eventId));
   const extractions = engine.ledger.listLegacyExtractions()
     .filter((extraction) => eligibleEventIds.has(extraction.eventId));
   const claims = engine.ledger.listClaims()
@@ -973,6 +1326,33 @@ export function getLegacyRejudgementGate(
       }, 0)
     : 0;
   const blockers: string[] = [];
+  const unboundEvents = events.filter((event) =>
+    !bindingByEventId.has(event.eventId)
+  );
+  const orphanBindings = bindings.filter((binding) =>
+    !eventIds.has(binding.eventId)
+  );
+  const invalidBindings = [...bindingVerificationByEventId.values()]
+    .filter((verification) => !verification.valid);
+  if (unboundEvents.length > 0) {
+    blockers.push(
+      `${unboundEvents.length} legacy source event(s) have no immutable migration binding`,
+    );
+  }
+  if (orphanBindings.length > 0) {
+    blockers.push(
+      `${orphanBindings.length} immutable migration binding(s) have no legacy source event`,
+    );
+  }
+  if (invalidBindings.length > 0) {
+    const errors = [...new Set(
+      invalidBindings.flatMap((verification) => verification.errors),
+    )].sort();
+    blockers.push(
+      `${invalidBindings.length} immutable migration binding(s) failed verification`
+      + (errors.length > 0 ? ` (${errors.join(", ")})` : ""),
+    );
+  }
   if (untracked > 0) blockers.push(`${untracked} eligible legacy event(s) have no rejudgement job`);
   if (pending > 0) blockers.push(`${pending} legacy rejudgement job(s) are pending`);
   if (running > 0) blockers.push(`${running} legacy rejudgement job(s) are running`);
@@ -1199,6 +1579,21 @@ export function getLegacyRejudgementGate(
       `legacy consolidation covered ${coveredSourceEvents} of ${eligibleEvents.length} source event(s)`,
     );
   }
+  if (archivedSourceEvents !== archivedEvents.length) {
+    blockers.push(
+      `${archivedEvents.length - archivedSourceEvents} legacy source event(s) have no immutable archive`,
+    );
+  }
+  if (completeSourceArchives !== archivedEvents.length) {
+    blockers.push(
+      `${archivedEvents.length - completeSourceArchives} legacy source archive(s) have incomplete chunk coverage`,
+    );
+  }
+  if (completeRedactions !== redactedEvents.length) {
+    blockers.push(
+      `${redactedEvents.length - completeRedactions} secret-bearing legacy source(s) have incomplete redaction coverage`,
+    );
+  }
   if (provisionalOpen > 0) {
     blockers.push(`${provisionalOpen} provisional migration claim(s) remain open`);
   }
@@ -1234,6 +1629,10 @@ export function getLegacyRejudgementGate(
     coverage: {
       sourceEvents: eligibleEvents.length,
       coveredSourceEvents,
+      archivedSourceEvents,
+      completeSourceArchives,
+      redactedSourceEvents: redactedEvents.length,
+      completeRedactions,
     },
     claims: {
       provisionalOpen,

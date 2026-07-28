@@ -27,7 +27,6 @@ function config(databasePath) {
         memoryKernel: {
           enabled: true,
           databasePath,
-          inferencePromotionConfidence: 0.5,
           worker: { enabled: false, intervalMs: 20 },
           wiki: { enabled: false },
         },
@@ -60,7 +59,9 @@ const databasePath = path.join(temporaryRoot, "memory.sqlite");
 const memoryFile = path.join(temporaryRoot, "legacy", "memory.json");
 const identityId = "identity:shared-user";
 
-const firstRuntime = new AsukaMemoryRuntime(config(databasePath));
+const firstRuntime = new AsukaMemoryRuntime(config(databasePath), {
+  allowMissingEmbeddingsForTests: true,
+});
 const privatePeers = ["direct-a", "direct-b"];
 const privateEvents = privatePeers.map((peerId, index) =>
   firstRuntime.ledger.appendEvent({
@@ -98,6 +99,8 @@ const explicitPrivate = firstRuntime.ledger.applyClaimProposal(
     epistemicStatus: "explicit",
     authority: "user_explicit",
     confidence: 1,
+    disposition: "active",
+    rationale: "Fixture model selected active",
   },
 );
 const inferredPrivate = firstRuntime.ledger.applyClaimProposal(
@@ -111,6 +114,8 @@ const inferredPrivate = firstRuntime.ledger.applyClaimProposal(
     epistemicStatus: "inferred",
     authority: "inferred",
     confidence: 0.9,
+    disposition: "active",
+    rationale: "Fixture model selected active",
   },
 );
 const explicitPublic = firstRuntime.ledger.applyClaimProposal(
@@ -124,6 +129,8 @@ const explicitPublic = firstRuntime.ledger.applyClaimProposal(
     epistemicStatus: "explicit",
     authority: "user_explicit",
     confidence: 1,
+    disposition: "active",
+    rationale: "Fixture model selected active",
   },
 );
 assert.ok(explicitPrivate.claimId);
@@ -174,7 +181,9 @@ assert.deepEqual(firstRuntime.getLegacyProjectionStatus(), {
 });
 await firstRuntime.shutdown();
 
-const secondRuntime = new AsukaMemoryRuntime(config(databasePath));
+const secondRuntime = new AsukaMemoryRuntime(config(databasePath), {
+  allowMissingEmbeddingsForTests: true,
+});
 assert.deepEqual(secondRuntime.getLegacyProjectionStatus(), {
   degraded: true,
   pendingCount: 3,

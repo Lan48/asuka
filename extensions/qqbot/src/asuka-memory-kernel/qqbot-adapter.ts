@@ -14,7 +14,7 @@ import {
   createOpenAICompatibleMemoryModelClient,
   type MemoryEmbeddingModelConfig,
 } from "./model-client.js";
-import { containsDeterministicSecret } from "./policy.js";
+import { containsDeterministicSecretValue } from "./policy.js";
 import {
   getAsukaMemoryRuntime,
   initializeAsukaMemoryRuntime,
@@ -217,12 +217,11 @@ function appendCanonicalCapture(
   event: AsukaMemoryMessageInput,
   logger?: AsukaMemoryRuntimeLogger,
 ): void {
-  if (containsDeterministicSecret([
-    event.text,
-    event.evidence?.excerpt,
-    event.evidence?.transcript,
-    event.evidence?.imageSummary,
-  ].filter(Boolean).join("\n"))) {
+  if (containsDeterministicSecretValue({
+    text: event.text,
+    evidence: event.evidence,
+    metadata: event.metadata,
+  })) {
     logger?.warn?.(
       `[asuka-memory] canonical ${kind} retry was not persisted because it contains secret-bearing content`,
     );

@@ -34,7 +34,14 @@ export interface ResolvedAsukaMemoryKernelConfig {
   enabled: boolean;
   databasePath: string;
   enableVector: boolean;
-  inferencePromotionConfidence?: number;
+  requireEmbeddings: boolean;
+  maxJudgementProposals?: number;
+  reflection: {
+    enabled: boolean;
+    intervalMs?: number;
+    batchSize?: number;
+    eventDelayMs?: number;
+  };
   maxJobAttempts?: number;
   model: unknown;
   timeouts: {
@@ -80,6 +87,7 @@ export interface AsukaMemoryRuntimeDependencies {
   model?: MemoryModelAdapter;
   createModelAdapter?(settings: unknown): MemoryModelAdapter | undefined;
   logger?: AsukaMemoryRuntimeLogger;
+  allowMissingEmbeddingsForTests?: boolean;
 }
 
 export interface AsukaLegacyMemoryWriteContext {
@@ -155,6 +163,7 @@ export function resolveAsukaMemoryKernelConfig(
   const timeouts = asRecord(kernel.timeouts);
   const migration = asRecord(kernel.migration);
   const worker = asRecord(kernel.worker);
+  const reflection = asRecord(kernel.reflection);
   const wiki = asRecord(kernel.wiki);
   const enabled = kernel.enabled === true;
   const memoryRoot = configuredPath(
@@ -188,10 +197,14 @@ export function resolveAsukaMemoryKernelConfig(
       getDefaultMemoryLedgerPath(),
     )!,
     enableVector: kernel.enableVector !== false,
-    inferencePromotionConfidence: typeof kernel.inferencePromotionConfidence === "number"
-      && Number.isFinite(kernel.inferencePromotionConfidence)
-      ? Math.max(0, Math.min(1, kernel.inferencePromotionConfidence))
-      : undefined,
+    requireEmbeddings: enabled,
+    maxJudgementProposals: optionalNumber(kernel.maxJudgementProposals, 1, 1_000),
+    reflection: {
+      enabled: reflection.enabled === true,
+      intervalMs: optionalNumber(reflection.intervalMs, 1_000, 365 * 86_400_000),
+      batchSize: optionalNumber(reflection.batchSize, 1, 200),
+      eventDelayMs: optionalNumber(reflection.eventDelayMs, 0, 3_600_000),
+    },
     maxJobAttempts: optionalNumber(kernel.maxJobAttempts, 1, 100),
     model: kernel.model,
     timeouts: {
@@ -328,26 +341,37 @@ export class AsukaMemoryRuntime {
       ?? dependencies.createModelAdapter?.(config.model);
     this.ledger = new AsukaMemoryLedger(config.databasePath, {
       enableVector: config.enableVector,
-      inferencePromotionConfidence: config.inferencePromotionConfidence,
     });
-    this.engine = new AsukaMemoryEngine(this.ledger, {
-      judgementTimeoutMs: config.timeouts.judgementMs,
-      rerankDeadlineMs: config.timeouts.retrievalMs,
-      rerankTaskTimeoutMs: config.timeouts.rerankTaskMs,
-      maxJobAttempts: config.maxJobAttempts,
-      legacyExtractionMaxInputChars: config.migration.extractionMaxInputChars,
-      legacyExtractionMaxProposals: config.migration.extractionMaxProposals,
-      legacyExtractionMaxTokens: config.migration.extractionMaxTokens,
-      legacyConsolidationMaxInputChars: config.migration.consolidationMaxInputChars,
-      legacyConsolidationMaxClaimsPerBatch:
-        config.migration.consolidationMaxClaimsPerBatch,
-      legacyConsolidationMaxTokens: config.migration.consolidationMaxTokens,
-      model,
-      onProjectionChanged: (identityId) => {
-        this.scheduleWikiProjection();
-        this.enqueueLegacyProjections(identityId);
-      },
-    });
+    try {
+      this.engine = new AsukaMemoryEngine(this.ledger, {
+        judgementTimeoutMs: config.timeouts.judgementMs,
+        rerankDeadlineMs: config.timeouts.retrievalMs,
+        rerankTaskTimeoutMs: config.timeouts.rerankTaskMs,
+        maxJobAttempts: config.maxJobAttempts,
+        requireEmbeddings:
+          config.requireEmbeddings && dependencies.allowMissingEmbeddingsForTests !== true,
+        maxJudgementProposals: config.maxJudgementProposals,
+        autoReflection: config.reflection.enabled,
+        reflectionIntervalMs: config.reflection.intervalMs,
+        reflectionBatchSize: config.reflection.batchSize,
+        reflectionEventDelayMs: config.reflection.eventDelayMs,
+        legacyExtractionMaxInputChars: config.migration.extractionMaxInputChars,
+        legacyExtractionMaxProposals: config.migration.extractionMaxProposals,
+        legacyExtractionMaxTokens: config.migration.extractionMaxTokens,
+        legacyConsolidationMaxInputChars: config.migration.consolidationMaxInputChars,
+        legacyConsolidationMaxClaimsPerBatch:
+          config.migration.consolidationMaxClaimsPerBatch,
+        legacyConsolidationMaxTokens: config.migration.consolidationMaxTokens,
+        model,
+        onProjectionChanged: (identityId) => {
+          this.scheduleWikiProjection();
+          this.enqueueLegacyProjections(identityId);
+        },
+      });
+    } catch (error) {
+      this.ledger.close();
+      throw error;
+    }
     this.start();
   }
 
@@ -356,6 +380,17 @@ export class AsukaMemoryRuntime {
   }
 
   private start(): void {
+    void this.engine.checkEmbeddingHealth().then((health) => {
+      if (health.ready) {
+        this.logger.info?.(
+          `[asuka-memory] embedding health ready; model=${health.model}, dimensions=${health.dimensions}`,
+        );
+      } else {
+        const message = `[asuka-memory] embedding health degraded: ${health.reason}`;
+        if (health.required) this.logger.error?.(message);
+        else this.logger.warn?.(message);
+      }
+    });
     if (this.config.worker.enabled) {
       this.workerTimer = setInterval(() => {
         void this.processPendingMemoryJobs();
@@ -425,6 +460,7 @@ export class AsukaMemoryRuntime {
     if (this.activeWorker) return this.activeWorker;
     const worker = (async () => {
       this.importOverrides(false);
+      this.engine.enqueueDueReflections();
       return this.engine.processPendingMemoryJobs({
         maxJobs: this.config.worker.maxJobs,
       });

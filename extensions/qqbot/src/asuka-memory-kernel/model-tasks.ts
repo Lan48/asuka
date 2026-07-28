@@ -5,6 +5,8 @@ import type {
   MemoryEpistemicStatus,
   MemoryEvent,
   MemoryJudgement,
+  MemoryReflectionDecision,
+  MemoryReflectionResult,
   MemoryTopLevelType,
 } from "./types.js";
 
@@ -18,6 +20,8 @@ const TOP_LEVEL_TYPES = new Set<MemoryTopLevelType>([
 ]);
 const EPISTEMIC_STATUSES = new Set<MemoryEpistemicStatus>(["explicit", "inferred"]);
 const ACTIONS = new Set(["add", "revise", "refute", "forget", "delete"]);
+const DISPOSITIONS = new Set(["active", "candidate"]);
+const REFLECTION_ACTIONS = new Set(["retain", "revise", "refute", "expire"]);
 const LIFECYCLES = new Set(["stable", "bounded", "episodic", "working"]);
 const LEGACY_PROPOSAL_STRING_LIMITS = {
   subjectId: 200,
@@ -36,6 +40,8 @@ interface RawProposal {
   epistemicStatus?: unknown;
   sourceKind?: unknown;
   confidence?: unknown;
+  disposition?: unknown;
+  rationale?: unknown;
   action?: unknown;
   targetClaimId?: unknown;
   validFrom?: unknown;
@@ -64,10 +70,35 @@ function extractJsonObject(text: string): unknown {
   }
 }
 
-function stringValue(value: unknown, maxLength: number): string | undefined {
+function normalizedString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized ? normalized.slice(0, maxLength) : undefined;
+  return normalized || undefined;
+}
+
+function stringValue(value: unknown, maxLength: number): string | undefined {
+  return normalizedString(value)?.slice(0, maxLength);
+}
+
+function strictRequiredModelString(
+  value: unknown,
+  maxLength: number,
+  errorMessage: string,
+): string {
+  const normalized = normalizedString(value);
+  if (!normalized || normalized.length > maxLength) {
+    throw new Error(errorMessage);
+  }
+  return normalized;
+}
+
+function strictOptionalModelString(
+  value: unknown,
+  maxLength: number,
+  errorMessage: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  return strictRequiredModelString(value, maxLength, errorMessage);
 }
 
 function stringArray(value: unknown, maxItems = 32): string[] {
@@ -85,9 +116,22 @@ function timestampValue(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function confidenceValue(value: unknown): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(1, value));
+function parseValidityInterval(
+  value: { validFrom?: unknown; validTo?: unknown },
+  errorMessage: string,
+): { validFrom?: number; validTo?: number } {
+  const hasValidFrom = Object.prototype.hasOwnProperty.call(value, "validFrom");
+  const hasValidTo = Object.prototype.hasOwnProperty.call(value, "validTo");
+  const validFrom = timestampValue(value.validFrom);
+  const validTo = timestampValue(value.validTo);
+  if (
+    (hasValidFrom && validFrom === undefined)
+    || (hasValidTo && validTo === undefined)
+    || (validFrom !== undefined && validTo !== undefined && validTo <= validFrom)
+  ) {
+    throw new Error(errorMessage);
+  }
+  return { validFrom, validTo };
 }
 
 function authorityFor(
@@ -95,6 +139,9 @@ function authorityFor(
   epistemicStatus: MemoryEpistemicStatus,
   sourceKind: string | undefined,
 ): MemoryAuthority {
+  if (epistemicStatus === "inferred") {
+    return "inferred";
+  }
   if (event.actor === "user" && event.kind === "human_override") return "human_override";
   if (
     event.actor === "user"
@@ -109,31 +156,133 @@ function authorityFor(
     return "mutual_agreement";
   }
   if (event.actor === "user" && epistemicStatus === "explicit") return "user_explicit";
-  if (sourceKind === "behavior") return "observed_pattern";
-  if (epistemicStatus === "inferred") return "inferred";
   return "summary";
 }
 
-function validateProposal(event: MemoryEvent, value: RawProposal): ClaimProposal | undefined {
-  const subjectId = stringValue(value.subjectId, 200);
-  const predicate = stringValue(value.predicate, 200);
-  const canonicalText = stringValue(value.canonicalText, 500);
-  if (!subjectId || !predicate || !canonicalText) return undefined;
-  if (!TOP_LEVEL_TYPES.has(value.topLevelType as MemoryTopLevelType)) return undefined;
-  if (!EPISTEMIC_STATUSES.has(value.epistemicStatus as MemoryEpistemicStatus)) return undefined;
+function validateProposal(
+  event: MemoryEvent,
+  raw: unknown,
+  index: number,
+): ClaimProposal {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`memory proposal ${index} must be an object`);
+  }
+  const value = raw as RawProposal;
+  const subjectId = strictRequiredModelString(
+    value.subjectId,
+    200,
+    `memory proposal ${index} has an invalid claim identity`,
+  );
+  const predicate = strictRequiredModelString(
+    value.predicate,
+    200,
+    `memory proposal ${index} has an invalid claim identity`,
+  );
+  const canonicalText = strictRequiredModelString(
+    value.canonicalText,
+    500,
+    `memory proposal ${index} has an invalid claim identity`,
+  );
+  if (!Object.prototype.hasOwnProperty.call(value, "value")) {
+    throw new Error(`memory proposal ${index} is missing value`);
+  }
+  if (!TOP_LEVEL_TYPES.has(value.topLevelType as MemoryTopLevelType)) {
+    throw new Error(`memory proposal ${index} has an invalid topLevelType`);
+  }
+  if (!EPISTEMIC_STATUSES.has(value.epistemicStatus as MemoryEpistemicStatus)) {
+    throw new Error(`memory proposal ${index} has an invalid epistemicStatus`);
+  }
+  if (
+    typeof value.confidence !== "number"
+    || !Number.isFinite(value.confidence)
+    || value.confidence < 0
+    || value.confidence > 1
+  ) {
+    throw new Error(`memory proposal ${index} has an invalid confidence`);
+  }
   const epistemicStatus = value.epistemicStatus as MemoryEpistemicStatus;
-  const action = ACTIONS.has(value.action as string)
-    ? value.action as ClaimProposal["action"]
-    : "add";
-  const lifecycle = LIFECYCLES.has(value.lifecycle as string)
-    ? value.lifecycle as ClaimProposal["lifecycle"]
-    : undefined;
-  const sourceKind = stringValue(value.sourceKind, 40);
+  if (value.action !== undefined && !ACTIONS.has(value.action as string)) {
+    throw new Error(`memory proposal ${index} has an invalid action`);
+  }
+  const action = (value.action ?? "add") as ClaimProposal["action"];
+  const targetClaimId = strictOptionalModelString(
+    value.targetClaimId,
+    200,
+    `memory proposal ${index} has an invalid targetClaimId`,
+  );
+  if (
+    (action === "add" && value.targetClaimId !== undefined)
+    || (action !== "add" && !targetClaimId)
+  ) {
+    throw new Error(`memory proposal ${index} has fields incompatible with ${action}`);
+  }
+  if (value.lifecycle !== undefined && !LIFECYCLES.has(value.lifecycle as string)) {
+    throw new Error(`memory proposal ${index} has an invalid lifecycle`);
+  }
+  const lifecycle = value.lifecycle as ClaimProposal["lifecycle"];
+  const sourceKind = strictOptionalModelString(
+    value.sourceKind,
+    40,
+    `memory proposal ${index} has an invalid sourceKind`,
+  );
+  const rationale = strictOptionalModelString(
+    value.rationale,
+    500,
+    `memory proposal ${index} has an invalid rationale`,
+  );
+  if (value.disposition !== undefined && !DISPOSITIONS.has(value.disposition as string)) {
+    throw new Error(`memory proposal ${index} has an invalid disposition`);
+  }
+  const disposition = value.disposition as ClaimProposal["disposition"];
+  if (
+    action !== "add"
+    && action !== "revise"
+    && value.disposition !== undefined
+  ) {
+    throw new Error(`memory proposal ${index} has fields incompatible with ${action}`);
+  }
+  const humanOverride = event.actor === "user" && event.kind === "human_override";
+  if (
+    (action === "add" || action === "revise")
+    && !humanOverride
+    && (!disposition || !rationale)
+  ) {
+    throw new Error(`memory proposal ${index} is missing disposition or rationale`);
+  }
+  if (
+    epistemicStatus === "inferred"
+    && (
+      !Array.isArray(value.supportingEventIds)
+      || value.supportingEventIds.length === 0
+    )
+  ) {
+    throw new Error(`memory proposal ${index} is missing inferred evidence`);
+  }
+  if (
+    !validOptionalStringArray(value.entityIds)
+    || !validOptionalStringArray(value.supportingEventIds)
+    || !validOptionalStringArray(value.opposingEventIds)
+  ) {
+    throw new Error(`memory proposal ${index} has invalid evidence or entity IDs`);
+  }
   const metadata = value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata)
     ? value.metadata as Record<string, unknown>
     : {};
+  if (value.metadata !== undefined && Object.keys(metadata).length === 0 && (
+    !value.metadata || typeof value.metadata !== "object" || Array.isArray(value.metadata)
+  )) {
+    throw new Error(`memory proposal ${index} has invalid metadata`);
+  }
+  const validity = parseValidityInterval(
+    value,
+    `memory proposal ${index} has an invalid validity interval`,
+  );
   return {
-    semanticKey: stringValue(value.semanticKey, 240),
+    semanticKey: strictOptionalModelString(
+      value.semanticKey,
+      240,
+      `memory proposal ${index} has an invalid semanticKey`,
+    ),
     subjectId,
     predicate,
     value: value.value,
@@ -141,12 +290,18 @@ function validateProposal(event: MemoryEvent, value: RawProposal): ClaimProposal
     topLevelType: value.topLevelType as MemoryTopLevelType,
     epistemicStatus,
     authority: authorityFor(event, epistemicStatus, sourceKind),
-    confidence: confidenceValue(value.confidence),
+    confidence: value.confidence,
+    disposition,
+    rationale,
     action,
-    targetClaimId: stringValue(value.targetClaimId, 200),
-    validFrom: timestampValue(value.validFrom),
-    validTo: timestampValue(value.validTo),
-    topic: stringValue(value.topic, 160),
+    targetClaimId,
+    validFrom: validity.validFrom,
+    validTo: validity.validTo,
+    topic: strictOptionalModelString(
+      value.topic,
+      160,
+      `memory proposal ${index} has an invalid topic`,
+    ),
     entityIds: stringArray(value.entityIds),
     supportingEventIds: stringArray(value.supportingEventIds),
     opposingEventIds: stringArray(value.opposingEventIds),
@@ -241,7 +396,14 @@ function validateLegacyProposal(event: MemoryEvent, value: unknown, index: numbe
   ) {
     throw new Error(`legacy extraction proposal ${index} has an invalid identifier list`);
   }
-  const validated = validateProposal(event, proposal);
+  const validated = validateProposal(event, {
+    ...proposal,
+    action: proposal.action ?? "add",
+    supportingEventIds: [event.eventId],
+    opposingEventIds: [],
+    disposition: "candidate",
+    rationale: "Pending legacy consolidation",
+  }, index);
   if (!validated) {
     throw new Error(`legacy extraction proposal ${index} is invalid`);
   }
@@ -258,7 +420,11 @@ function validateLegacyProposal(event: MemoryEvent, value: unknown, index: numbe
   };
 }
 
-export function parseMemoryJudgement(text: string, event: MemoryEvent): MemoryJudgement {
+export function parseMemoryJudgement(
+  text: string,
+  event: MemoryEvent,
+  maxProposals = 12,
+): MemoryJudgement {
   const parsed = extractJsonObject(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("memory judgement must be a JSON object");
@@ -267,16 +433,24 @@ export function parseMemoryJudgement(text: string, event: MemoryEvent): MemoryJu
     proposals?: unknown;
     noMemoryReason?: unknown;
   };
-  const proposals = Array.isArray(result.proposals)
-    ? result.proposals
-      .map((proposal) => validateProposal(event, proposal as RawProposal))
-      .filter((proposal): proposal is ClaimProposal => Boolean(proposal))
-      .slice(0, 12)
-    : [];
+  if (!Array.isArray(result.proposals)) {
+    throw new Error("memory judgement is missing proposals");
+  }
+  if (Array.isArray(result.proposals) && result.proposals.length > maxProposals) {
+    throw new Error(
+      `memory judgement returned ${result.proposals.length} proposals; maximum is ${maxProposals}`,
+    );
+  }
+  const proposals = result.proposals
+    .map((proposal, index) => validateProposal(event, proposal, index));
   return {
     eventId: event.eventId,
     proposals,
-    noMemoryReason: stringValue(result.noMemoryReason, 500),
+    noMemoryReason: strictOptionalModelString(
+      result.noMemoryReason,
+      500,
+      "memory judgement has an invalid noMemoryReason",
+    ),
   };
 }
 
@@ -301,7 +475,11 @@ export function parseLegacyExtraction(
       `legacy extraction returned ${result.proposals.length} proposals; maximum is ${maxProposals}`,
     );
   }
-  const noMemoryReason = stringValue(result.noMemoryReason, 500);
+  const noMemoryReason = strictOptionalModelString(
+    result.noMemoryReason,
+    500,
+    "legacy extraction has an invalid noMemoryReason",
+  );
   if (result.proposals.length === 0 && !noMemoryReason) {
     throw new Error("empty legacy extraction requires noMemoryReason");
   }
@@ -384,6 +562,8 @@ export interface LegacyConsolidationPromptItem {
   topLevelType: MemoryTopLevelType;
   epistemicStatus: MemoryEpistemicStatus;
   confidence: number;
+  disposition: "active" | "candidate";
+  rationale: string;
   validFrom?: number;
   validTo?: number;
   topic?: string;
@@ -408,6 +588,8 @@ export interface LegacyConsolidationDecisionClaim {
   topLevelType: MemoryTopLevelType;
   epistemicStatus: MemoryEpistemicStatus;
   confidence: number;
+  disposition: "active" | "candidate";
+  rationale: string;
   validFrom?: number;
   validTo?: number;
   topic?: string;
@@ -442,6 +624,8 @@ export function buildLegacyConsolidationPrompt(
     topLevelType: item.topLevelType,
     epistemicStatus: item.epistemicStatus,
     confidence: item.confidence,
+    disposition: item.disposition,
+    rationale: item.rationale,
     validFrom: item.validFrom,
     validTo: item.validTo,
     topic: item.topic,
@@ -475,6 +659,8 @@ export function buildLegacyConsolidationPrompt(
         topLevelType: "fact|event|belief|self_narrative|working_memory|procedural",
         epistemicStatus: "explicit|inferred",
         confidence: 0.9,
+        disposition: "active|candidate",
+        rationale: "为什么该声明应当 active 或留在 candidate",
         validFrom: "可选 ISO 时间",
         validTo: "可选 ISO 时间",
         topic: "可选动态主题",
@@ -558,6 +744,12 @@ export function parseLegacyConsolidation(
     ) {
       throw new Error(`legacy consolidation claim ${index} has an invalid confidence`);
     }
+    if (!DISPOSITIONS.has(value.disposition as string)) {
+      throw new Error(`legacy consolidation claim ${index} has an invalid disposition`);
+    }
+    if (!presentString(value.rationale, 500)) {
+      throw new Error(`legacy consolidation claim ${index} has an invalid rationale`);
+    }
     if (
       value.lifecycle !== undefined
       && !LIFECYCLES.has(value.lifecycle as string)
@@ -588,6 +780,8 @@ export function parseLegacyConsolidation(
       topLevelType: value.topLevelType as MemoryTopLevelType,
       epistemicStatus: value.epistemicStatus as MemoryEpistemicStatus,
       confidence: value.confidence,
+      disposition: value.disposition as "active" | "candidate",
+      rationale: normalizedString(value.rationale)!,
       validFrom,
       validTo,
       topic: stringValue(value.topic, 160),
@@ -630,6 +824,7 @@ export function parseLegacyConsolidation(
 function claimForPrompt(claim: MemoryClaim): Record<string, unknown> {
   return {
     claimId: claim.claimId,
+    rootClaimId: claim.rootClaimId,
     semanticKey: claim.semanticKey,
     subjectId: claim.subjectId,
     predicate: claim.predicate,
@@ -639,6 +834,8 @@ function claimForPrompt(claim: MemoryClaim): Record<string, unknown> {
     epistemicStatus: claim.epistemicStatus,
     authority: claim.authority,
     confidence: claim.confidence,
+    disposition: claim.metadata.disposition,
+    rationale: claim.metadata.rationale,
     state: claim.state,
     validFrom: claim.validFrom,
     validTo: claim.validTo,
@@ -647,9 +844,25 @@ function claimForPrompt(claim: MemoryClaim): Record<string, unknown> {
   };
 }
 
+export interface MemoryJudgementContextCoverage {
+  availableClaimCount: number;
+  includedClaimCount: number;
+  omittedClaimCount: number;
+  requiredClaimIds: string[];
+  includedRequiredClaimIds: string[];
+  missingRequiredReferences: string[];
+  includedEvidenceCount: number;
+  omittedEvidenceCount: number;
+  evidenceByClaimId: Record<string, {
+    supportingEventIds: string[];
+    opposingEventIds: string[];
+  }>;
+}
+
 export function buildMemoryJudgementPrompt(
   event: MemoryEvent,
   currentClaims: MemoryClaim[],
+  coverage: MemoryJudgementContextCoverage,
 ): string {
   const migrationRules = event.kind === "legacy_import"
     ? [
@@ -668,6 +881,17 @@ export function buildMemoryJudgementPrompt(
     metadata: event.metadata,
     generatedFromClaimIds: event.generatedFromClaimIds,
   };
+  const {
+    evidenceByClaimId,
+    ...coverageSummary
+  } = coverage;
+  const promptClaims = currentClaims.map((claim) => ({
+    ...claimForPrompt(claim),
+    ...(evidenceByClaimId[claim.claimId] ?? {
+      supportingEventIds: [],
+      opposingEventIds: [],
+    }),
+  }));
   return [
     "你是 Asuka 记忆系统的语义裁决器。只返回一个 JSON 对象，不要 Markdown。",
     "目标不是保存每句话，而是提出可审计的记忆声明 proposal；代码会独立验证权限、权威和证据。",
@@ -677,6 +901,7 @@ export function buildMemoryJudgementPrompt(
     "2. semanticKey 表示稳定版本链；同义 predicate 必须使用同一 semanticKey。semanticKey、predicate、topic、entityIds 都按语义动态生成，不依赖预设领域枚举。",
     "3. 用户明确说出的事实标 explicit；从行为、语气或多轮模式推导的内容标 inferred。",
     "4. inferred 必须给出 supportingEventIds、证据化 canonicalText 和保守 confidence。",
+    "4a. 每个 add/revise proposal 都必须给 disposition=active|candidate 和具体 rationale；active 表示模型判定它可参与召回，代码仍会执行证据、作用域和明确事实优先门禁。",
     "5. 提问、引用、否定对象、角色动作、一次性情绪和寒暄不能误当成用户事实。",
     "6. Asuka 自己生成的说法只能作为候选；generatedFromClaimIds 中的自我召回不能成为新证据。",
     "7. 新内容与 currentClaims 冲突时，使用 revise/refute 并给 targetClaimId；不能让推断覆盖明确事实。",
@@ -697,6 +922,8 @@ export function buildMemoryJudgementPrompt(
         epistemicStatus: "explicit",
         sourceKind: "statement|correction|agreement|behavior|inference|summary",
         confidence: 0.9,
+        disposition: "active|candidate",
+        rationale: "该 proposal 当前应 active 或 candidate 的证据化理由",
         action: "add|revise|refute|forget|delete",
         targetClaimId: "可选",
         validFrom: "可选 ISO 时间",
@@ -712,7 +939,8 @@ export function buildMemoryJudgementPrompt(
     }),
     "",
     `当前事件：${JSON.stringify(eventPayload)}`,
-    `当前相关声明：${JSON.stringify(currentClaims.map(claimForPrompt))}`,
+    `上下文覆盖：${JSON.stringify(coverageSummary)}`,
+    `当前相关声明：${JSON.stringify(promptClaims)}`,
   ].join("\n");
 }
 
@@ -746,4 +974,178 @@ export function parseRerankResult(text: string, allowedClaimIds: Set<string>): {
     claimIds: stringArray(result.claimIds, 100).filter((id) => allowedClaimIds.has(id)),
     reason: stringValue(result.reason, 500),
   };
+}
+
+export function buildReflectionPrompt(
+  claims: Array<{
+    claim: MemoryClaim;
+    evidence: MemoryEvent[];
+  }>,
+  now = Date.now(),
+): string {
+  return [
+    "你是 Asuka 记忆系统的反思裁决器。只返回一个 JSON 对象，不要 Markdown。",
+    "逐条复核输入中的非 stable 声明，决定 retain、revise、refute 或 expire；不得遗漏、重复或发明 claimId。",
+    "retain 保留现有内容；revise 只在同一语义事实发生变化时给 revision；refute 表示证据否定推断；expire 表示临时状态不再有效。",
+    "每条决定必须给具体 rationale 和 confidence。所有 retain/revise 都必须给 disposition=active|candidate。",
+    "明确事实不得被间接推断覆盖；证据、作用域、版本链和显式优先由代码再次校验。",
+    `当前时间：${new Date(now).toISOString()}`,
+    `输入：${JSON.stringify(claims.map(({ claim, evidence }) => ({
+      claim: claimForPrompt(claim),
+      lifecycle: claim.metadata.lifecycle,
+      evidence: evidence.map((event) => ({
+        eventId: event.eventId,
+        actor: event.actor,
+        kind: event.kind,
+        occurredAt: event.occurredAt,
+        text: event.text,
+      })),
+    })))}`,
+    "输出结构：",
+    JSON.stringify({
+      decisions: [{
+        claimId: "输入 claimId",
+        action: "retain|revise|refute|expire",
+        disposition: "active|candidate（retain/revise 必填）",
+        confidence: 0.7,
+        rationale: "基于哪些证据作出决定",
+        revision: {
+          value: "revise 时的新 JSON value",
+          canonicalText: "revise 时的新声明",
+          validFrom: "可选 ISO 时间",
+          validTo: "可选 ISO 时间",
+          topic: "可选动态主题",
+          entityIds: [],
+          lifecycle: "stable|bounded|episodic|working",
+        },
+      }],
+    }),
+  ].join("\n");
+}
+
+export function parseReflectionResult(
+  text: string,
+  allowedClaimIds: Set<string>,
+): MemoryReflectionResult {
+  const parsed = extractJsonObject(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("reflection result must be a JSON object");
+  }
+  const rawDecisions = (parsed as { decisions?: unknown }).decisions;
+  if (!Array.isArray(rawDecisions)) {
+    throw new Error("reflection result is missing decisions");
+  }
+  const seen = new Set<string>();
+  const decisions = rawDecisions.map((raw, index): MemoryReflectionDecision => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`reflection decision ${index} must be an object`);
+    }
+    const value = raw as Record<string, unknown>;
+    const claimId = strictRequiredModelString(
+      value.claimId,
+      200,
+      `reflection decision ${index} has an invalid claimId`,
+    );
+    if (!allowedClaimIds.has(claimId)) {
+      throw new Error(`reflection decision ${index} has an invalid claimId`);
+    }
+    if (seen.has(claimId)) {
+      throw new Error(`reflection decision repeats claim ${claimId}`);
+    }
+    seen.add(claimId);
+    if (!REFLECTION_ACTIONS.has(value.action as string)) {
+      throw new Error(`reflection decision ${index} has an invalid action`);
+    }
+    const action = value.action as MemoryReflectionDecision["action"];
+    if (
+      typeof value.confidence !== "number"
+      || !Number.isFinite(value.confidence)
+      || value.confidence < 0
+      || value.confidence > 1
+    ) {
+      throw new Error(`reflection decision ${index} has an invalid confidence`);
+    }
+    const rationale = strictRequiredModelString(
+      value.rationale,
+      500,
+      `reflection decision ${index} has an invalid rationale`,
+    );
+    if (
+      value.disposition !== undefined
+      && !DISPOSITIONS.has(value.disposition as string)
+    ) {
+      throw new Error(`reflection decision ${index} has an invalid disposition`);
+    }
+    const disposition = value.disposition as MemoryReflectionDecision["disposition"];
+    if (
+      (action === "retain" || action === "revise")
+      && !disposition
+    ) {
+      throw new Error(`reflection decision ${index} is missing disposition`);
+    }
+    if (
+      (action === "refute" || action === "expire")
+      && value.disposition !== undefined
+    ) {
+      throw new Error(`reflection decision ${index} has fields incompatible with ${action}`);
+    }
+    let revision: MemoryReflectionDecision["revision"];
+    if (action === "revise") {
+      if (!value.revision || typeof value.revision !== "object" || Array.isArray(value.revision)) {
+        throw new Error(`reflection decision ${index} is missing revision`);
+      }
+      const rawRevision = value.revision as Record<string, unknown>;
+      const canonicalText = strictRequiredModelString(
+        rawRevision.canonicalText,
+        500,
+        `reflection decision ${index} has an invalid revision`,
+      );
+      if (
+        !Object.prototype.hasOwnProperty.call(rawRevision, "value")
+      ) {
+        throw new Error(`reflection decision ${index} has an invalid revision`);
+      }
+      if (
+        rawRevision.lifecycle !== undefined
+        && !LIFECYCLES.has(rawRevision.lifecycle as string)
+      ) {
+        throw new Error(`reflection decision ${index} has an invalid lifecycle`);
+      }
+      const validity = parseValidityInterval(
+        rawRevision,
+        `reflection decision ${index} has an invalid validity interval`,
+      );
+      if (!validOptionalStringArray(rawRevision.entityIds)) {
+        throw new Error(`reflection decision ${index} has invalid entityIds`);
+      }
+      revision = {
+        value: rawRevision.value,
+        canonicalText,
+        validFrom: validity.validFrom,
+        validTo: validity.validTo,
+        topic: strictOptionalModelString(
+          rawRevision.topic,
+          160,
+          `reflection decision ${index} has an invalid topic`,
+        ),
+        entityIds: stringArray(rawRevision.entityIds),
+        lifecycle: rawRevision.lifecycle as ClaimProposal["lifecycle"],
+      };
+    } else if (value.revision !== undefined) {
+      throw new Error(`reflection decision ${index} cannot include revision`);
+    }
+    return {
+      claimId,
+      action,
+      disposition,
+      confidence: value.confidence,
+      rationale,
+      revision,
+    };
+  });
+  const missing = [...allowedClaimIds].filter((claimId) => !seen.has(claimId));
+  if (missing.length > 0) {
+    throw new Error(`reflection coverage missing ${missing.length} claim(s)`);
+  }
+  return { decisions };
 }

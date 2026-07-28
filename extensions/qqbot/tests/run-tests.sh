@@ -28,6 +28,9 @@ node tests/asuka-media-caption.test.mjs
 node tests/asuka-narration.test.mjs
 node tests/asuka-memory.test.mjs
 node tests/asuka-memory-kernel.test.mjs
+node tests/asuka-memory-validity.test.mjs
+node tests/asuka-memory-policy-regressions.test.mjs
+node tests/asuka-memory-retrieval-resilience.test.mjs
 node tests/asuka-memory-legacy-projection-v15.test.mjs
 node tests/asuka-memory-model-client.test.mjs
 node tests/asuka-memory-migration-v15.test.mjs

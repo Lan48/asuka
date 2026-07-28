@@ -5,6 +5,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { load as loadSqliteVec } from "sqlite-vec";
 import { getQQBotDataDir } from "../utils/platform.js";
 import {
+  containsDeterministicSecretValue,
   defaultVisibility,
   memoryAuthorityWeight,
   normalizeConfidence,
@@ -22,31 +23,54 @@ import type {
   LegacyConsolidationDiscard,
   LegacyConsolidationRun,
   LegacyExtraction,
+  LegacyMigrationBinding,
+  LegacyMigrationBindingVerification,
+  LegacyMigrationDisposition,
+  LegacyMigrationSourceLocator,
   MemoryClaim,
   MemoryClaimState,
   MemoryEvent,
   MemoryEventInput,
   MemoryEventReceipt,
   MemoryJob,
+  MemoryJobFailureResult,
   MemoryJobKind,
   MemoryJudgement,
   MemoryProjectionClaimEvidence,
   MemoryProjectionEventSummary,
   MemoryProjectionSnapshot,
+  MemoryReflectionDecision,
   MemorySearchCandidate,
+  LegacySourceArchive,
+  LegacySourceArchiveInspection,
   MemoryVisibility,
 } from "./types.js";
 
-const SCHEMA_VERSION = 3;
-const DEFAULT_INFERENCE_PROMOTION_CONFIDENCE = 0.74;
+const SCHEMA_VERSION = 5;
 const DEFAULT_JOB_LEASE_MS = 60_000;
 const DEFAULT_MAX_JOB_ATTEMPTS = 8;
 const MAX_PROJECTION_EVIDENCE_PER_STANCE = 4;
 const MAX_PROJECTION_EVIDENCE_CHARS = 280;
+const LEGACY_ARCHIVE_CHUNK_CHARS = 8_000;
 
 interface LedgerOptions {
   enableVector?: boolean;
-  inferencePromotionConfidence?: number;
+}
+
+export interface RerankCacheContext {
+  visibility: MemoryVisibility;
+  maxPromptChars: number;
+  asOf: number | null;
+  candidateFingerprint: string;
+}
+
+interface RerankCachePayload {
+  schemaVersion: 2;
+  claimIds: string[];
+  visibility: MemoryVisibility;
+  maxPromptChars: number;
+  asOf: number | null;
+  candidateFingerprint: string;
 }
 
 interface EventRow {
@@ -105,6 +129,7 @@ interface JobRow {
   attempts: number;
   available_at: number;
   lease_until: number | null;
+  lease_token: string | null;
   last_error: string | null;
   created_at: number;
   updated_at: number;
@@ -123,6 +148,7 @@ interface LegacyExtractionRow {
 
 interface LegacyConsolidationRunRow {
   run_id: string;
+  run_token: string;
   identity_id: string;
   visibility: MemoryVisibility;
   input_hash: string;
@@ -137,6 +163,23 @@ interface LegacyConsolidationRunRow {
   error: string | null;
   created_at: number;
   updated_at: number;
+}
+
+interface LegacyMigrationBindingRow {
+  event_id: string;
+  identity_id: string;
+  account_id: string;
+  peer_kind: MemoryEvent["peerKind"];
+  peer_id: string;
+  visibility: MemoryVisibility;
+  source_kind: string;
+  source_locator_json: string;
+  content_hash: string;
+  content_chars: number;
+  chunk_count: number;
+  manifest_hash: string;
+  disposition: LegacyMigrationDisposition;
+  created_at: number;
 }
 
 interface LegacyProjectionTaskRow {
@@ -222,6 +265,7 @@ function asJob(row: JobRow): MemoryJob {
     attempts: row.attempts,
     availableAt: row.available_at,
     leaseUntil: row.lease_until ?? undefined,
+    leaseToken: row.lease_token ?? undefined,
     lastError: row.last_error ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -244,6 +288,7 @@ function asLegacyExtraction(row: LegacyExtractionRow): LegacyExtraction {
 function asLegacyConsolidationRun(row: LegacyConsolidationRunRow): LegacyConsolidationRun {
   return {
     runId: row.run_id,
+    runToken: row.run_token,
     identityId: row.identity_id,
     visibility: row.visibility,
     inputHash: row.input_hash,
@@ -258,6 +303,27 @@ function asLegacyConsolidationRun(row: LegacyConsolidationRunRow): LegacyConsoli
     error: row.error ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function asLegacyMigrationBinding(
+  row: LegacyMigrationBindingRow,
+): LegacyMigrationBinding {
+  return {
+    eventId: row.event_id,
+    identityId: row.identity_id,
+    accountId: row.account_id,
+    peerKind: row.peer_kind,
+    peerId: row.peer_id,
+    visibility: row.visibility,
+    sourceKind: row.source_kind,
+    sourceLocator: parseJson(row.source_locator_json, {}),
+    contentHash: row.content_hash,
+    contentChars: row.content_chars,
+    chunkCount: row.chunk_count,
+    manifestHash: row.manifest_hash,
+    disposition: row.disposition,
+    createdAt: row.created_at,
   };
 }
 
@@ -341,14 +407,143 @@ function makeDedupeKey(input: MemoryEventInput, occurredAt: number): string {
     .digest("hex");
 }
 
+function legacyArchiveChunks(content: string): LegacySourceArchive["chunks"] {
+  if (content.length === 0) {
+    return [{
+      index: 0,
+      startChar: 0,
+      endChar: 0,
+      contentHash: createHash("sha256").update("").digest("hex"),
+      content: "",
+    }];
+  }
+  const chunks: LegacySourceArchive["chunks"] = [];
+  let startChar = 0;
+  while (startChar < content.length) {
+    let endChar = Math.min(content.length, startChar + LEGACY_ARCHIVE_CHUNK_CHARS);
+    if (
+      endChar < content.length
+      && content.charCodeAt(endChar - 1) >= 0xD800
+      && content.charCodeAt(endChar - 1) <= 0xDBFF
+      && content.charCodeAt(endChar) >= 0xDC00
+      && content.charCodeAt(endChar) <= 0xDFFF
+    ) {
+      endChar -= 1;
+    }
+    const chunkContent = content.slice(startChar, endChar);
+    chunks.push({
+      index: chunks.length,
+      startChar,
+      endChar,
+      contentHash: createHash("sha256").update(chunkContent).digest("hex"),
+      content: chunkContent,
+    });
+    startChar = endChar;
+  }
+  return chunks;
+}
+
+function legacyArchiveManifestHash(
+  chunks: LegacySourceArchive["chunks"],
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(chunks.map((chunk) => ({
+      index: chunk.index,
+      startChar: chunk.startChar,
+      endChar: chunk.endChar,
+      contentHash: chunk.contentHash,
+    }))))
+    .digest("hex");
+}
+
+function isCompleteLegacySourceArchive(
+  archive: LegacySourceArchiveInspection | undefined,
+): archive is LegacySourceArchive {
+  return archive?.complete === true;
+}
+
+function legacySourceLocator(event: MemoryEvent): LegacyMigrationSourceLocator {
+  const sourcePath = typeof event.metadata.legacySourcePath === "string"
+    ? event.metadata.legacySourcePath
+    : undefined;
+  const sourceRecordId = typeof event.metadata.legacySourceRecordId === "string"
+    ? event.metadata.legacySourceRecordId
+    : undefined;
+  return {
+    ...(event.sourceId ? { sourceId: event.sourceId } : {}),
+    ...(sourcePath ? { sourcePath } : {}),
+    ...(sourceRecordId ? { sourceRecordId } : {}),
+  };
+}
+
 function makeFtsQuery(query: string): string {
   const normalized = normalizeText(query).replace(/["*:^(){}\[\]]/g, " ");
   return `"${normalized.replace(/"/g, '""')}"`;
 }
 
+function lexicalUnits(value: string): Set<string> {
+  const normalized = normalizeText(value).toLocaleLowerCase();
+  const units = new Set<string>();
+  for (const token of normalized.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    if (/^[\x00-\x7F]+$/.test(token)) {
+      units.add(token);
+      continue;
+    }
+    const characters = [...token];
+    for (const character of characters) units.add(character);
+    for (let size = 2; size <= 3; size += 1) {
+      for (let index = 0; index + size <= characters.length; index += 1) {
+        units.add(characters.slice(index, index + size).join(""));
+      }
+    }
+  }
+  return units;
+}
+
+function lexicalSimilarity(query: Set<string>, value: string): number {
+  if (query.size === 0) return 0;
+  const candidate = lexicalUnits(value);
+  if (candidate.size === 0) return 0;
+  let matched = 0;
+  for (const unit of query) {
+    if (candidate.has(unit)) matched += 1;
+  }
+  return matched / Math.sqrt(query.size * candidate.size);
+}
+
+function proposalAuthority(event: MemoryEvent, proposal: ClaimProposal): MemoryClaim["authority"] {
+  if (proposal.epistemicStatus === "inferred") {
+    return "inferred";
+  }
+  if (event.actor === "user" && event.kind === "human_override") return "human_override";
+  if (
+    event.actor === "user"
+    && (event.kind === "memory_control" || event.kind === "human_override")
+    && proposal.authority === "user_correction"
+  ) {
+    return "user_correction";
+  }
+  if (event.actor === "user") return "user_explicit";
+  if (
+    proposal.authority === "mutual_agreement"
+    && event.metadata.mutualAgreement === true
+  ) {
+    return "mutual_agreement";
+  }
+  return "summary";
+}
+
 function recencyScore(updatedAt: number, now: number): number {
   const ageDays = Math.max(0, now - updatedAt) / 86_400_000;
   return 1 / (1 + ageDays / 30);
+}
+
+function diversityKey(query: string, claim: MemoryClaim): string {
+  return createHash("sha256")
+    .update(query)
+    .update("\u0000")
+    .update(claim.rootClaimId)
+    .digest("hex");
 }
 
 export function getDefaultMemoryLedgerPath(): string {
@@ -359,7 +554,7 @@ export class AsukaMemoryLedger {
   readonly databasePath: string;
   readonly vectorAvailable: boolean;
   private readonly db: DatabaseSync;
-  private readonly inferencePromotionConfidence: number;
+  private closed = false;
 
   constructor(databasePath = getDefaultMemoryLedgerPath(), options: LedgerOptions = {}) {
     this.databasePath = databasePath;
@@ -378,14 +573,16 @@ export class AsukaMemoryLedger {
     }
     this.migrate();
     this.vectorAvailable = options.enableVector === false ? false : this.tryLoadVectorExtension();
-    this.inferencePromotionConfidence = Math.max(
-      0,
-      Math.min(1, options.inferencePromotionConfidence ?? DEFAULT_INFERENCE_PROMOTION_CONFIDENCE),
-    );
   }
 
   close(): void {
+    if (this.closed) return;
     this.db.close();
+    this.closed = true;
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
   }
 
   private tryLoadVectorExtension(): boolean {
@@ -502,6 +699,7 @@ export class AsukaMemoryLedger {
         attempts INTEGER NOT NULL DEFAULT 0,
         available_at INTEGER NOT NULL,
         lease_until INTEGER,
+        lease_token TEXT,
         last_error TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
@@ -523,8 +721,29 @@ export class AsukaMemoryLedger {
       CREATE INDEX IF NOT EXISTS idx_legacy_extractions_scope
         ON legacy_extractions(identity_id, visibility, disposition);
 
+      CREATE TABLE IF NOT EXISTS legacy_source_archives (
+        event_id TEXT PRIMARY KEY REFERENCES memory_events(event_id) ON DELETE CASCADE,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_chars INTEGER NOT NULL,
+        chunk_count INTEGER NOT NULL,
+        manifest_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS legacy_source_archive_chunks (
+        event_id TEXT NOT NULL REFERENCES legacy_source_archives(event_id) ON DELETE CASCADE,
+        chunk_index INTEGER NOT NULL,
+        start_char INTEGER NOT NULL,
+        end_char INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        PRIMARY KEY(event_id, chunk_index)
+      );
+
       CREATE TABLE IF NOT EXISTS legacy_consolidation_runs (
         run_id TEXT PRIMARY KEY,
+        run_token TEXT NOT NULL,
         identity_id TEXT NOT NULL,
         visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
         input_hash TEXT NOT NULL,
@@ -543,6 +762,25 @@ export class AsukaMemoryLedger {
       );
       CREATE INDEX IF NOT EXISTS idx_legacy_consolidation_scope
         ON legacy_consolidation_runs(identity_id, visibility, updated_at);
+
+      CREATE TABLE IF NOT EXISTS legacy_migration_bindings (
+        event_id TEXT PRIMARY KEY REFERENCES memory_events(event_id),
+        identity_id TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        peer_kind TEXT NOT NULL CHECK (peer_kind IN ('direct', 'group')),
+        peer_id TEXT NOT NULL,
+        visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
+        source_kind TEXT NOT NULL,
+        source_locator_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content_chars INTEGER NOT NULL,
+        chunk_count INTEGER NOT NULL,
+        manifest_hash TEXT NOT NULL,
+        disposition TEXT NOT NULL CHECK (
+          disposition IN ('imported', 'audited_non_import', 'redacted')
+        ),
+        created_at INTEGER NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS projection_cursors (
         projection TEXT PRIMARY KEY,
@@ -652,9 +890,203 @@ export class AsukaMemoryLedger {
     ) {
       this.db.exec("DROP INDEX IF EXISTS idx_memory_claims_semantic_key");
     }
+
+    const jobColumns = this.db.prepare("PRAGMA table_info(memory_jobs)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!jobColumns.some((column) => column.name === "lease_token")) {
+      this.db.exec("ALTER TABLE memory_jobs ADD COLUMN lease_token TEXT");
+    }
+
+    const archiveColumns = this.db.prepare("PRAGMA table_info(legacy_source_archives)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!archiveColumns.some((column) => column.name === "chunk_count")) {
+      this.db.exec(
+        "ALTER TABLE legacy_source_archives ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    if (!archiveColumns.some((column) => column.name === "manifest_hash")) {
+      this.db.exec(
+        "ALTER TABLE legacy_source_archives ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    const archiveRows = this.db.prepare(`
+      SELECT archive.event_id, archive.content_hash, archive.content,
+             archive.content_chars
+      FROM legacy_source_archives AS archive
+      LEFT JOIN legacy_migration_bindings AS binding
+        ON binding.event_id = archive.event_id
+      WHERE binding.event_id IS NULL
+        AND (archive.chunk_count = 0 OR archive.manifest_hash = '')
+    `).all() as unknown as Array<{
+      event_id: string;
+      content_hash: string;
+      content: string;
+      content_chars: number;
+    }>;
+    const updateArchiveManifest = this.db.prepare(`
+      UPDATE legacy_source_archives
+      SET chunk_count = ?, manifest_hash = ?
+      WHERE event_id = ?
+    `);
+    if (archiveRows.length > 0) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec("DROP TRIGGER IF EXISTS legacy_source_archives_immutable");
+        const deleteChunks = this.db.prepare(`
+          DELETE FROM legacy_source_archive_chunks WHERE event_id = ?
+        `);
+        const insertChunk = this.db.prepare(`
+          INSERT INTO legacy_source_archive_chunks(
+            event_id, chunk_index, start_char, end_char, content_hash, content
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        for (const archive of archiveRows) {
+          if (
+            archive.content.length !== archive.content_chars
+            || createHash("sha256").update(archive.content).digest("hex")
+              !== archive.content_hash
+          ) {
+            continue;
+          }
+          const chunks = legacyArchiveChunks(archive.content);
+          deleteChunks.run(archive.event_id);
+          for (const chunk of chunks) {
+            insertChunk.run(
+              archive.event_id,
+              chunk.index,
+              chunk.startChar,
+              chunk.endChar,
+              chunk.contentHash,
+              chunk.content,
+            );
+          }
+          updateArchiveManifest.run(
+            chunks.length,
+            legacyArchiveManifestHash(chunks),
+            archive.event_id,
+          );
+        }
+        this.db.exec(`
+          CREATE TRIGGER IF NOT EXISTS legacy_source_archives_immutable
+          BEFORE UPDATE ON legacy_source_archives
+          BEGIN
+            SELECT RAISE(ABORT, 'legacy source archive is immutable');
+          END
+        `);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+
+    const consolidationColumns = this.db
+      .prepare("PRAGMA table_info(legacy_consolidation_runs)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!consolidationColumns.some((column) => column.name === "run_token")) {
+      this.db.exec(
+        "ALTER TABLE legacy_consolidation_runs ADD COLUMN run_token TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    const tokenlessRuns = this.db.prepare(`
+      SELECT run_id FROM legacy_consolidation_runs WHERE run_token = ''
+    `).all() as unknown as Array<{ run_id: string }>;
+    const updateRunToken = this.db.prepare(`
+      UPDATE legacy_consolidation_runs SET run_token = ? WHERE run_id = ?
+    `);
+    for (const run of tokenlessRuns) {
+      updateRunToken.run(randomUUID(), run.run_id);
+    }
+
+    const unboundArchives = this.db.prepare(`
+      SELECT archive.event_id
+      FROM legacy_source_archives AS archive
+      LEFT JOIN legacy_migration_bindings AS binding
+        ON binding.event_id = archive.event_id
+      WHERE binding.event_id IS NULL
+    `).all() as unknown as Array<{ event_id: string }>;
+    for (const { event_id: eventId } of unboundArchives) {
+      const event = this.getEvent(eventId);
+      const archive = this.inspectLegacySourceArchive(eventId);
+      if (!event || !archive?.complete) continue;
+      this.storeLegacyMigrationBindingWithinTransaction(
+        event,
+        archive,
+        event.metadata.legacyAuditedNonImport
+          ? "audited_non_import"
+          : "imported",
+        event.recordedAt,
+      );
+    }
+
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_memory_claims_semantic_key
         ON memory_claims(identity_id, visibility, semantic_key, state);
+
+      CREATE TRIGGER IF NOT EXISTS legacy_source_archives_immutable
+      BEFORE UPDATE ON legacy_source_archives
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy source archive is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_source_archive_chunks_immutable
+      BEFORE UPDATE ON legacy_source_archive_chunks
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy source archive chunk is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_source_archive_chunks_insert_immutable
+      BEFORE INSERT ON legacy_source_archive_chunks
+      WHEN EXISTS (
+        SELECT 1 FROM legacy_migration_bindings
+        WHERE event_id = NEW.event_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'finalized legacy source archive is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_source_archive_chunks_delete_immutable
+      BEFORE DELETE ON legacy_source_archive_chunks
+      WHEN EXISTS (
+        SELECT 1 FROM legacy_migration_bindings
+        WHERE event_id = OLD.event_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'finalized legacy source archive is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_source_archives_delete_immutable
+      BEFORE DELETE ON legacy_source_archives
+      WHEN EXISTS (
+        SELECT 1 FROM legacy_migration_bindings
+        WHERE event_id = OLD.event_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'bound legacy source archive is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_migration_bindings_immutable_update
+      BEFORE UPDATE ON legacy_migration_bindings
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy migration binding is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_migration_bindings_immutable_delete
+      BEFORE DELETE ON legacy_migration_bindings
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy migration binding is immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS legacy_migration_bound_events_immutable_delete
+      BEFORE DELETE ON memory_events
+      WHEN EXISTS (
+        SELECT 1 FROM legacy_migration_bindings
+        WHERE event_id = OLD.event_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'legacy migration binding prevents event deletion');
+      END;
+
       INSERT OR IGNORE INTO schema_migrations(version, applied_at)
       VALUES (${SCHEMA_VERSION}, unixepoch('now') * 1000);
     `);
@@ -756,64 +1188,145 @@ export class AsukaMemoryLedger {
     return row?.identity_id ?? makeDefaultIdentityId(accountId, peerKind, peerId);
   }
 
-  appendEvent(input: MemoryEventInput): MemoryEventReceipt {
+  resolveIdentityForRetrieval(
+    accountId: string,
+    peerKind: "direct" | "group",
+    peerId: string,
+    requestedIdentityId?: string,
+  ): string {
+    const row = this.db.prepare(`
+      SELECT identity_id
+      FROM identity_links
+      WHERE account_id = ? AND peer_kind = ? AND peer_id = ?
+    `).get(accountId, peerKind, peerId) as { identity_id?: string } | undefined;
+    const identityId = row?.identity_id ?? makeDefaultIdentityId(
+      accountId,
+      peerKind,
+      peerId,
+    );
+    if (
+      requestedIdentityId?.trim()
+      && requestedIdentityId.trim() !== identityId
+    ) {
+      throw new Error("Requested identity does not match the current peer scope");
+    }
+    return identityId;
+  }
+
+  private appendEventWithinTransaction(input: MemoryEventInput): MemoryEventReceipt {
+    if (containsDeterministicSecretValue({
+      text: input.text,
+      evidence: input.evidence,
+      metadata: input.metadata,
+    })) {
+      throw new Error("Secret-bearing memory event must be redacted before persistence");
+    }
     const text = normalizeText(input.text);
     const occurredAt = input.occurredAt ?? Date.now();
     const recordedAt = Date.now();
+    const visibility = input.visibility ?? defaultVisibility(input.peerKind);
+    if (input.peerKind === "group" && visibility === "private") {
+      throw new Error("Private memory events cannot be written into a group scope");
+    }
+    const dedupeKey = makeDedupeKey(input, occurredAt);
+    const duplicate = this.db.prepare(`
+      SELECT * FROM memory_events WHERE dedupe_key = ?
+    `).get(dedupeKey) as EventRow | undefined;
+    if (duplicate) {
+      const requestedIdentityId = input.identityId?.trim();
+      if (
+        duplicate.account_id !== input.accountId
+        || duplicate.peer_kind !== input.peerKind
+        || duplicate.peer_id !== input.peerId
+        || duplicate.visibility !== visibility
+        || duplicate.actor !== input.actor
+        || duplicate.kind !== input.kind
+        || (
+          requestedIdentityId !== undefined
+          && requestedIdentityId !== duplicate.identity_id
+        )
+      ) {
+        throw new Error("Duplicate memory event scope does not match the stored event");
+      }
+      return {
+        eventId: duplicate.event_id,
+        identityId: duplicate.identity_id,
+        inserted: false,
+      };
+    }
     const identityId = this.resolveIdentity(
       input.accountId,
       input.peerKind,
       input.peerId,
       input.identityId,
     );
-    const visibility = input.visibility ?? defaultVisibility(input.peerKind);
-    if (input.peerKind === "group" && visibility === "private") {
-      throw new Error("Private memory events cannot be written into a group scope");
-    }
-    const dedupeKey = makeDedupeKey(input, occurredAt);
     const eventId = randomUUID();
 
+    this.linkIdentity({
+      identityId,
+      accountId: input.accountId,
+      peerKind: input.peerKind,
+      peerId: input.peerId,
+      visibility,
+    }, recordedAt);
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO memory_events(
+        event_id, identity_id, account_id, peer_kind, peer_id, actor, kind,
+        visibility, text, source_id, source_message_id, occurred_at, recorded_at,
+        evidence_json, metadata_json, generated_from_claim_ids_json, dedupe_key
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId,
+      identityId,
+      input.accountId,
+      input.peerKind,
+      input.peerId,
+      input.actor,
+      input.kind,
+      visibility,
+      text,
+      input.sourceId ?? null,
+      input.sourceMessageId ?? null,
+      occurredAt,
+      recordedAt,
+      JSON.stringify(input.evidence ?? {}),
+      JSON.stringify(input.metadata ?? {}),
+      JSON.stringify(input.generatedFromClaimIds ?? []),
+      dedupeKey,
+    );
+    if (result.changes !== 1) {
+      throw new Error("Memory event insertion lost an unexpected dedupe race");
+    }
+    return { eventId, identityId, inserted: true };
+  }
+
+  appendEvent(input: MemoryEventInput): MemoryEventReceipt {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.linkIdentity({
-        identityId,
-        accountId: input.accountId,
-        peerKind: input.peerKind,
-        peerId: input.peerId,
-        visibility,
-      }, recordedAt);
-      const result = this.db.prepare(`
-        INSERT OR IGNORE INTO memory_events(
-          event_id, identity_id, account_id, peer_kind, peer_id, actor, kind,
-          visibility, text, source_id, source_message_id, occurred_at, recorded_at,
-          evidence_json, metadata_json, generated_from_claim_ids_json, dedupe_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        eventId,
-        identityId,
-        input.accountId,
-        input.peerKind,
-        input.peerId,
-        input.actor,
-        input.kind,
-        visibility,
-        text,
-        input.sourceId ?? null,
-        input.sourceMessageId ?? null,
-        occurredAt,
-        recordedAt,
-        JSON.stringify(input.evidence ?? {}),
-        JSON.stringify(input.metadata ?? {}),
-        JSON.stringify(input.generatedFromClaimIds ?? []),
-        dedupeKey,
-      );
-      const inserted = result.changes > 0;
-      const storedEventId = inserted
-        ? eventId
-        : (this.db.prepare("SELECT event_id FROM memory_events WHERE dedupe_key = ?")
-          .get(dedupeKey) as { event_id: string }).event_id;
+      const receipt = this.appendEventWithinTransaction(input);
       this.db.exec("COMMIT");
-      return { eventId: storedEventId, identityId, inserted };
+      return receipt;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  scheduleReflectionBatch(
+    input: MemoryEventInput,
+    availableAt = Date.now(),
+  ): { event: MemoryEvent; job: MemoryJob } {
+    if (input.kind !== "reflection") {
+      throw new Error("reflection scheduling requires a reflection event");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const receipt = this.appendEventWithinTransaction(input);
+      const job = this.enqueueJob(receipt.eventId, "reflect", availableAt);
+      const event = this.getEvent(receipt.eventId);
+      if (!event) throw new Error("scheduled reflection event was not persisted");
+      this.db.exec("COMMIT");
+      return { event, job };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -834,20 +1347,452 @@ export class AsukaMemoryLedger {
     return (rows as unknown as EventRow[]).map(asEvent);
   }
 
+  storeLegacySourceArchive(
+    eventId: string,
+    content: string,
+    contentHash: string,
+    at = Date.now(),
+  ): LegacySourceArchive {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const archive = this.storeLegacySourceArchiveWithinTransaction(
+        eventId,
+        content,
+        contentHash,
+        at,
+      );
+      const event = this.getEvent(eventId)!;
+      this.storeLegacyMigrationBindingWithinTransaction(
+        event,
+        archive,
+        event.metadata.legacyAuditedNonImport
+          ? "audited_non_import"
+          : "imported",
+        at,
+      );
+      this.db.exec("COMMIT");
+      return archive;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private storeLegacySourceArchiveWithinTransaction(
+    eventId: string,
+    content: string,
+    contentHash: string,
+    at: number,
+  ): LegacySourceArchive {
+    if (containsDeterministicSecretValue(content)) {
+      throw new Error("Secret-bearing legacy source cannot be archived");
+    }
+    const event = this.getEvent(eventId);
+    if (!event || event.kind !== "legacy_import") {
+      throw new Error(`legacy source archive event not found: ${eventId}`);
+    }
+    if (!contentHash.trim()) throw new Error("legacy source archive hash is required");
+    if (event.metadata.legacyContentHash !== contentHash) {
+      throw new Error(`legacy source archive hash does not match event ${eventId}`);
+    }
+    if (createHash("sha256").update(content).digest("hex") !== contentHash) {
+      throw new Error(`legacy source archive content hash mismatch for event ${eventId}`);
+    }
+    const existing = this.inspectLegacySourceArchive(eventId);
+    if (existing) {
+      if (
+        !isCompleteLegacySourceArchive(existing)
+        || existing.contentHash !== contentHash
+        || existing.content !== content
+      ) {
+        throw new Error(`legacy source archive is immutable for event ${eventId}`);
+      }
+      return existing;
+    }
+    const chunks = legacyArchiveChunks(content);
+    const manifestHash = legacyArchiveManifestHash(chunks);
+    this.db.prepare(`
+      INSERT INTO legacy_source_archives(
+        event_id, content_hash, content, content_chars, chunk_count,
+        manifest_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      eventId,
+      contentHash,
+      content,
+      content.length,
+      chunks.length,
+      manifestHash,
+      at,
+    );
+    const insertChunk = this.db.prepare(`
+      INSERT INTO legacy_source_archive_chunks(
+        event_id, chunk_index, start_char, end_char, content_hash, content
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    for (const chunk of chunks) {
+      insertChunk.run(
+        eventId,
+        chunk.index,
+        chunk.startChar,
+        chunk.endChar,
+        chunk.contentHash,
+        chunk.content,
+      );
+    }
+    const stored = this.inspectLegacySourceArchive(eventId);
+    if (!isCompleteLegacySourceArchive(stored)) {
+      throw new Error(`legacy source archive integrity verification failed for event ${eventId}`);
+    }
+    return stored;
+  }
+
+  appendLegacyEvent(
+    input: MemoryEventInput,
+    source: {
+      content: string;
+      contentHash: string;
+    },
+    options: {
+      enqueue?: boolean;
+      jobKind?: MemoryJobKind;
+    } = {},
+  ): MemoryEventReceipt {
+    if (input.kind !== "legacy_import") {
+      throw new Error("legacy source archives require a legacy_import event");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const receipt = this.appendEventWithinTransaction(input);
+      const archive = this.storeLegacySourceArchiveWithinTransaction(
+        receipt.eventId,
+        source.content,
+        source.contentHash,
+        Date.now(),
+      );
+      const event = this.getEvent(receipt.eventId)!;
+      this.storeLegacyMigrationBindingWithinTransaction(
+        event,
+        archive,
+        event.metadata.legacyAuditedNonImport
+          ? "audited_non_import"
+          : "imported",
+        Date.now(),
+      );
+      if (options.enqueue !== false) {
+        this.enqueueJob(receipt.eventId, options.jobKind ?? "legacy_rejudge");
+      }
+      this.db.exec("COMMIT");
+      return receipt;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendLegacyRedactedEvent(
+    input: MemoryEventInput,
+    source: { contentHash: string; contentChars: number },
+  ): MemoryEventReceipt {
+    if (
+      input.kind !== "legacy_import"
+      || input.metadata?.secretRedacted !== true
+      || input.metadata.legacyRedactionDisposition !== "deterministic_secret_filter"
+    ) {
+      throw new Error("redacted legacy events require an explicit redaction disposition");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const receipt = this.appendEventWithinTransaction(input);
+      const event = this.getEvent(receipt.eventId)!;
+      if (
+        event.metadata.legacyContentHash !== source.contentHash
+        || !Number.isSafeInteger(source.contentChars)
+        || source.contentChars < 0
+      ) {
+        throw new Error("redacted legacy source binding does not match its event");
+      }
+      this.storeLegacyMigrationBindingWithinTransaction(
+        event,
+        {
+          contentHash: source.contentHash,
+          contentChars: source.contentChars,
+          chunkCount: 0,
+          manifestHash: legacyArchiveManifestHash([]),
+        },
+        "redacted",
+        Date.now(),
+      );
+      this.db.exec("COMMIT");
+      return receipt;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  inspectLegacySourceArchive(
+    eventId: string,
+  ): LegacySourceArchiveInspection | undefined {
+    const archive = this.db.prepare(`
+      SELECT content_hash, content, content_chars, chunk_count, manifest_hash
+      FROM legacy_source_archives
+      WHERE event_id = ?
+    `).get(eventId) as {
+      content_hash: string;
+      content: string;
+      content_chars: number;
+      chunk_count: number;
+      manifest_hash: string;
+    } | undefined;
+    if (!archive) return undefined;
+    const chunks = (this.db.prepare(`
+      SELECT chunk_index, start_char, end_char, content_hash, content
+      FROM legacy_source_archive_chunks
+      WHERE event_id = ?
+      ORDER BY chunk_index
+    `).all(eventId) as unknown as Array<{
+      chunk_index: number;
+      start_char: number;
+      end_char: number;
+      content_hash: string;
+      content: string;
+    }>).map((chunk) => ({
+      index: chunk.chunk_index,
+      startChar: chunk.start_char,
+      endChar: chunk.end_char,
+      contentHash: chunk.content_hash,
+      content: chunk.content,
+    }));
+    const expectedChunks = legacyArchiveChunks(archive.content);
+    let cursor = 0;
+    let complete = chunks.length === archive.chunk_count
+      && archive.chunk_count === expectedChunks.length;
+    for (const [index, chunk] of chunks.entries()) {
+      const expected = expectedChunks[index];
+      if (
+        !expected
+        ||
+        chunk.index !== index
+        || chunk.startChar !== expected.startChar
+        || chunk.endChar !== expected.endChar
+        || chunk.contentHash !== expected.contentHash
+        || chunk.content !== expected.content
+        || chunk.startChar !== cursor
+        || chunk.endChar - chunk.startChar !== chunk.content.length
+        || createHash("sha256").update(chunk.content).digest("hex") !== chunk.contentHash
+        || (
+          archive.content_chars > 0
+          && chunk.content.length === 0
+        )
+      ) {
+        complete = false;
+        break;
+      }
+      cursor = chunk.endChar;
+    }
+    const joined = chunks.map((chunk) => chunk.content).join("");
+    const manifestHash = legacyArchiveManifestHash(chunks);
+    complete = complete
+      && cursor === archive.content_chars
+      && archive.content.length === archive.content_chars
+      && joined === archive.content
+      && archive.manifest_hash === manifestHash
+      && archive.manifest_hash === legacyArchiveManifestHash(expectedChunks)
+      && createHash("sha256").update(archive.content).digest("hex") === archive.content_hash;
+    return {
+      eventId,
+      contentHash: archive.content_hash,
+      content: archive.content,
+      contentChars: archive.content_chars,
+      coveredChars: cursor,
+      chunkCount: archive.chunk_count,
+      manifestHash: archive.manifest_hash,
+      complete,
+      chunks,
+    };
+  }
+
+  getLegacySourceArchive(eventId: string): LegacySourceArchive | undefined {
+    const archive = this.inspectLegacySourceArchive(eventId);
+    if (!archive) return undefined;
+    if (!isCompleteLegacySourceArchive(archive)) {
+      throw new Error(`legacy source archive integrity verification failed for event ${eventId}`);
+    }
+    return archive;
+  }
+
+  private storeLegacyMigrationBindingWithinTransaction(
+    event: MemoryEvent,
+    archive: Pick<
+      LegacySourceArchiveInspection,
+      "contentHash" | "contentChars" | "chunkCount" | "manifestHash"
+    >,
+    disposition: LegacyMigrationDisposition,
+    at: number,
+  ): LegacyMigrationBinding {
+    const sourceKind = typeof event.metadata.legacySourceKind === "string"
+      ? event.metadata.legacySourceKind.trim()
+      : "";
+    if (
+      event.kind !== "legacy_import"
+      || !sourceKind
+      || event.metadata.legacyContentHash !== archive.contentHash
+    ) {
+      throw new Error("legacy migration binding does not match its source event");
+    }
+    const locator = legacySourceLocator(event);
+    const expected: LegacyMigrationBinding = {
+      eventId: event.eventId,
+      identityId: event.identityId,
+      accountId: event.accountId,
+      peerKind: event.peerKind,
+      peerId: event.peerId,
+      visibility: event.visibility,
+      sourceKind,
+      sourceLocator: locator,
+      contentHash: archive.contentHash,
+      contentChars: archive.contentChars,
+      chunkCount: archive.chunkCount,
+      manifestHash: archive.manifestHash,
+      disposition,
+      createdAt: at,
+    };
+    const existing = this.getLegacyMigrationBinding(event.eventId);
+    if (existing) {
+      const comparable = (binding: LegacyMigrationBinding) => ({
+        ...binding,
+        createdAt: 0,
+      });
+      if (
+        JSON.stringify(comparable(existing))
+        !== JSON.stringify(comparable(expected))
+      ) {
+        throw new Error(`legacy migration binding is immutable for event ${event.eventId}`);
+      }
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO legacy_migration_bindings(
+        event_id, identity_id, account_id, peer_kind, peer_id, visibility,
+        source_kind, source_locator_json, content_hash, content_chars,
+        chunk_count, manifest_hash, disposition, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      expected.eventId,
+      expected.identityId,
+      expected.accountId,
+      expected.peerKind,
+      expected.peerId,
+      expected.visibility,
+      expected.sourceKind,
+      JSON.stringify(expected.sourceLocator),
+      expected.contentHash,
+      expected.contentChars,
+      expected.chunkCount,
+      expected.manifestHash,
+      expected.disposition,
+      expected.createdAt,
+    );
+    return this.getLegacyMigrationBinding(event.eventId)!;
+  }
+
+  getLegacyMigrationBinding(eventId: string): LegacyMigrationBinding | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM legacy_migration_bindings WHERE event_id = ?
+    `).get(eventId) as LegacyMigrationBindingRow | undefined;
+    return row ? asLegacyMigrationBinding(row) : undefined;
+  }
+
+  listLegacyMigrationBindings(): LegacyMigrationBinding[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM legacy_migration_bindings ORDER BY created_at, event_id
+    `).all() as unknown as LegacyMigrationBindingRow[];
+    return rows.map(asLegacyMigrationBinding);
+  }
+
+  verifyLegacyMigrationBinding(
+    eventId: string,
+  ): LegacyMigrationBindingVerification {
+    const binding = this.getLegacyMigrationBinding(eventId);
+    if (!binding) {
+      throw new Error(`legacy migration binding not found: ${eventId}`);
+    }
+    const errors: string[] = [];
+    const event = this.getEvent(eventId);
+    if (!event) {
+      errors.push("event_missing");
+      return { binding, valid: false, errors };
+    }
+    if (event.kind !== "legacy_import") errors.push("event_kind_mismatch");
+    for (const [field, actual, expected] of [
+      ["identity", event.identityId, binding.identityId],
+      ["account", event.accountId, binding.accountId],
+      ["peer_kind", event.peerKind, binding.peerKind],
+      ["peer_id", event.peerId, binding.peerId],
+      ["visibility", event.visibility, binding.visibility],
+      ["source_kind", event.metadata.legacySourceKind, binding.sourceKind],
+      ["content_hash", event.metadata.legacyContentHash, binding.contentHash],
+    ] as const) {
+      if (actual !== expected) errors.push(`${field}_mismatch`);
+    }
+    if (
+      JSON.stringify(legacySourceLocator(event))
+      !== JSON.stringify(binding.sourceLocator)
+    ) {
+      errors.push("source_locator_mismatch");
+    }
+    const expectedDisposition: LegacyMigrationDisposition =
+      event.metadata.secretRedacted === true
+        ? "redacted"
+        : event.metadata.legacyAuditedNonImport
+          ? "audited_non_import"
+          : "imported";
+    if (binding.disposition !== expectedDisposition) {
+      errors.push("disposition_mismatch");
+    }
+    const archive = this.inspectLegacySourceArchive(eventId);
+    if (binding.disposition === "redacted") {
+      if (
+        event.metadata.legacyRedactionDisposition
+          !== "deterministic_secret_filter"
+      ) {
+        errors.push("redaction_disposition_mismatch");
+      }
+      if (archive) errors.push("redacted_archive_present");
+      if (
+        binding.chunkCount !== 0
+        || binding.manifestHash !== legacyArchiveManifestHash([])
+      ) {
+        errors.push("redacted_manifest_mismatch");
+      }
+    } else if (!archive) {
+      errors.push("archive_missing");
+    } else {
+      if (!archive.complete) errors.push("archive_incomplete");
+      if (archive.contentHash !== binding.contentHash) {
+        errors.push("archive_content_hash_mismatch");
+      }
+      if (archive.contentChars !== binding.contentChars) {
+        errors.push("archive_content_length_mismatch");
+      }
+      if (archive.chunkCount !== binding.chunkCount) {
+        errors.push("archive_chunk_count_mismatch");
+      }
+      if (archive.manifestHash !== binding.manifestHash) {
+        errors.push("archive_manifest_mismatch");
+      }
+    }
+    return { binding, valid: errors.length === 0, errors };
+  }
+
   enqueueJob(eventId: string, kind: MemoryJobKind, availableAt = Date.now()): MemoryJob {
     const now = Date.now();
     this.db.prepare(`
       INSERT INTO memory_jobs(
         job_id, event_id, kind, status, attempts, available_at, created_at, updated_at
       ) VALUES (?, ?, ?, 'pending', 0, ?, ?, ?)
-      ON CONFLICT(event_id, kind) DO UPDATE SET
-        status = CASE WHEN memory_jobs.status = 'completed' THEN 'completed' ELSE 'pending' END,
-        available_at = CASE
-          WHEN memory_jobs.status = 'completed' THEN memory_jobs.available_at
-          ELSE excluded.available_at
-        END,
-        lease_until = NULL,
-        updated_at = excluded.updated_at
+      ON CONFLICT(event_id, kind) DO NOTHING
     `).run(randomUUID(), eventId, kind, availableAt, now, now);
     const row = this.db.prepare("SELECT * FROM memory_jobs WHERE event_id = ? AND kind = ?")
       .get(eventId, kind) as unknown as JobRow;
@@ -870,6 +1815,44 @@ export class AsukaMemoryLedger {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const expired = this.db.prepare(`
+        SELECT job_id, event_id, kind
+        FROM memory_jobs
+        WHERE status = 'running'
+          AND lease_until IS NOT NULL
+          AND lease_until <= ?
+          AND attempts >= ?
+          ${kindClause}
+      `).all(now, maxAttempts, ...(kinds ?? [])) as unknown as Array<{
+        job_id: string;
+        event_id: string;
+        kind: MemoryJobKind;
+      }>;
+      for (const job of expired) {
+        if (job.kind === "reflect") {
+          this.quarantineReflectionClaimsWithinTransaction(
+            job.event_id,
+            "job lease expired at the attempt limit",
+            now,
+          );
+        }
+        const failed = this.db.prepare(`
+          UPDATE memory_jobs
+          SET status = 'failed',
+              lease_until = NULL,
+              lease_token = NULL,
+              last_error = 'job lease expired at the attempt limit',
+              updated_at = ?
+          WHERE job_id = ?
+            AND status = 'running'
+            AND lease_until IS NOT NULL
+            AND lease_until <= ?
+            AND attempts >= ?
+        `).run(now, job.job_id, now, maxAttempts);
+        if (failed.changes !== 1) {
+          throw new Error("expired job lease changed during terminal handling");
+        }
+      }
       const row = this.db.prepare(`
         SELECT *
         FROM memory_jobs
@@ -886,7 +1869,7 @@ export class AsukaMemoryLedger {
               FROM memory_jobs AS older
               JOIN memory_events AS older_event ON older_event.event_id = older.event_id
               WHERE older.kind = 'legacy_rejudge'
-                AND older.status <> 'completed'
+                AND older.status IN ('pending', 'running')
                 AND older_event.identity_id = (
                   SELECT current_event.identity_id
                   FROM memory_events AS current_event
@@ -915,14 +1898,16 @@ export class AsukaMemoryLedger {
         this.db.exec("COMMIT");
         return undefined;
       }
+      const leaseToken = randomUUID();
       this.db.prepare(`
         UPDATE memory_jobs
         SET status = 'running',
             attempts = attempts + 1,
             lease_until = ?,
+            lease_token = ?,
             updated_at = ?
         WHERE job_id = ?
-      `).run(now + leaseMs, now, row.job_id);
+      `).run(now + leaseMs, leaseToken, now, row.job_id);
       const claimed = this.db.prepare("SELECT * FROM memory_jobs WHERE job_id = ?")
         .get(row.job_id) as unknown as JobRow;
       this.db.exec("COMMIT");
@@ -933,39 +1918,165 @@ export class AsukaMemoryLedger {
     }
   }
 
-  completeJob(jobId: string, at = Date.now()): void {
-    this.db.prepare(`
+  completeJob(jobId: string, leaseToken: string, at = Date.now()): boolean {
+    const result = this.db.prepare(`
       UPDATE memory_jobs
-      SET status = 'completed', lease_until = NULL, last_error = NULL, updated_at = ?
-      WHERE job_id = ?
-    `).run(at, jobId);
+      SET status = 'completed',
+          lease_until = NULL,
+          lease_token = NULL,
+          last_error = NULL,
+          updated_at = ?
+      WHERE job_id = ? AND status = 'running' AND lease_token = ?
+    `).run(at, jobId, leaseToken);
+    return result.changes === 1;
   }
 
-  failJob(jobId: string, error: string, options: {
+  failJob(jobId: string, leaseToken: string, error: string, options: {
     retryAt?: number;
     maxAttempts?: number;
-  } = {}): void {
+  } = {}): MemoryJobFailureResult {
     const now = Date.now();
-    const row = this.db.prepare("SELECT attempts FROM memory_jobs WHERE job_id = ?")
-      .get(jobId) as { attempts: number } | undefined;
-    if (!row) return;
+    const row = this.db.prepare(`
+      SELECT attempts
+      FROM memory_jobs
+      WHERE job_id = ? AND status = 'running' AND lease_token = ?
+    `).get(jobId, leaseToken) as { attempts: number } | undefined;
+    if (!row) return { applied: false, terminal: false };
     const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_JOB_ATTEMPTS;
     const terminal = row.attempts >= maxAttempts;
-    this.db.prepare(`
+    const safeJobError = containsDeterministicSecretValue(error)
+      ? "[secret-bearing job error omitted]"
+      : error.slice(0, 1_000);
+    const result = this.db.prepare(`
       UPDATE memory_jobs
       SET status = ?,
           available_at = ?,
           lease_until = NULL,
+          lease_token = NULL,
           last_error = ?,
           updated_at = ?
-      WHERE job_id = ?
+      WHERE job_id = ? AND status = 'running' AND lease_token = ?
     `).run(
       terminal ? "failed" : "pending",
       options.retryAt ?? now + Math.min(3_600_000, 15_000 * 2 ** Math.max(0, row.attempts - 1)),
-      error.slice(0, 1_000),
+      safeJobError,
       now,
       jobId,
+      leaseToken,
     );
+    return { applied: result.changes === 1, terminal };
+  }
+
+  private quarantineReflectionClaimsWithinTransaction(
+    eventId: string,
+    error: string,
+    at: number,
+  ): string[] {
+    const event = this.getEvent(eventId);
+    if (!event) return [];
+    const targetClaimIds = event.kind === "reflection" && Array.isArray(event.metadata.targetClaimIds)
+      ? event.metadata.targetClaimIds.filter(
+        (claimId): claimId is string => typeof claimId === "string",
+      )
+      : this.listClaims({
+        identityId: event.identityId,
+        states: ["active", "candidate"],
+        visibility: event.visibility,
+      }).filter((claim) => claim.sourceEventId === eventId)
+        .map((claim) => claim.claimId);
+    const claims = [...new Set(targetClaimIds)]
+      .map((claimId) => this.getClaim(claimId))
+      .filter((claim): claim is MemoryClaim => Boolean(
+        claim
+        && claim.identityId === event.identityId
+        && claim.visibility === event.visibility
+        && (claim.state === "active" || claim.state === "candidate")
+        && claim.metadata.lifecycle !== "stable",
+      ));
+    if (claims.length === 0) return [];
+    const terminalError = containsDeterministicSecretValue(error)
+      ? "[secret-bearing reflection error omitted]"
+      : error.slice(0, 1_000);
+    for (const claim of claims) {
+      this.removeClaimFromIndexes(claim.claimId);
+      this.db.prepare(`
+        UPDATE memory_claims
+        SET state = 'candidate', metadata_json = ?, updated_at = ?
+        WHERE claim_id = ? AND state IN ('active', 'candidate')
+      `).run(JSON.stringify({
+        ...claim.metadata,
+        reflectionTerminalFailure: {
+          eventId,
+          error: terminalError,
+          failedAt: at,
+        },
+      }), at, claim.claimId);
+    }
+    return claims.map((claim) => claim.claimId);
+  }
+
+  quarantineReflectionClaims(eventId: string, error: string, at = Date.now()): string[] {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const claimIds = this.quarantineReflectionClaimsWithinTransaction(
+        eventId,
+        error,
+        at,
+      );
+      this.db.exec("COMMIT");
+      return claimIds;
+    } catch (quarantineError) {
+      this.db.exec("ROLLBACK");
+      throw quarantineError;
+    }
+  }
+
+  failTerminalReflectionJobAndQuarantineClaims(
+    jobId: string,
+    leaseToken: string,
+    error: string,
+    maxAttempts = DEFAULT_MAX_JOB_ATTEMPTS,
+    at = Date.now(),
+  ): MemoryJobFailureResult {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.db.prepare(`
+        SELECT event_id, attempts
+        FROM memory_jobs
+        WHERE job_id = ?
+          AND kind = 'reflect'
+          AND status = 'running'
+          AND lease_token = ?
+      `).get(jobId, leaseToken) as {
+        event_id: string;
+        attempts: number;
+      } | undefined;
+      if (!job || job.attempts < maxAttempts) {
+        this.db.exec("COMMIT");
+        return { applied: false, terminal: false };
+      }
+      this.quarantineReflectionClaimsWithinTransaction(job.event_id, error, at);
+      const safeJobError = containsDeterministicSecretValue(error)
+        ? "[secret-bearing reflection error omitted]"
+        : error.slice(0, 1_000);
+      const result = this.db.prepare(`
+        UPDATE memory_jobs
+        SET status = 'failed',
+            lease_until = NULL,
+            lease_token = NULL,
+            last_error = ?,
+            updated_at = ?
+        WHERE job_id = ? AND status = 'running' AND lease_token = ?
+      `).run(safeJobError, at, jobId, leaseToken);
+      if (result.changes !== 1) {
+        throw new Error("reflection job lease changed during terminal failure");
+      }
+      this.db.exec("COMMIT");
+      return { applied: true, terminal: true };
+    } catch (failureError) {
+      this.db.exec("ROLLBACK");
+      throw failureError;
+    }
   }
 
   listJobs(status?: MemoryJob["status"]): MemoryJob[] {
@@ -976,17 +2087,104 @@ export class AsukaMemoryLedger {
   }
 
   retryFailedJobs(kind: MemoryJobKind, availableAt = Date.now()): number {
+    if (kind === "reflect") {
+      throw new Error(
+        "terminal reflection jobs require retryTerminalReflectionJob authorization",
+      );
+    }
     const result = this.db.prepare(`
       UPDATE memory_jobs
       SET status = 'pending',
           attempts = 0,
           available_at = ?,
           lease_until = NULL,
+          lease_token = NULL,
           last_error = NULL,
           updated_at = ?
       WHERE kind = ? AND status = 'failed'
     `).run(availableAt, Date.now(), kind);
     return Number(result.changes);
+  }
+
+  retryTerminalReflectionJob(
+    jobId: string,
+    availableAt = Date.now(),
+    authorizedAt = Date.now(),
+  ): boolean {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const job = this.db.prepare(`
+        SELECT event_id
+        FROM memory_jobs
+        WHERE job_id = ?
+          AND kind = 'reflect'
+          AND status IN ('failed', 'completed')
+      `).get(jobId) as { event_id: string } | undefined;
+      const event = job ? this.getEvent(job.event_id) : undefined;
+      if (!job || !event || event.kind !== "reflection") {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      const targetClaimIds = Array.isArray(event.metadata.targetClaimIds)
+        ? event.metadata.targetClaimIds.filter(
+          (claimId): claimId is string => typeof claimId === "string",
+        )
+        : [];
+      let authorizedClaims = 0;
+      for (const claimId of [...new Set(targetClaimIds)]) {
+        const claim = this.getClaim(claimId);
+        const terminal = claim?.metadata.reflectionTerminalFailure;
+        if (
+          !claim
+          || claim.identityId !== event.identityId
+          || claim.visibility !== event.visibility
+          || !terminal
+          || typeof terminal !== "object"
+          || Array.isArray(terminal)
+          || (terminal as Record<string, unknown>).eventId !== event.eventId
+        ) {
+          continue;
+        }
+        this.db.prepare(`
+          UPDATE memory_claims
+          SET metadata_json = ?, updated_at = ?
+          WHERE claim_id = ?
+        `).run(JSON.stringify({
+          ...claim.metadata,
+          reflectionRetryAuthorization: {
+            jobId,
+            eventId: event.eventId,
+            authorizedAt,
+          },
+        }), authorizedAt, claimId);
+        authorizedClaims += 1;
+      }
+      if (authorizedClaims === 0) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      const result = this.db.prepare(`
+        UPDATE memory_jobs
+        SET status = 'pending',
+            attempts = 0,
+            available_at = ?,
+            lease_until = NULL,
+            lease_token = NULL,
+            last_error = NULL,
+            updated_at = ?
+        WHERE job_id = ?
+          AND kind = 'reflect'
+          AND status IN ('failed', 'completed')
+      `).run(availableAt, authorizedAt, jobId);
+      if (result.changes !== 1) {
+        throw new Error("terminal reflection job changed during retry authorization");
+      }
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getLegacyExtraction(eventId: string): LegacyExtraction | undefined {
@@ -1021,6 +2219,9 @@ export class AsukaMemoryLedger {
     }
     if (judgement.proposals.length === 0 && !judgement.noMemoryReason?.trim()) {
       throw new Error("empty legacy extraction requires a no-memory disposition");
+    }
+    if (containsDeterministicSecretValue(judgement)) {
+      throw new Error("legacy extraction contains secret-bearing output");
     }
     const now = Date.now();
     const candidateClaimIds: string[] = [];
@@ -1172,14 +2373,16 @@ export class AsukaMemoryLedger {
     if (existing?.status === "completed") return existing;
     const now = Date.now();
     const runId = existing?.runId ?? randomUUID();
+    const runToken = randomUUID();
     this.db.prepare(`
       INSERT INTO legacy_consolidation_runs(
-        run_id, identity_id, visibility, input_hash, status, input_candidate_count,
+        run_id, run_token, identity_id, visibility, input_hash, status, input_candidate_count,
         covered_candidate_count, source_event_count, covered_source_event_count,
         output_claim_ids_json, discarded_candidate_ids_json, audit_json,
         error, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'running', ?, 0, ?, 0, '[]', '[]', '{}', NULL, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, 0, '[]', '[]', '{}', NULL, ?, ?)
       ON CONFLICT(identity_id, visibility, input_hash) DO UPDATE SET
+        run_token = excluded.run_token,
         status = 'running',
         input_candidate_count = excluded.input_candidate_count,
         source_event_count = excluded.source_event_count,
@@ -1190,8 +2393,10 @@ export class AsukaMemoryLedger {
         audit_json = '{}',
         error = NULL,
         updated_at = excluded.updated_at
+      WHERE legacy_consolidation_runs.status <> 'completed'
     `).run(
       runId,
+      runToken,
       input.identityId,
       input.visibility,
       input.inputHash,
@@ -1209,32 +2414,43 @@ export class AsukaMemoryLedger {
 
   failLegacyConsolidation(
     runId: string,
+    runToken: string,
     error: string,
     audit: Record<string, unknown> = {},
-  ): void {
-    this.db.prepare(`
+  ): boolean {
+    const result = this.db.prepare(`
       UPDATE legacy_consolidation_runs
       SET status = 'failed', error = ?, audit_json = ?, updated_at = ?
-      WHERE run_id = ?
-    `).run(error.slice(0, 1_000), JSON.stringify(audit), Date.now(), runId);
+      WHERE run_id = ? AND run_token = ? AND status = 'running'
+    `).run(
+      error.slice(0, 1_000),
+      JSON.stringify(audit),
+      Date.now(),
+      runId,
+      runToken,
+    );
+    return result.changes === 1;
   }
 
   updateLegacyConsolidationAudit(
     runId: string,
+    runToken: string,
     audit: Record<string, unknown>,
-  ): void {
-    this.db.prepare(`
+  ): boolean {
+    const result = this.db.prepare(`
       UPDATE legacy_consolidation_runs
       SET audit_json = ?, updated_at = ?
-      WHERE run_id = ? AND status = 'running'
-    `).run(JSON.stringify(audit), Date.now(), runId);
+      WHERE run_id = ? AND run_token = ? AND status = 'running'
+    `).run(JSON.stringify(audit), Date.now(), runId, runToken);
+    return result.changes === 1;
   }
 
   private deriveLegacyClaimPolicy(
     events: MemoryEvent[],
     sourceCandidates: MemoryClaim[],
     requestedEpistemicStatus: MemoryClaim["epistemicStatus"],
-    confidence: number,
+    disposition: LegacyConsolidationClaim["disposition"],
+    rationale: string,
   ): {
     authority: MemoryClaim["authority"];
     epistemicStatus: MemoryClaim["epistemicStatus"];
@@ -1242,9 +2458,7 @@ export class AsukaMemoryLedger {
   } {
     const userEvents = events.filter((event) => event.actor === "user");
     const hasHumanOverride = events.some((event) => event.kind === "human_override");
-    const hasUserCorrection = events.some((event) =>
-      event.kind === "memory_control" || event.metadata.sourceKind === "correction"
-    );
+    const hasUserCorrection = events.some((event) => event.kind === "memory_control");
     const hasMutualAgreement = events.some((event) =>
       event.metadata.mutualAgreement === true
     );
@@ -1255,42 +2469,44 @@ export class AsukaMemoryLedger {
     const epistemicStatus = assistantOnly || !hasExplicitSource
       ? "inferred"
       : requestedEpistemicStatus;
-    const authority: MemoryClaim["authority"] = hasHumanOverride
-      ? "human_override"
-      : hasUserCorrection
-        ? "user_correction"
-        : hasMutualAgreement
-          ? "mutual_agreement"
-          : assistantOnly
-            ? "summary"
-            : epistemicStatus === "explicit"
-              ? "user_explicit"
-              : "inferred";
-    const state = assistantOnly
-      || (
-        epistemicStatus === "inferred"
-        && (
-          confidence < this.inferencePromotionConfidence
-          || new Set(userEvents.map((event) => event.eventId)).size < 2
-        )
-      )
-      ? "candidate"
-      : "active";
+    const authority: MemoryClaim["authority"] = epistemicStatus === "inferred"
+      ? "inferred"
+      : hasHumanOverride
+        ? "human_override"
+        : hasUserCorrection
+          ? "user_correction"
+          : hasMutualAgreement
+            ? "mutual_agreement"
+            : assistantOnly
+              ? "summary"
+              : "user_explicit";
+    const state = hasHumanOverride
+      ? "active"
+      : assistantOnly || disposition !== "active" || !rationale.trim()
+        ? "candidate"
+        : "active";
     return { authority, epistemicStatus, state };
   }
 
   commitLegacyConsolidation(input: {
     runId: string;
+    runToken: string;
     claims: LegacyConsolidationClaim[];
     discarded: LegacyConsolidationDiscard[];
     audit: Record<string, unknown>;
   }): LegacyConsolidationRun {
+    if (containsDeterministicSecretValue(input)) {
+      throw new Error("legacy consolidation contains secret-bearing output");
+    }
     const runRow = this.db.prepare(`
       SELECT * FROM legacy_consolidation_runs WHERE run_id = ?
     `).get(input.runId) as LegacyConsolidationRunRow | undefined;
     if (!runRow) throw new Error(`legacy consolidation run not found: ${input.runId}`);
     const run = asLegacyConsolidationRun(runRow);
     if (run.status === "completed") return run;
+    if (run.status !== "running" || run.runToken !== input.runToken) {
+      throw new Error("legacy consolidation run lease is stale");
+    }
     const extractions = this.listLegacyExtractions(run.identityId)
       .filter((extraction) => extraction.visibility === run.visibility);
     const expectedCandidateIds = extractions.flatMap((extraction) =>
@@ -1414,7 +2630,8 @@ export class AsukaMemoryLedger {
         events,
         sourceCandidates,
         claim.epistemicStatus,
-        normalizeConfidence(claim.confidence),
+        claim.disposition,
+        claim.rationale,
       );
       return {
         claim,
@@ -1431,7 +2648,11 @@ export class AsukaMemoryLedger {
       groups.set(item.claim.semanticKey, group);
     }
     for (const [semanticKey, versions] of groups) {
-      if (new Set(versions.map((version) => version.claim.subjectId)).size !== 1) {
+      if (
+        new Set(
+          versions.map((version) => normalizeText(version.claim.subjectId)),
+        ).size !== 1
+      ) {
         throw new Error(
           `legacy consolidation semantic key spans multiple subjects: ${semanticKey}`,
         );
@@ -1475,6 +2696,16 @@ export class AsukaMemoryLedger {
           && claim.metadata.migrationPendingRejudge !== true
           && claim.metadata.migrationPendingConsolidation !== true
         );
+        if (
+          new Set([
+            ...versions.map((version) => normalizeText(version.claim.subjectId)),
+            ...existingVersions.map((claim) => normalizeText(claim.subjectId)),
+          ]).size !== 1
+        ) {
+          throw new Error(
+            `legacy consolidation subject collision for semantic key: ${semanticKey}`,
+          );
+        }
         const existingRoot = [...existingVersions].sort((left, right) =>
           Number(right.state === "active") - Number(left.state === "active")
           || right.updatedAt - left.updatedAt
@@ -1646,6 +2877,8 @@ export class AsukaMemoryLedger {
               legacyConsolidationRunId: run.runId,
               semanticKey,
               sourceCandidateIds: version.claim.sourceCandidateIds,
+              disposition: version.claim.disposition,
+              rationale: version.claim.rationale,
             }),
           );
           for (const eventId of version.claim.supportingEventIds) {
@@ -1696,6 +2929,8 @@ export class AsukaMemoryLedger {
             error = NULL,
             updated_at = ?
         WHERE run_id = ?
+          AND run_token = ?
+          AND status = 'running'
       `).run(
         expectedCandidateIds.length,
         extractions.length,
@@ -1704,13 +2939,18 @@ export class AsukaMemoryLedger {
         JSON.stringify(storedAudit),
         now,
         run.runId,
+        input.runToken,
       );
-      this.db.exec("COMMIT");
-      return this.getLegacyConsolidationRun(
+      const completedRun = this.getLegacyConsolidationRun(
         run.identityId,
         run.visibility,
         run.inputHash,
-      )!;
+      );
+      if (completedRun?.status !== "completed") {
+        throw new Error("legacy consolidation completion lease was lost");
+      }
+      this.db.exec("COMMIT");
+      return completedRun;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -1978,6 +3218,14 @@ export class AsukaMemoryLedger {
   }
 
   applyClaimProposal(eventId: string, proposal: ClaimProposal): ApplyClaimResult {
+    return this.applyClaimProposalInternal(eventId, proposal, false);
+  }
+
+  private applyClaimProposalInternal(
+    eventId: string,
+    proposal: ClaimProposal,
+    transactionActive: boolean,
+  ): ApplyClaimResult {
     const event = this.getEvent(eventId);
     if (!event) return { ignoredReason: "source_event_not_found" };
     const canonicalText = normalizeText(proposal.canonicalText);
@@ -1986,7 +3234,30 @@ export class AsukaMemoryLedger {
     if (!canonicalText || !predicate || !subjectId) {
       return { ignoredReason: "invalid_empty_claim" };
     }
+    if (containsDeterministicSecretValue({
+      value: proposal.value,
+      canonicalText,
+      topic: proposal.topic,
+      metadata: proposal.metadata,
+      rationale: proposal.rationale,
+    })) {
+      return { ignoredReason: "secret_bearing_claim" };
+    }
+    const effectiveFrom = proposal.validFrom ?? event.occurredAt;
+    if (
+      !Number.isFinite(effectiveFrom)
+      || (
+        proposal.validTo !== undefined
+        && (
+          !Number.isFinite(proposal.validTo)
+          || proposal.validTo <= effectiveFrom
+        )
+      )
+    ) {
+      return { ignoredReason: "invalid_validity_interval" };
+    }
     const action = proposal.action ?? "add";
+    const authority = proposalAuthority(event, proposal);
     const target = proposal.targetClaimId ? this.getClaim(proposal.targetClaimId) : undefined;
     if (proposal.targetClaimId && !target) {
       return { ignoredReason: `${action}_target_not_found` };
@@ -2004,21 +3275,21 @@ export class AsukaMemoryLedger {
       event.actor === "user"
       && (event.kind === "memory_control" || event.kind === "human_override")
       && (
-        proposal.authority === "user_correction"
-        || proposal.authority === "human_override"
+        authority === "user_correction"
+        || authority === "human_override"
       );
     if (action === "delete") {
       if (!target) return { ignoredReason: "delete_target_not_found" };
       if (!userControlAuthority) {
         return { ignoredReason: "delete_requires_user_control_authority" };
       }
-      this.db.exec("BEGIN IMMEDIATE");
+      if (!transactionActive) this.db.exec("BEGIN IMMEDIATE");
       try {
         const deletedClaimIds = this.purgeClaim(target.rootClaimId);
-        this.db.exec("COMMIT");
+        if (!transactionActive) this.db.exec("COMMIT");
         return { deletedClaimIds };
       } catch (error) {
-        this.db.exec("ROLLBACK");
+        if (!transactionActive) this.db.exec("ROLLBACK");
         throw error;
       }
     }
@@ -2038,8 +3309,13 @@ export class AsukaMemoryLedger {
     const opposeError = this.evidenceScopeError(opposeIds, event, "opposing");
     if (opposeError) return { ignoredReason: opposeError };
     const usableSupportCount = this.countUsableEvidence(supportIds, current);
+    const hasUserSupport = supportIds.some((supportId) => {
+      const support = this.getEvent(supportId);
+      return support?.actor === "user"
+        && !(current && shouldIgnoreSelfReinforcingEvidence(support, current));
+    });
     const confidence = normalizeConfidence(proposal.confidence);
-    const proposedAuthorityWeight = memoryAuthorityWeight(proposal.authority);
+    const proposedAuthorityWeight = memoryAuthorityWeight(authority);
     const currentAuthorityWeight = current ? memoryAuthorityWeight(current.authority) : -1;
     const assistantOrigin = event.actor === "asuka"
       || event.kind === "assistant_reply"
@@ -2058,18 +3334,42 @@ export class AsukaMemoryLedger {
       state = "forgotten";
     } else if (action === "refute") {
       if (!current) return { ignoredReason: "refute_target_not_found" };
+      if (
+        proposal.epistemicStatus === "inferred"
+        && current.epistemicStatus === "explicit"
+      ) {
+        return { ignoredReason: "inferred_cannot_refute_explicit" };
+      }
       if (proposedAuthorityWeight < currentAuthorityWeight) {
         return { ignoredReason: "lower_authority_cannot_refute" };
       }
       state = "refuted";
+    } else if (
+      event.actor === "user"
+      && event.kind === "human_override"
+      && (action === "add" || action === "revise")
+    ) {
+      state = "active";
     } else if (assistantOrigin) {
+      state = "candidate";
+    } else if (
+      (action === "add" || action === "revise")
+      && proposal.disposition !== "active"
+    ) {
       state = "candidate";
     } else if (
       proposal.epistemicStatus === "inferred"
       && (
-        confidence < this.inferencePromotionConfidence
-        || usableSupportCount < 2
+        proposal.disposition !== "active"
+        || !proposal.rationale?.trim()
+        || usableSupportCount < 1
+        || !hasUserSupport
       )
+    ) {
+      state = "candidate";
+    } else if (
+      proposal.epistemicStatus === "inferred"
+      && current?.epistemicStatus === "explicit"
     ) {
       state = "candidate";
     } else if (current && proposedAuthorityWeight < currentAuthorityWeight) {
@@ -2077,17 +3377,15 @@ export class AsukaMemoryLedger {
     } else {
       state = "active";
     }
-    const effectiveFrom = proposal.validFrom ?? event.occurredAt;
-
     if (
       current
       && state === "active"
       && current.canonicalText === canonicalText
-      && current.authority === proposal.authority
+      && current.authority === authority
       && (proposal.validFrom === undefined || current.validFrom === effectiveFrom)
       && (proposal.validTo === undefined || current.validTo === proposal.validTo)
     ) {
-      this.db.exec("BEGIN IMMEDIATE");
+      if (!transactionActive) this.db.exec("BEGIN IMMEDIATE");
       try {
         this.insertEvidence(current.claimId, supportIds, "supports", current);
         this.insertEvidence(current.claimId, opposeIds, "opposes", current);
@@ -2103,14 +3401,14 @@ export class AsukaMemoryLedger {
               )
           WHERE claim_id = ?
         `).run(current.claimId, current.claimId, current.claimId);
-        this.db.exec("COMMIT");
+        if (!transactionActive) this.db.exec("COMMIT");
         return {
           claimId: current.claimId,
           rootClaimId: current.rootClaimId,
           state: current.state,
         };
       } catch (error) {
-        this.db.exec("ROLLBACK");
+        if (!transactionActive) this.db.exec("ROLLBACK");
         throw error;
       }
     }
@@ -2127,7 +3425,7 @@ export class AsukaMemoryLedger {
       && (current.validFrom === undefined || current.validFrom <= event.occurredAt)
       && (current.validTo === undefined || current.validTo > event.occurredAt),
     );
-    this.db.exec("BEGIN IMMEDIATE");
+    if (!transactionActive) this.db.exec("BEGIN IMMEDIATE");
     try {
       if (current && state !== "candidate" && !preservesCurrentValidity) {
         this.db.prepare(`
@@ -2167,7 +3465,7 @@ export class AsukaMemoryLedger {
         canonicalText,
         proposal.topLevelType,
         proposal.epistemicStatus,
-        proposal.authority,
+        authority,
         confidence,
         state,
         event.visibility,
@@ -2182,6 +3480,8 @@ export class AsukaMemoryLedger {
         JSON.stringify({
           ...(proposal.metadata ?? {}),
           lifecycle: proposal.lifecycle,
+          disposition: proposal.disposition,
+          rationale: proposal.rationale,
         }),
       );
       const supportCount = this.insertEvidence(claimId, supportIds, "supports", current);
@@ -2193,12 +3493,425 @@ export class AsukaMemoryLedger {
       `).run(supportCount, opposeCount, claimId);
       const inserted = this.getClaim(claimId)!;
       this.indexClaim(inserted);
-      this.db.exec("COMMIT");
+      if (!transactionActive) this.db.exec("COMMIT");
       return { claimId, rootClaimId, state };
+    } catch (error) {
+      if (!transactionActive) this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  commitAdjudication(input: {
+    eventId: string;
+    proposals: ClaimProposal[];
+    modelRun: {
+      runId?: string;
+      model?: string;
+      promptVersion: number;
+      elapsedMs: number;
+      resultSummary?: string | ((results: ApplyClaimResult[]) => string);
+    };
+    jobLease?: { jobId: string; leaseToken: string };
+  }): {
+    results: ApplyClaimResult[];
+    modelRunId: string;
+    jobCompleted: boolean;
+  } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const results = input.proposals.map((proposal) => {
+        const result = this.applyClaimProposalInternal(
+          input.eventId,
+          proposal,
+          true,
+        );
+        if (result.ignoredReason) {
+          throw new Error(`judgement proposal rejected: ${result.ignoredReason}`);
+        }
+        return result;
+      });
+      const modelRunId = this.recordModelRun({
+        runId: input.modelRun.runId,
+        task: "adjudicate",
+        model: input.modelRun.model,
+        promptVersion: input.modelRun.promptVersion,
+        status: "completed",
+        elapsedMs: input.modelRun.elapsedMs,
+        inputEventId: input.eventId,
+        resultSummary: typeof input.modelRun.resultSummary === "function"
+          ? input.modelRun.resultSummary(results)
+          : input.modelRun.resultSummary,
+      });
+      const jobCompleted = input.jobLease
+        ? this.completeJob(
+          input.jobLease.jobId,
+          input.jobLease.leaseToken,
+        )
+        : false;
+      if (input.jobLease && !jobCompleted) {
+        throw new Error("adjudication job lease changed before commit");
+      }
+      this.db.exec("COMMIT");
+      return { results, modelRunId, jobCompleted };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  commitReflection(input: {
+    eventId: string;
+    decisions: MemoryReflectionDecision[];
+    modelRun: {
+      runId?: string;
+      model?: string;
+      promptVersion: number;
+      elapsedMs: number;
+      resultSummary?: string | ((results: ApplyClaimResult[]) => string);
+    };
+    jobLease: { jobId: string; leaseToken: string };
+  }): {
+    results: ApplyClaimResult[];
+    modelRunId: string;
+    jobCompleted: true;
+  } {
+    const committedAt = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const event = this.getEvent(input.eventId);
+      if (!event || event.kind !== "reflection") {
+        throw new Error("reflection event not found during commit");
+      }
+      const job = this.db.prepare(`
+        SELECT event_id
+        FROM memory_jobs
+        WHERE job_id = ?
+          AND event_id = ?
+          AND kind = 'reflect'
+          AND status = 'running'
+          AND lease_token = ?
+          AND lease_until IS NOT NULL
+          AND lease_until > ?
+      `).get(
+        input.jobLease.jobId,
+        input.eventId,
+        input.jobLease.leaseToken,
+        committedAt,
+      ) as { event_id: string } | undefined;
+      if (!job) throw new Error("reflection job lease changed before commit");
+
+      const targetClaimIds = Array.isArray(event.metadata.targetClaimIds)
+        ? event.metadata.targetClaimIds.filter(
+          (claimId): claimId is string => typeof claimId === "string",
+        )
+        : [];
+      const uniqueTargets = [...new Set(targetClaimIds)].sort();
+      const decisionTargets = input.decisions.map((decision) => decision.claimId).sort();
+      if (
+        uniqueTargets.length !== decisionTargets.length
+        || uniqueTargets.some((claimId, index) => claimId !== decisionTargets[index])
+      ) {
+        throw new Error("reflection decisions do not exactly cover the scheduled claims");
+      }
+
+      const results = input.decisions.map((decision) =>
+        this.applyReflectionDecisionWithinTransaction(
+          input.eventId,
+          decision,
+          input.jobLease.jobId,
+        )
+      );
+      const modelRunId = this.recordModelRun({
+        runId: input.modelRun.runId,
+        task: "reflect",
+        model: input.modelRun.model,
+        promptVersion: input.modelRun.promptVersion,
+        status: "completed",
+        elapsedMs: input.modelRun.elapsedMs,
+        inputEventId: input.eventId,
+        resultSummary: typeof input.modelRun.resultSummary === "function"
+          ? input.modelRun.resultSummary(results)
+          : input.modelRun.resultSummary,
+      });
+      const completed = this.db.prepare(`
+        UPDATE memory_jobs
+        SET status = 'completed',
+            lease_until = NULL,
+            lease_token = NULL,
+            last_error = NULL,
+            updated_at = ?
+        WHERE job_id = ?
+          AND event_id = ?
+          AND kind = 'reflect'
+          AND status = 'running'
+          AND lease_token = ?
+          AND lease_until IS NOT NULL
+          AND lease_until > ?
+      `).run(
+        committedAt,
+        input.jobLease.jobId,
+        input.eventId,
+        input.jobLease.leaseToken,
+        committedAt,
+      );
+      if (completed.changes !== 1) {
+        throw new Error("reflection job lease changed during commit");
+      }
+      this.db.exec("COMMIT");
+      return { results, modelRunId, jobCompleted: true };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordFailedReflectionRunIfLeaseCurrent(input: {
+    eventId: string;
+    jobId: string;
+    leaseToken: string;
+    model?: string;
+    promptVersion: number;
+    elapsedMs: number;
+    resultSummary?: string;
+    error: string;
+  }): boolean {
+    const checkedAt = Date.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.db.prepare(`
+        SELECT 1
+        FROM memory_jobs
+        WHERE job_id = ?
+          AND event_id = ?
+          AND kind = 'reflect'
+          AND status = 'running'
+          AND lease_token = ?
+          AND lease_until IS NOT NULL
+          AND lease_until > ?
+      `).get(input.jobId, input.eventId, input.leaseToken, checkedAt);
+      if (!current) {
+        this.db.exec("COMMIT");
+        return false;
+      }
+      this.recordModelRun({
+        task: "reflect",
+        model: input.model,
+        promptVersion: input.promptVersion,
+        status: "failed",
+        elapsedMs: input.elapsedMs,
+        inputEventId: input.eventId,
+        resultSummary: input.resultSummary,
+        error: input.error,
+      });
+      this.db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  applyReflectionDecision(
+    eventId: string,
+    decision: MemoryReflectionDecision,
+  ): ApplyClaimResult {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.applyReflectionDecisionWithinTransaction(eventId, decision);
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private applyReflectionDecisionWithinTransaction(
+    eventId: string,
+    decision: MemoryReflectionDecision,
+    authorizedJobId?: string,
+  ): ApplyClaimResult {
+    const event = this.getEvent(eventId);
+    if (!event || event.kind !== "reflection") {
+      return { ignoredReason: "reflection_event_not_found" };
+    }
+    const claim = this.getClaim(decision.claimId);
+    if (!claim) return { ignoredReason: "reflection_claim_not_found" };
+    if (
+      claim.identityId !== event.identityId
+      || claim.visibility !== event.visibility
+    ) {
+      return { ignoredReason: "reflection_scope_mismatch" };
+    }
+    if (claim.metadata.lifecycle === "stable") {
+      return { ignoredReason: "stable_claim_does_not_require_reflection" };
+    }
+    if (claim.state !== "active" && claim.state !== "candidate") {
+      return { ignoredReason: "reflection_claim_not_current" };
+    }
+    const terminalFailure = claim.metadata.reflectionTerminalFailure;
+    if (terminalFailure !== undefined) {
+      const authorization = claim.metadata.reflectionRetryAuthorization;
+      if (
+        !authorizedJobId
+        || !authorization
+        || typeof authorization !== "object"
+        || Array.isArray(authorization)
+        || (authorization as Record<string, unknown>).jobId !== authorizedJobId
+        || (authorization as Record<string, unknown>).eventId !== eventId
+      ) {
+        return { ignoredReason: "terminal_reflection_requires_authorized_retry" };
+      }
+    }
+    const reflectionEntry = {
+      eventId,
+      action: decision.action,
+      disposition: decision.disposition,
+      confidence: normalizeConfidence(decision.confidence),
+      rationale: normalizeText(decision.rationale),
+      reflectedAt: event.occurredAt,
+    };
+    const reflectionHistory = [
+      ...(Array.isArray(claim.metadata.reflectionHistory)
+        ? claim.metadata.reflectionHistory
+        : []),
+      reflectionEntry,
+    ];
+    const metadata: Record<string, unknown> = {
+      ...claim.metadata,
+      reflection: reflectionEntry,
+      reflectionHistory,
+      lastReflectedAt: event.occurredAt,
+    };
+    const resolvedMetadata = (): Record<string, unknown> => {
+      const resolved = { ...metadata };
+      delete resolved.reflectionTerminalFailure;
+      delete resolved.reflectionRetryAuthorization;
+      return resolved;
+    };
+    const writeReflectionMetadata = (
+      nextMetadata: Record<string, unknown> = metadata,
+    ): void => {
+      this.db.prepare(`
+        UPDATE memory_claims
+        SET metadata_json = ?, updated_at = ?
+        WHERE claim_id = ?
+      `).run(JSON.stringify(nextMetadata), Date.now(), claim.claimId);
+    };
+
+    if (decision.action === "expire" || decision.action === "refute") {
+      if (
+        decision.action === "refute"
+        && claim.epistemicStatus === "explicit"
+      ) {
+        writeReflectionMetadata();
+        return { ignoredReason: "inferred_reflection_cannot_refute_explicit" };
+      }
+      if (
+        decision.action === "expire"
+        &&
+        claim.epistemicStatus === "explicit"
+        && !["bounded", "episodic", "working"].includes(
+          String(claim.metadata.lifecycle ?? ""),
+        )
+      ) {
+        writeReflectionMetadata();
+        return { ignoredReason: "explicit_reflection_requires_temporal_lifecycle" };
+      }
+      this.removeClaimFromIndexes(claim.claimId);
+      this.db.prepare(`
+        UPDATE memory_claims
+        SET state = ?,
+            valid_to = CASE
+              WHEN valid_to IS NULL OR valid_to > ? THEN ?
+              ELSE valid_to
+            END,
+            metadata_json = ?,
+            updated_at = ?
+        WHERE claim_id = ? AND state IN ('active', 'candidate')
+      `).run(
+        decision.action === "refute" ? "refuted" : "superseded",
+        event.occurredAt,
+        event.occurredAt,
+        JSON.stringify(resolvedMetadata()),
+        Date.now(),
+        claim.claimId,
+      );
+      return {
+        claimId: claim.claimId,
+        rootClaimId: claim.rootClaimId,
+        state: this.getClaim(claim.claimId)?.state,
+      };
+    }
+
+    if (decision.action === "revise") {
+      const revision = decision.revision;
+      if (!revision) return { ignoredReason: "reflection_revision_missing" };
+      const supportingEventIds = this.listClaimEvidence(claim.claimId, "supports")
+        .map((item) => item.eventId);
+      const result = this.applyClaimProposalInternal(eventId, {
+        semanticKey: claim.semanticKey,
+        subjectId: claim.subjectId,
+        predicate: claim.predicate,
+        value: revision.value,
+        canonicalText: revision.canonicalText,
+        topLevelType: claim.topLevelType,
+        epistemicStatus: claim.epistemicStatus === "explicit" ? "inferred" : claim.epistemicStatus,
+        authority: claim.epistemicStatus === "explicit" ? "inferred" : claim.authority,
+        confidence: decision.confidence,
+        disposition: decision.disposition,
+        rationale: decision.rationale,
+        action: "revise",
+        targetClaimId: claim.claimId,
+        validFrom: revision.validFrom,
+        validTo: revision.validTo,
+        topic: revision.topic ?? claim.topic,
+        entityIds: revision.entityIds ?? claim.entityIds,
+        supportingEventIds,
+        lifecycle: revision.lifecycle
+          ?? claim.metadata.lifecycle as ClaimProposal["lifecycle"],
+        metadata: {
+          reflectionFromClaimId: claim.claimId,
+          reflectionDecisionEventId: eventId,
+          reflection: reflectionEntry,
+          reflectionHistory,
+        },
+      }, true);
+      if (!result.ignoredReason) writeReflectionMetadata(resolvedMetadata());
+      return result;
+    }
+
+    let state: MemoryClaimState = "candidate";
+    const desiredActive = decision.disposition === "active"
+      && Boolean(decision.rationale.trim());
+    if (desiredActive && claim.epistemicStatus === "inferred") {
+      const hasUserEvidence = this.listClaimEvidence(claim.claimId, "supports")
+        .some((item) => this.getEvent(item.eventId)?.actor === "user");
+      const competingActive = this.listClaims({
+        identityId: claim.identityId,
+        states: ["active"],
+        visibility: claim.visibility,
+      }).some((candidate) =>
+        candidate.claimId !== claim.claimId
+        && candidate.semanticKey === claim.semanticKey
+      );
+      if (desiredActive && hasUserEvidence && !competingActive) {
+        state = "active";
+      }
+    } else if (desiredActive) {
+      state = "active";
+    }
+    this.db.prepare(`
+      UPDATE memory_claims
+      SET state = ?, metadata_json = ?, updated_at = ?
+      WHERE claim_id = ? AND state IN ('active', 'candidate')
+    `).run(state, JSON.stringify(resolvedMetadata()), Date.now(), claim.claimId);
+    this.indexClaim(this.getClaim(claim.claimId)!);
+    return {
+      claimId: claim.claimId,
+      rootClaimId: claim.rootClaimId,
+      state: this.getClaim(claim.claimId)?.state,
+    };
   }
 
   listClaims(options: {
@@ -2305,11 +4018,19 @@ export class AsukaMemoryLedger {
     limit?: number;
     vector?: number[];
     embeddingModel?: string;
+    includeDiversifiedFallback?: boolean;
   }): MemorySearchCandidate[] {
     const now = options.now ?? Date.now();
     const limit = Math.max(1, Math.min(100, options.limit ?? 24));
     const claims = new Map<string, MemorySearchCandidate>();
     const query = normalizeText(options.query);
+    const queryUnits = lexicalUnits(query);
+    const activeClaims = this.listClaims({
+      identityId: options.identityId,
+      states: ["active"],
+      visibility: options.visibility,
+      now,
+    }).filter((claim) => this.isRecallableClaim(claim, options.visibility, now));
 
     if (query.length >= 3) {
       try {
@@ -2330,6 +4051,7 @@ export class AsukaMemoryLedger {
           claims.set(claim.claimId, {
             claim,
             lexicalScore,
+            exactLexicalMatch: true,
             vectorScore: 0,
             recencyScore: recencyScore(claim.updatedAt, now),
             authorityScore: memoryAuthorityWeight(claim.authority) / 600,
@@ -2337,7 +4059,35 @@ export class AsukaMemoryLedger {
           });
         }
       } catch {
-        // Invalid or unsupported FTS input falls through to recent active claims.
+        // Invalid or unsupported FTS input still allows lexical/vector retrieval.
+      }
+    }
+
+    if (queryUnits.size > 0) {
+      for (const claim of activeClaims) {
+        const lexicalScore = lexicalSimilarity(
+          queryUnits,
+          [
+            claim.canonicalText,
+            claim.semanticKey,
+            claim.predicate,
+            claim.topic,
+            JSON.stringify(claim.value),
+            claim.entityIds.join(" "),
+          ].filter(Boolean).join(" "),
+        );
+        if (lexicalScore <= 0) continue;
+        const existing = claims.get(claim.claimId);
+        claims.set(claim.claimId, {
+          claim,
+          lexicalScore: Math.max(existing?.lexicalScore ?? 0, lexicalScore),
+          exactLexicalMatch: existing?.exactLexicalMatch ?? false,
+          vectorScore: existing?.vectorScore ?? 0,
+          recencyScore: existing?.recencyScore ?? recencyScore(claim.updatedAt, now),
+          authorityScore: existing?.authorityScore
+            ?? memoryAuthorityWeight(claim.authority) / 600,
+          localScore: 0,
+        });
       }
     }
 
@@ -2355,6 +4105,7 @@ export class AsukaMemoryLedger {
         claims.set(claim.claimId, {
           claim,
           lexicalScore: existing?.lexicalScore ?? 0,
+          exactLexicalMatch: existing?.exactLexicalMatch ?? false,
           vectorScore,
           recencyScore: existing?.recencyScore ?? recencyScore(claim.updatedAt, now),
           authorityScore: existing?.authorityScore ?? memoryAuthorityWeight(claim.authority) / 600,
@@ -2363,18 +4114,19 @@ export class AsukaMemoryLedger {
       }
     }
 
-    if (claims.size < Math.min(8, limit)) {
-      for (const claim of this.listClaims({
-        identityId: options.identityId,
-        states: ["active"],
-        visibility: options.visibility,
-        now,
-      }).slice(0, limit)) {
-        if (!this.isRecallableClaim(claim, options.visibility, now)) continue;
-        if (claims.has(claim.claimId)) continue;
+    if (options.includeDiversifiedFallback && claims.size < limit) {
+      const fallback = activeClaims
+        .filter((claim) => !claims.has(claim.claimId))
+        .sort((left, right) =>
+          diversityKey(query, left).localeCompare(diversityKey(query, right))
+          || left.claimId.localeCompare(right.claimId)
+        );
+      for (const claim of fallback) {
+        if (claims.size >= limit) break;
         claims.set(claim.claimId, {
           claim,
           lexicalScore: 0,
+          exactLexicalMatch: false,
           vectorScore: 0,
           recencyScore: recencyScore(claim.updatedAt, now),
           authorityScore: memoryAuthorityWeight(claim.authority) / 600,
@@ -2391,8 +4143,83 @@ export class AsukaMemoryLedger {
         + candidate.recencyScore * 0.08;
     }
     return [...claims.values()]
-      .sort((a, b) => b.localScore - a.localScore || b.claim.updatedAt - a.claim.updatedAt)
+      .sort((a, b) => {
+        const aHasSignal = a.lexicalScore > 0 || a.vectorScore > 0;
+        const bHasSignal = b.lexicalScore > 0 || b.vectorScore > 0;
+        if (aHasSignal !== bHasSignal) return aHasSignal ? -1 : 1;
+        if (!aHasSignal) return 0;
+        return b.localScore - a.localScore || b.claim.updatedAt - a.claim.updatedAt;
+      })
       .slice(0, limit);
+  }
+
+  searchClaimsForAdjudication(options: {
+    identityId: string;
+    visibility: MemoryVisibility;
+    query: string;
+    now?: number;
+    limit?: number;
+  }): MemoryClaim[] {
+    const now = options.now ?? Date.now();
+    const limit = Math.max(1, Math.min(200, options.limit ?? 80));
+    const queryUnits = lexicalUnits(options.query);
+    const available = this.listClaims({
+      identityId: options.identityId,
+      states: ["active", "candidate"],
+      visibility: options.visibility,
+      now,
+    }).filter((claim) =>
+      claim.metadata.migrationPendingRejudge !== true
+      && claim.metadata.migrationPendingConsolidation !== true
+    );
+    const scored = available.map((claim) => ({
+      claim,
+      score: lexicalSimilarity(
+        queryUnits,
+        [
+          claim.canonicalText,
+          claim.semanticKey,
+          claim.predicate,
+          claim.topic,
+          JSON.stringify(claim.value),
+          claim.entityIds.join(" "),
+        ].filter(Boolean).join(" "),
+      ),
+    })).sort((left, right) =>
+      right.score - left.score
+      || memoryAuthorityWeight(right.claim.authority)
+        - memoryAuthorityWeight(left.claim.authority)
+      || right.claim.updatedAt - left.claim.updatedAt
+    );
+    const related = scored.filter((item) => item.score > 0);
+    const relatedIds = new Set(related.map((item) => item.claim.claimId));
+    const diversified = scored
+      .filter((item) => !relatedIds.has(item.claim.claimId))
+      .sort((left, right) =>
+        diversityKey(options.query, left.claim).localeCompare(
+          diversityKey(options.query, right.claim),
+        )
+        || left.claim.claimId.localeCompare(right.claim.claimId)
+      );
+    const selected = [...related, ...diversified].slice(0, limit);
+    const byId = new Map<string, MemoryClaim>();
+    for (const { claim } of selected) {
+      for (const version of available) {
+        if (
+          byId.size >= limit
+          || version.epistemicStatus !== "explicit"
+          || version.semanticKey !== claim.semanticKey
+        ) {
+          continue;
+        }
+        byId.set(version.claimId, version);
+      }
+      if (byId.size < limit || byId.has(claim.claimId)) {
+        byId.set(claim.claimId, claim);
+      }
+      if (byId.size >= limit) break;
+    }
+    return [...byId.values()];
   }
 
   upsertEmbedding(claimId: string, model: string, vector: number[], at = Date.now()): boolean {
@@ -2409,7 +4236,19 @@ export class AsukaMemoryLedger {
     `);
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const previousTables = this.db.prepare(`
+        SELECT DISTINCT table_name
+        FROM claim_embedding_meta
+        WHERE claim_id = ?
+      `).all(claimId) as unknown as Array<{ table_name: string }>;
+      for (const previous of previousTables) {
+        if (!/^claim_vec_\d+$/.test(previous.table_name)) {
+          throw new Error("claim embedding metadata contains an invalid table");
+        }
+        this.db.prepare(`DELETE FROM ${previous.table_name} WHERE claim_id = ?`).run(claimId);
+      }
       this.db.prepare(`DELETE FROM ${tableName} WHERE claim_id = ?`).run(claimId);
+      this.db.prepare("DELETE FROM claim_embedding_meta WHERE claim_id = ?").run(claimId);
       this.db.prepare(`INSERT INTO ${tableName}(claim_id, embedding) VALUES (?, ?)`)
         .run(claimId, new Float32Array(vector));
       this.db.prepare(`
@@ -2473,10 +4312,23 @@ export class AsukaMemoryLedger {
     query: string,
     claimIds: string[],
     modelRunId?: string,
-    ttlMs = 300_000,
+    options: number | {
+      ttlMs?: number;
+      context?: RerankCacheContext;
+    } = 300_000,
   ): void {
     const now = Date.now();
+    const ttlMs = typeof options === "number" ? options : options.ttlMs ?? 300_000;
+    const context = typeof options === "number" ? undefined : options.context;
     const queryHash = createHash("sha256").update(normalizeText(query)).digest("hex");
+    const payload: string[] | RerankCachePayload = context ? {
+      schemaVersion: 2,
+      claimIds,
+      visibility: context.visibility,
+      maxPromptChars: context.maxPromptChars,
+      asOf: context.asOf,
+      candidateFingerprint: context.candidateFingerprint,
+    } : claimIds;
     this.db.prepare(`
       INSERT INTO rerank_cache(
         identity_id, query_hash, claim_ids_json, model_run_id, expires_at, updated_at
@@ -2486,10 +4338,14 @@ export class AsukaMemoryLedger {
         model_run_id = excluded.model_run_id,
         expires_at = excluded.expires_at,
         updated_at = excluded.updated_at
-    `).run(identityId, queryHash, JSON.stringify(claimIds), modelRunId ?? null, now + ttlMs, now);
+    `).run(identityId, queryHash, JSON.stringify(payload), modelRunId ?? null, now + ttlMs, now);
   }
 
-  readRerankCache(identityId: string, query: string, at = Date.now()): {
+  readRerankCache(
+    identityId: string,
+    query: string,
+    context?: RerankCacheContext | number,
+  ): {
     claimIds: string[];
     modelRunId?: string;
   } | undefined {
@@ -2498,14 +4354,45 @@ export class AsukaMemoryLedger {
       SELECT claim_ids_json, model_run_id
       FROM rerank_cache
       WHERE identity_id = ? AND query_hash = ? AND expires_at > ?
-    `).get(identityId, queryHash, at) as {
+    `).get(identityId, queryHash, Date.now()) as {
       claim_ids_json: string;
       model_run_id: string | null;
     } | undefined;
-    return row ? {
-      claimIds: parseJson(row.claim_ids_json, []),
+    if (!row) return undefined;
+
+    const payload = parseJson<unknown>(row.claim_ids_json, []);
+    const expectedContext = typeof context === "number" ? undefined : context;
+    if (Array.isArray(payload)) {
+      if (expectedContext) return undefined;
+      return {
+        claimIds: payload.filter((claimId): claimId is string => typeof claimId === "string"),
+        modelRunId: row.model_run_id ?? undefined,
+      };
+    }
+    if (!payload || typeof payload !== "object") return undefined;
+    const entry = payload as Partial<RerankCachePayload>;
+    if (
+      entry.schemaVersion !== 2
+      || !Array.isArray(entry.claimIds)
+      || entry.claimIds.some((claimId) => typeof claimId !== "string")
+    ) {
+      return undefined;
+    }
+    if (
+      expectedContext
+      && (
+        entry.visibility !== expectedContext.visibility
+        || entry.maxPromptChars !== expectedContext.maxPromptChars
+        || entry.asOf !== expectedContext.asOf
+        || entry.candidateFingerprint !== expectedContext.candidateFingerprint
+      )
+    ) {
+      return undefined;
+    }
+    return {
+      claimIds: entry.claimIds as string[],
       modelRunId: row.model_run_id ?? undefined,
-    } : undefined;
+    };
   }
 
   recordModelRun(input: {
@@ -2520,6 +4407,12 @@ export class AsukaMemoryLedger {
     error?: string;
   }): string {
     const runId = input.runId ?? randomUUID();
+    const resultSummary = containsDeterministicSecretValue(input.resultSummary)
+      ? "[secret-bearing model output omitted]"
+      : input.resultSummary;
+    const error = containsDeterministicSecretValue(input.error)
+      ? "[secret-bearing error omitted]"
+      : input.error;
     this.db.prepare(`
       INSERT INTO model_runs(
         run_id, task, model, prompt_version, status, elapsed_ms, input_event_id,
@@ -2533,8 +4426,8 @@ export class AsukaMemoryLedger {
       input.status,
       input.elapsedMs,
       input.inputEventId ?? null,
-      input.resultSummary?.slice(0, 1_000) ?? null,
-      input.error?.slice(0, 1_000) ?? null,
+      resultSummary?.slice(0, 1_000) ?? null,
+      error?.slice(0, 1_000) ?? null,
       Date.now(),
     );
     return runId;
@@ -2713,6 +4606,8 @@ export class AsukaMemoryLedger {
       "model_runs",
       "retrieval_feedback",
       "legacy_projection_outbox",
+      "legacy_source_archives",
+      "legacy_source_archive_chunks",
     ];
     return Object.fromEntries(tables.map((table) => {
       const row = this.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };

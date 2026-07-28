@@ -193,6 +193,7 @@ for (const [requested, expected] of [[5_000, 5_000], [99_999, 16_000]]) {
       assert.equal(String(url), "https://embedding.example/v1/embeddings");
       assert.equal(JSON.parse(init.body).model, "embedding-model");
       return new Response(JSON.stringify({
+        model: "embedding-model",
         data: [
           { index: 1, embedding: [3, 4] },
           { index: 0, embedding: [1, 2] },
@@ -209,6 +210,44 @@ for (const [requested, expected] of [[5_000, 5_000], [99_999, 16_000]]) {
   });
 }
 
+for (const data of [
+  [
+    { embedding: [1, 2] },
+    { index: 1, embedding: [3, 4] },
+  ],
+  [
+    { index: 0, embedding: [1, 2] },
+    { index: 0, embedding: [3, 4] },
+  ],
+  [
+    { index: -1, embedding: [1, 2] },
+    { index: 1, embedding: [3, 4] },
+  ],
+  [
+    { index: 0, embedding: [1, 2] },
+    { index: 2, embedding: [3, 4] },
+  ],
+]) {
+  const client = createOpenAICompatibleMemoryModelClient({
+    primary,
+    embedding: {
+      endpoint: "https://embedding.example/v1/embeddings",
+      apiKey: embeddingKey,
+      model: "embedding-model",
+      timeoutMs: 80,
+      expectedDimensions: 2,
+    },
+    fetchImpl: async () => new Response(JSON.stringify({
+      model: "embedding-model",
+      data,
+    })),
+  });
+  await assert.rejects(
+    client.embed(["first", "second"], 100),
+    /invalid vector index/,
+  );
+}
+
 {
   const warnings = [];
   const client = createOpenAICompatibleMemoryModelClient({
@@ -221,6 +260,7 @@ for (const [requested, expected] of [[5_000, 5_000], [99_999, 16_000]]) {
     },
     log: { warn: (message) => warnings.push(message) },
     fetchImpl: async () => new Response(JSON.stringify({
+      model: "embedding-model",
       data: [
         { index: 0, embedding: [1, 2] },
         { index: 1, embedding: [3] },
@@ -232,6 +272,32 @@ for (const [requested, expected] of [[5_000, 5_000], [99_999, 16_000]]) {
     /inconsistent dimensions/,
   );
   assert.doesNotMatch(warnings.join("\n"), /EMBEDDING_TEST_KEY/);
+}
+
+for (const payload of [
+  {
+    data: [{ index: 0, embedding: [1, 2] }],
+  },
+  {
+    model: "wrong-embedding-model",
+    data: [{ index: 0, embedding: [1, 2] }],
+  },
+]) {
+  const client = createOpenAICompatibleMemoryModelClient({
+    primary,
+    embedding: {
+      endpoint: "https://embedding.example/v1/embeddings",
+      apiKey: embeddingKey,
+      model: "embedding-model",
+      timeoutMs: 80,
+      expectedDimensions: 2,
+    },
+    fetchImpl: async () => new Response(JSON.stringify(payload)),
+  });
+  await assert.rejects(
+    client.embed(["first"], 100),
+    /embedding provider returned an unexpected model/,
+  );
 }
 
 {

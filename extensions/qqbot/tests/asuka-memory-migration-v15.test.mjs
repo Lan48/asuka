@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as wait } from "node:timers/promises";
 import { AsukaMemoryEngine } from "../dist/src/asuka-memory-kernel/engine.js";
 import { AsukaMemoryLedger } from "../dist/src/asuka-memory-kernel/ledger.js";
@@ -10,6 +11,7 @@ import {
   executeLegacyRejudgements,
   getLegacyRejudgementGate,
   migrateLegacyRecords,
+  sanitizeLegacyMigrationSourcesForReport,
 } from "../dist/src/asuka-memory-kernel/legacy-migration.js";
 import {
   importWikiOverrides,
@@ -312,6 +314,128 @@ assert.throws(
   /invalid legacy session id/i,
   "a hostile session id must be rejected before any transcript path is read",
 );
+const secretConfiguredPath = path.join(
+  fixtureRoot,
+  "password=opaque-configured-path",
+);
+const sanitizedSources = sanitizeLegacyMigrationSourcesForReport({
+  memoryJson: secretConfiguredPath,
+  claimsJsonl: claimsFile,
+});
+assert.match(
+  sanitizedSources.memoryJson,
+  /^redacted-configured-memoryJson-[a-f0-9]{64}$/,
+);
+assert.equal(sanitizedSources.claimsJsonl, claimsFile);
+assert.doesNotMatch(JSON.stringify(sanitizedSources), /opaque-configured-path/);
+const malformedMemoryRootFile = path.join(fixtureRoot, "malformed-memory-root.json");
+fs.writeFileSync(malformedMemoryRootFile, JSON.stringify({ version: 1 }));
+assert.throws(
+  () => collectLegacyMigrationRecords({ memoryJson: malformedMemoryRootFile }, scope),
+  /memory source must contain an object-valued memories root/i,
+  "a configured memory source without its required root must fail closed",
+);
+const malformedSessionsIndex = path.join(fixtureRoot, "malformed-sessions-index.json");
+fs.writeFileSync(malformedSessionsIndex, JSON.stringify([]));
+assert.throws(
+  () => collectLegacyMigrationRecords({
+    sessionsIndexJson: malformedSessionsIndex,
+    sessionsDirectory,
+  }, scope),
+  /sessions index must be an object/i,
+  "a configured session index with the wrong root shape must fail closed",
+);
+assert.throws(
+  () => collectLegacyMigrationRecords({
+    sessionsIndexJson: sessionsIndexFile,
+  }, scope),
+  /index and sessions directory must be configured together/i,
+  "a session index without its transcript directory must fail closed",
+);
+assert.throws(
+  () => collectLegacyMigrationRecords({
+    sessionsDirectory,
+  }, scope),
+  /index and sessions directory must be configured together/i,
+  "a transcript directory without its session index must fail closed",
+);
+
+const deepMemoryFile = path.join(fixtureRoot, "deep-memory.json");
+let deepMemoryValue = { text: "有界规范化深度测试" };
+for (let depth = 0; depth < 130; depth += 1) {
+  deepMemoryValue = {
+    text: "有界规范化深度测试",
+    nested: deepMemoryValue,
+  };
+}
+fs.writeFileSync(deepMemoryFile, JSON.stringify({
+  memories: { deep: deepMemoryValue },
+}));
+assert.throws(
+  () => collectLegacyMigrationRecords({ memoryJson: deepMemoryFile }, scope),
+  /canonicalization exceeds depth limit/i,
+  "deep canonicalization must return a controlled fail-closed error",
+);
+const wideMemoryFile = path.join(fixtureRoot, "wide-memory.json");
+fs.writeFileSync(wideMemoryFile, JSON.stringify({
+  memories: {
+    wide: {
+      text: "有界规范化节点测试",
+      nested: Object.fromEntries(
+        Array.from({ length: 10_000 }, (_, index) => [`field-${index}`, index]),
+      ),
+    },
+  },
+}));
+assert.throws(
+  () => collectLegacyMigrationRecords({ memoryJson: wideMemoryFile }, scope),
+  /canonicalization exceeds node limit/i,
+  "wide canonicalization must reject before building unbounded work queues",
+);
+
+for (const linkType of ["file", "junction"]) {
+  const linkSessionsDirectory = path.join(
+    fixtureRoot,
+    `linked-sessions-${linkType}`,
+  );
+  const linkSessionsIndex = path.join(linkSessionsDirectory, "sessions.json");
+  const linkSessionId = linkType === "file"
+    ? "44444444-4444-4444-8444-444444444444"
+    : "55555555-5555-4555-8555-555555555555";
+  const externalTarget = linkType === "file"
+    ? path.join(fixtureRoot, "external-session.jsonl")
+    : path.join(fixtureRoot, "external-session-directory");
+  fs.mkdirSync(linkSessionsDirectory, { recursive: true });
+  fs.writeFileSync(linkSessionsIndex, JSON.stringify({
+    "agent:main:qqbot:direct:user-1": {
+      sessionId: linkSessionId,
+      channel: "qqbot",
+      chatType: "direct",
+    },
+  }));
+  if (linkType === "file") {
+    fs.writeFileSync(externalTarget, `${JSON.stringify({
+      type: "message",
+      id: "external-message",
+      message: { role: "user", content: "must-not-import" },
+    })}\n`);
+  } else {
+    fs.mkdirSync(externalTarget, { recursive: true });
+  }
+  fs.symlinkSync(
+    externalTarget,
+    path.join(linkSessionsDirectory, `${linkSessionId}.jsonl`),
+    linkType === "file" ? "file" : "junction",
+  );
+  assert.throws(
+    () => collectLegacyMigrationRecords({
+      sessionsIndexJson: linkSessionsIndex,
+      sessionsDirectory: linkSessionsDirectory,
+    }, scope),
+    /must not be a symlink or junction/i,
+    `${linkType} traversal must be rejected before transcript content is read`,
+  );
+}
 
 const sourceAccountingRegressionFailures = [];
 function verifySourceAccountingRegression(name, run) {
@@ -321,6 +445,21 @@ function verifySourceAccountingRegression(name, run) {
     sourceAccountingRegressionFailures.push(
       `${name}: ${error instanceof Error ? error.message : String(error)}`,
     );
+  }
+}
+
+function dropLegacyArchiveTriggers(database) {
+  const triggers = database.prepare(`
+    SELECT name
+    FROM sqlite_master
+    WHERE type = 'trigger'
+      AND tbl_name IN (
+        'legacy_source_archives',
+        'legacy_source_archive_chunks'
+      )
+  `).all();
+  for (const { name } of triggers) {
+    database.exec(`DROP TRIGGER "${String(name).replaceAll('"', '""')}"`);
   }
 }
 
@@ -386,8 +525,328 @@ verifySourceAccountingRegression("full source content hash", () => {
   }
 });
 
+verifySourceAccountingRegression("lossless source archive survives restart", () => {
+  const archiveDatabase = path.join(fixtureRoot, "lossless-archive.sqlite");
+  const sharedPrefix = "源".repeat(8_000);
+  const archiveRecords = [
+    {
+      sourceKind: "memory",
+      sourcePath: memoryFile,
+      sourceRecordId: "archive-row-a",
+      legacyId: "archive-a",
+      actor: "user",
+      text: sharedPrefix,
+      sourceContent: `${sharedPrefix}\n  尾部甲`,
+      occurredAt: 1_000,
+      metadata: {},
+    },
+    {
+      sourceKind: "memory",
+      sourcePath: memoryFile,
+      sourceRecordId: "archive-row-b",
+      legacyId: "archive-b",
+      actor: "user",
+      text: sharedPrefix,
+      sourceContent: `${sharedPrefix}\n\t尾部乙`,
+      occurredAt: 2_000,
+      metadata: {},
+    },
+  ];
+  let archiveLedger = new AsukaMemoryLedger(archiveDatabase);
+  const archiveEngine = new AsukaMemoryEngine(archiveLedger);
+  const archiveReport = migrateLegacyRecords(archiveEngine, archiveRecords, scope);
+  assert.equal(archiveReport.importedEvents, 2);
+  assert.equal(
+    new Set(archiveReport.sourceMap.map((item) => item.legacyContentHash)).size,
+    2,
+    "different source tails must have different complete-content hashes",
+  );
+  for (const [index, item] of archiveReport.sourceMap.entries()) {
+    const event = archiveLedger.getEvent(item.eventId);
+    const archive = archiveLedger.getLegacySourceArchive(item.eventId);
+    assert.equal(event.text.length, 8_000, "model-facing event text stays bounded");
+    assert.equal(archive.complete, true);
+    assert.equal(archive.content, archiveRecords[index].sourceContent);
+    assert.equal(archive.contentChars, archiveRecords[index].sourceContent.length);
+    assert.equal(archive.contentHash, item.legacyContentHash);
+    assert.ok(archive.chunks.length > 1);
+  }
+  archiveLedger.close();
+
+  archiveLedger = new AsukaMemoryLedger(archiveDatabase);
+  try {
+    const restartedEngine = new AsukaMemoryEngine(archiveLedger);
+    for (const [index, item] of archiveReport.sourceMap.entries()) {
+      const event = archiveLedger.getEvent(item.eventId);
+      const archive = archiveLedger.getLegacySourceArchive(item.eventId);
+      assert.equal(archive.complete, true);
+      assert.equal(
+        archive.content,
+        archiveRecords[index].sourceContent,
+        "restart must reconstruct every source character exactly",
+      );
+      assert.equal(event.metadata.legacySourceRecordId, archiveRecords[index].sourceRecordId);
+      assert.equal(event.metadata.legacySourcePath, archiveRecords[index].sourcePath);
+      assert.equal(event.metadata.legacyContentHash, item.legacyContentHash);
+    }
+    const repeated = migrateLegacyRecords(restartedEngine, archiveRecords, scope);
+    assert.equal(repeated.importedEvents, 0);
+    assert.equal(repeated.duplicateEvents, 2);
+    assert.throws(
+      () => migrateLegacyRecords(restartedEngine, [{
+        ...archiveRecords[0],
+        sourceContent: `${sharedPrefix}\n  被替换的尾部`,
+      }], scope),
+      /legacy content hash mismatch/i,
+      "changing a physical row tail must fail its immutable content binding",
+    );
+  } finally {
+    archiveLedger.close();
+  }
+});
+
+verifySourceAccountingRegression("archive insertion is atomic with event and job", () => {
+  const atomicDatabase = path.join(fixtureRoot, "archive-atomicity.sqlite");
+  const atomicLedger = new AsukaMemoryLedger(atomicDatabase);
+  const rawDatabase = new DatabaseSync(atomicDatabase);
+  try {
+    rawDatabase.exec(`
+      CREATE TRIGGER reject_archive_fixture
+      BEFORE INSERT ON legacy_source_archives
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture archive failure');
+      END;
+    `);
+  } finally {
+    rawDatabase.close();
+  }
+  try {
+    const atomicEngine = new AsukaMemoryEngine(atomicLedger);
+    const report = migrateLegacyRecords(atomicEngine, [{
+      sourceKind: "memory",
+      sourcePath: memoryFile,
+      sourceRecordId: "atomic-row",
+      legacyId: "atomic-row",
+      actor: "user",
+      text: "事务归档测试",
+      sourceContent: "事务归档测试的完整原文",
+      occurredAt: 3_000,
+      metadata: {},
+    }], scope);
+    assert.equal(report.skippedRecords, 1);
+    assert.equal(atomicLedger.listEvents().length, 0);
+    assert.equal(atomicLedger.listJobs().length, 0);
+  } finally {
+    atomicLedger.close();
+  }
+});
+
+for (const corruption of ["delete", "duplicate", "reorder", "mutate"]) {
+  verifySourceAccountingRegression(`archive ${corruption} blocks the 3A gate`, () => {
+    const corruptionDatabase = path.join(fixtureRoot, `archive-${corruption}.sqlite`);
+    let corruptionLedger = new AsukaMemoryLedger(corruptionDatabase);
+    const corruptionEngine = new AsukaMemoryEngine(corruptionLedger);
+    const sourceContent = `${"块".repeat(8_000)}${"段".repeat(8_000)}尾部`;
+    const report = migrateLegacyRecords(corruptionEngine, [{
+      sourceKind: "memory",
+      sourcePath: memoryFile,
+      sourceRecordId: `corrupt-${corruption}`,
+      legacyId: `corrupt-${corruption}`,
+      actor: "user",
+      text: sourceContent.slice(0, 8_000),
+      sourceContent,
+      occurredAt: 4_000,
+      metadata: {},
+    }], scope);
+    const eventId = report.sourceMap[0].eventId;
+    corruptionLedger.close();
+
+    const rawDatabase = new DatabaseSync(corruptionDatabase);
+    try {
+      dropLegacyArchiveTriggers(rawDatabase);
+      if (corruption === "delete") {
+        rawDatabase.prepare(`
+          DELETE FROM legacy_source_archive_chunks
+          WHERE event_id = ? AND chunk_index = 1
+        `).run(eventId);
+      } else if (corruption === "duplicate") {
+        const finalChunk = rawDatabase.prepare(`
+          SELECT content_hash, content
+          FROM legacy_source_archive_chunks
+          WHERE event_id = ? AND chunk_index = 2
+        `).get(eventId);
+        rawDatabase.prepare(`
+          INSERT INTO legacy_source_archive_chunks(
+            event_id, chunk_index, start_char, end_char, content_hash, content
+          ) VALUES (?, 3, 16002, 16004, ?, ?)
+        `).run(eventId, finalChunk.content_hash, finalChunk.content);
+      } else if (corruption === "reorder") {
+        const first = rawDatabase.prepare(`
+          SELECT content_hash, content
+          FROM legacy_source_archive_chunks
+          WHERE event_id = ? AND chunk_index = 0
+        `).get(eventId);
+        const second = rawDatabase.prepare(`
+          SELECT content_hash, content
+          FROM legacy_source_archive_chunks
+          WHERE event_id = ? AND chunk_index = 1
+        `).get(eventId);
+        rawDatabase.prepare(`
+          UPDATE legacy_source_archive_chunks
+          SET content_hash = ?, content = ?
+          WHERE event_id = ? AND chunk_index = 0
+        `).run(second.content_hash, second.content, eventId);
+        rawDatabase.prepare(`
+          UPDATE legacy_source_archive_chunks
+          SET content_hash = ?, content = ?
+          WHERE event_id = ? AND chunk_index = 1
+        `).run(first.content_hash, first.content, eventId);
+      } else {
+        rawDatabase.prepare(`
+          UPDATE legacy_source_archive_chunks
+          SET content = content || '损坏'
+          WHERE event_id = ? AND chunk_index = 1
+        `).run(eventId);
+      }
+    } finally {
+      rawDatabase.close();
+    }
+
+    corruptionLedger = new AsukaMemoryLedger(corruptionDatabase);
+    try {
+      const gate = getLegacyRejudgementGate(new AsukaMemoryEngine(corruptionLedger));
+      assert.equal(gate.passed, false);
+      assert.equal(gate.coverage.completeSourceArchives, 0);
+      assert.match(gate.blockers.join("; "), /incomplete chunk coverage/i);
+    } finally {
+      corruptionLedger.close();
+    }
+  });
+}
+
+verifySourceAccountingRegression("immutable binding blocks provenance reclassification", () => {
+  const bindingDatabase = path.join(fixtureRoot, "binding-provenance.sqlite");
+  let bindingLedger = new AsukaMemoryLedger(bindingDatabase);
+  const bindingEngine = new AsukaMemoryEngine(bindingLedger);
+  const bindingReport = migrateLegacyRecords(bindingEngine, [{
+    sourceKind: "memory",
+    sourcePath: memoryFile,
+    sourceRecordId: "binding-source-row",
+    legacyId: "binding-source-row",
+    actor: "user",
+    text: "不可变迁移来源绑定",
+    sourceContent: "不可变迁移来源绑定的完整原文",
+    occurredAt: 4_500,
+    metadata: {},
+  }], scope);
+  const eventId = bindingReport.sourceMap[0].eventId;
+  const event = bindingLedger.getEvent(eventId);
+  bindingLedger.close();
+
+  const rawDatabase = new DatabaseSync(bindingDatabase);
+  try {
+    dropLegacyArchiveTriggers(rawDatabase);
+    rawDatabase.prepare(`
+      UPDATE memory_events
+      SET peer_id = ?, metadata_json = ?
+      WHERE event_id = ?
+    `).run(
+      "tampered-peer",
+      JSON.stringify({
+        ...event.metadata,
+        secretRedacted: true,
+        legacyRedactionDisposition: "deterministic_secret_filter",
+      }),
+      eventId,
+    );
+    rawDatabase.prepare(
+      "DELETE FROM memory_jobs WHERE event_id = ?",
+    ).run(eventId);
+    rawDatabase.prepare(
+      "DELETE FROM legacy_source_archive_chunks WHERE event_id = ?",
+    ).run(eventId);
+    rawDatabase.prepare(
+      "DELETE FROM legacy_source_archives WHERE event_id = ?",
+    ).run(eventId);
+  } finally {
+    rawDatabase.close();
+  }
+
+  bindingLedger = new AsukaMemoryLedger(bindingDatabase);
+  try {
+    const gate = getLegacyRejudgementGate(new AsukaMemoryEngine(bindingLedger));
+    assert.equal(gate.passed, false);
+    assert.equal(
+      gate.events.eligible,
+      1,
+      "mutable redaction metadata must not remove an imported binding from the cohort",
+    );
+    assert.equal(gate.events.untracked, 1);
+    assert.match(
+      gate.blockers.join("; "),
+      /migration binding|immutable binding|archive/i,
+    );
+  } finally {
+    bindingLedger.close();
+  }
+});
+
+verifySourceAccountingRegression("audit-only archives remain in integrity coverage", () => {
+  const auditDatabase = path.join(fixtureRoot, "audit-archive.sqlite");
+  let auditLedger = new AsukaMemoryLedger(auditDatabase);
+  const auditReport = migrateLegacyRecords(
+    new AsukaMemoryEngine(auditLedger),
+    [{
+      sourceKind: "claim",
+      sourcePath: claimsFile,
+      sourceRecordId: "audit-only-row",
+      legacyId: "audit-only-row",
+      actor: "system",
+      text: "无法导入但必须保留的来源",
+      sourceContent: `${"审计原文".repeat(2_500)}尾部`,
+      occurredAt: 4_600,
+      metadata: {},
+      auditedNonImport: {
+        code: "no_supported_text",
+        reason: "source record has no supported text field",
+      },
+    }],
+    scope,
+  );
+  const eventId = auditReport.sourceMap[0].eventId;
+  assert.equal(auditReport.auditedNonImportRecords, 1);
+  assert.equal(
+    getLegacyRejudgementGate(new AsukaMemoryEngine(auditLedger)).passed,
+    true,
+  );
+  auditLedger.close();
+
+  const rawDatabase = new DatabaseSync(auditDatabase);
+  try {
+    dropLegacyArchiveTriggers(rawDatabase);
+    rawDatabase.prepare(`
+      DELETE FROM legacy_source_archive_chunks
+      WHERE event_id = ? AND chunk_index = 0
+    `).run(eventId);
+  } finally {
+    rawDatabase.close();
+  }
+
+  auditLedger = new AsukaMemoryLedger(auditDatabase);
+  try {
+    const gate = getLegacyRejudgementGate(new AsukaMemoryEngine(auditLedger));
+    assert.equal(gate.passed, false);
+    assert.equal(gate.events.eligible, 0);
+    assert.equal(gate.coverage.completeSourceArchives, 0);
+    assert.match(gate.blockers.join("; "), /migration binding|archive/i);
+  } finally {
+    auditLedger.close();
+  }
+});
+
 verifySourceAccountingRegression("secret-bearing legacy payload is not persisted", () => {
   const secret = "sk-phase23-secret-1234567890";
+  const secretPrefix = "无敏感前缀".repeat(1_700);
   const secretMemoryFile = path.join(fixtureRoot, "secret-memory.json");
   const secretDatabase = path.join(fixtureRoot, "secret-memory.sqlite");
   fs.writeFileSync(secretMemoryFile, JSON.stringify({
@@ -399,7 +858,7 @@ verifySourceAccountingRegression("secret-bearing legacy payload is not persisted
         peerKind: "direct",
         peerId: "user-1",
         type: "explicit",
-        text: `api_key=${secret}`,
+        text: `${secretPrefix}api_key=${secret}`,
         source: "user_explicit",
         nested: { rawSecret: secret },
       },
@@ -416,10 +875,21 @@ verifySourceAccountingRegression("secret-bearing legacy payload is not persisted
     const secretEvent = secretLedger.getEvent(secretReport.sourceMap[0].eventId);
     assert.equal(secretEvent.text, "[secret-bearing content omitted]");
     assert.equal(secretEvent.metadata.secretRedacted, true);
+    assert.equal(
+      secretEvent.metadata.legacyRedactionDisposition,
+      "deterministic_secret_filter",
+    );
     assert.equal("legacyRecord" in secretEvent.metadata, false);
     assert.equal(typeof secretEvent.metadata.legacyContentHash, "string");
     assert.equal(secretEvent.metadata.legacySourcePath, secretMemoryFile);
     assert.doesNotMatch(JSON.stringify(secretEvent.metadata), new RegExp(secret));
+    assert.equal(
+      secretLedger.getLegacySourceArchive(secretEvent.eventId),
+      undefined,
+      "secret-bearing source must never be archived",
+    );
+    const gate = getLegacyRejudgementGate(secretEngine);
+    assert.equal(gate.passed, true, gate.blockers.join("; "));
   } finally {
     secretLedger.close();
   }
@@ -433,6 +903,131 @@ verifySourceAccountingRegression("secret-bearing legacy payload is not persisted
       fs.readFileSync(sqlitePath).includes(Buffer.from(secret)),
       false,
       `plaintext secret must not remain in ${path.basename(sqlitePath)}`,
+    );
+  }
+});
+
+verifySourceAccountingRegression("structured secret fields are redacted before archive", () => {
+  const structuredSecretFile = path.join(fixtureRoot, "structured-secrets.json");
+  const structuredSecretDatabase = path.join(
+    fixtureRoot,
+    "structured-secrets.sqlite",
+  );
+  const secretValues = [
+    "opaque-credential-alpha",
+    "opaque-credential-beta",
+    "opaque-credential-gamma",
+  ];
+  fs.writeFileSync(structuredSecretFile, JSON.stringify({
+    memories: {
+      password: {
+        text: "密码字段迁移测试",
+        nested: { password: secretValues[0] },
+      },
+      clientSecret: {
+        text: "客户端密钥字段迁移测试",
+        nested: { clientSecret: secretValues[1] },
+      },
+      accessToken: {
+        text: "访问令牌字段迁移测试",
+        nested: { accessToken: secretValues[2] },
+      },
+      numericSecret: {
+        text: "数值密码字段迁移测试",
+        nested: { password: 731904 },
+      },
+    },
+  }));
+  const structuredRecords = collectLegacyMigrationRecords(
+    { memoryJson: structuredSecretFile },
+    scope,
+  );
+  const structuredLedger = new AsukaMemoryLedger(structuredSecretDatabase);
+  try {
+    const structuredReport = migrateLegacyRecords(
+      new AsukaMemoryEngine(structuredLedger),
+      structuredRecords,
+      scope,
+    );
+    assert.equal(structuredReport.importedEvents, 4);
+    for (const item of structuredReport.sourceMap) {
+      const event = structuredLedger.getEvent(item.eventId);
+      assert.equal(event.text, "[secret-bearing content omitted]");
+      assert.equal(event.metadata.secretRedacted, true);
+      assert.equal(structuredLedger.getLegacySourceArchive(item.eventId), undefined);
+    }
+  } finally {
+    structuredLedger.close();
+  }
+  const persisted = [
+    structuredSecretDatabase,
+    `${structuredSecretDatabase}-wal`,
+    `${structuredSecretDatabase}-shm`,
+  ].filter((file) => fs.existsSync(file))
+    .map((file) => fs.readFileSync(file))
+    .reduce((combined, value) => Buffer.concat([combined, value]), Buffer.alloc(0));
+  for (const secretValue of secretValues) {
+    assert.equal(
+      persisted.includes(Buffer.from(secretValue)),
+      false,
+      `structured secret value must not remain in SQLite: ${secretValue}`,
+    );
+  }
+});
+
+verifySourceAccountingRegression("secret-bearing locators are domain-hashed everywhere", () => {
+  const locatorDatabase = path.join(fixtureRoot, "secret-locator.sqlite");
+  const secretLocator = "password=opaque-locator-value";
+  const locatorRecord = {
+    sourceKind: "memory",
+    sourcePath: secretLocator,
+    sourceRecordId: secretLocator,
+    sourceContent: "ordinary archived source",
+    legacyId: secretLocator,
+    actor: "user",
+    text: "普通迁移内容",
+    occurredAt: 8_000,
+    metadata: {},
+  };
+  const locatorLedger = new AsukaMemoryLedger(locatorDatabase);
+  let locatorReport;
+  try {
+    locatorReport = migrateLegacyRecords(
+      new AsukaMemoryEngine(locatorLedger),
+      [locatorRecord],
+      scope,
+    );
+    const mapping = locatorReport.sourceMap[0];
+    const event = locatorLedger.getEvent(mapping.eventId);
+    assert.match(mapping.sourcePath, /^redacted-source-path-[a-f0-9]{64}$/);
+    assert.match(mapping.sourceRecordId, /^redacted-source-record-[a-f0-9]{64}$/);
+    assert.match(mapping.legacyId, /^redacted-legacy-id-[a-f0-9]{64}$/);
+    assert.equal(
+      new Set([
+        mapping.sourcePath,
+        mapping.sourceRecordId,
+        mapping.legacyId,
+      ]).size,
+      3,
+      "the same locator must hash differently in different domains",
+    );
+    assert.doesNotMatch(JSON.stringify(locatorReport), /opaque-locator-value/);
+    assert.doesNotMatch(JSON.stringify(event), /opaque-locator-value/);
+    assert.doesNotMatch(event.sourceId, /opaque-locator-value/);
+    assert.doesNotMatch(event.dedupeKey, /opaque-locator-value/);
+  } finally {
+    locatorLedger.close();
+  }
+  for (const sqlitePath of [
+    locatorDatabase,
+    `${locatorDatabase}-wal`,
+    `${locatorDatabase}-shm`,
+  ]) {
+    if (!fs.existsSync(sqlitePath)) continue;
+    assert.equal(
+      fs.readFileSync(sqlitePath).includes(Buffer.from(secretLocator)),
+      false,
+      `secret-bearing locator must not remain in ${path.basename(sqlitePath)}`,
     );
   }
 });
@@ -730,6 +1325,8 @@ function consolidateResidences(request) {
         topLevelType: "fact",
         epistemicStatus: "explicit",
         confidence: 0.99,
+        disposition: "active",
+        rationale: "The user directly stated this historical residence",
         topic: "居住状态",
         lifecycle: "bounded",
       },
@@ -743,6 +1340,8 @@ function consolidateResidences(request) {
         topLevelType: "fact",
         epistemicStatus: "explicit",
         confidence: 0.99,
+        disposition: "active",
+        rationale: "The user directly stated this current residence",
         topic: "居住状态",
         lifecycle: "bounded",
       },
@@ -1181,6 +1780,8 @@ await verifyMigrationInvariant("bounded intermediate evidence excerpts", async (
           topLevelType: "fact",
           epistemicStatus: "explicit",
           confidence: 0.99,
+          disposition: "active",
+          rationale: "The source evidence directly supports this claim",
         }],
         discarded: [],
       });
@@ -1247,6 +1848,8 @@ await verifyMigrationInvariant("large consolidation fan-in remains bounded and t
             topLevelType: "fact",
             epistemicStatus: "explicit",
             confidence: 0.99,
+            disposition: "active",
+            rationale: "The source evidence directly supports this claim",
           }],
           discarded: [],
         });
@@ -1316,6 +1919,8 @@ await verifyMigrationInvariant("invalidated extraction candidates cannot be resu
             topLevelType: "fact",
             epistemicStatus: "explicit",
             confidence: 0.99,
+            disposition: "active",
+            rationale: "The source evidence directly supports this claim",
           }],
           discarded: [],
         });
@@ -1395,6 +2000,8 @@ await verifyMigrationInvariant("legacy consolidation joins an existing semantic 
     epistemicStatus: "explicit",
     authority: "user_explicit",
     confidence: 1,
+    disposition: "active",
+    rationale: "Fixture model selected active",
     validFrom: 200_000,
   });
   const joinedEngine = new AsukaMemoryEngine(joinedLedger, {
@@ -1427,6 +2034,8 @@ await verifyMigrationInvariant("legacy consolidation joins an existing semantic 
             topLevelType: "fact",
             epistemicStatus: "explicit",
             confidence: 1,
+            disposition: "active",
+            rationale: "The user directly stated this historical residence",
             validFrom: "1970-01-01T00:00:10.000Z",
           }],
           discarded: [],
@@ -1487,6 +2096,8 @@ const assistantEngine = new AsukaMemoryEngine(assistantLedger, {
           topLevelType: "fact",
           epistemicStatus: "explicit",
           confidence: 0.99,
+          disposition: "active",
+          rationale: "The assistant-only source remains a candidate by safety policy",
         }],
         discarded: [],
       });
@@ -1503,7 +2114,7 @@ const assistantClaim = assistantLedger.listClaims()
     claim.canonicalText === "用户住在东京"
     && claim.metadata.legacyConsolidationRunId
   );
-assert.equal(assistantClaim?.authority, "summary");
+assert.equal(assistantClaim?.authority, "inferred");
 assert.equal(assistantClaim?.epistemicStatus, "inferred");
 assert.equal(assistantClaim?.state, "candidate");
 assert.equal(
@@ -1554,6 +2165,8 @@ const inferenceConflictEngine = new AsukaMemoryEngine(inferenceConflictLedger, {
             topLevelType: "belief",
             epistemicStatus: "explicit",
             confidence: 0.99,
+            disposition: "active",
+            rationale: "The user explicitly stated this preference",
           },
           {
             semanticKey: "user.preference.daily_period",
@@ -1565,6 +2178,8 @@ const inferenceConflictEngine = new AsukaMemoryEngine(inferenceConflictLedger, {
             topLevelType: "belief",
             epistemicStatus: "explicit",
             confidence: 0.99,
+            disposition: "candidate",
+            rationale: "Behavioral evidence remains an inference and cannot override the explicit fact",
           },
         ],
         discarded: [],

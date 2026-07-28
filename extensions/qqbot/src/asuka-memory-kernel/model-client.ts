@@ -257,6 +257,21 @@ function validateTaskOutput(text: string, task: MemoryModelRequest["task"]): voi
       throw new Error("memory rerank is missing valid claimIds");
     }
   }
+  if (task === "reflect") {
+    if (
+      !Array.isArray(parsed.decisions)
+      || parsed.decisions.some((decision) => (
+        !isRecord(decision)
+        || !isPresentString(decision.claimId)
+        || !isPresentString(decision.action)
+        || !isPresentString(decision.rationale)
+        || typeof decision.confidence !== "number"
+        || !Number.isFinite(decision.confidence)
+      ))
+    ) {
+      throw new Error("memory reflection is missing valid decisions");
+    }
+  }
   if (task === "legacy_consolidate") {
     if (!Array.isArray(parsed.claims) || !Array.isArray(parsed.discarded)) {
       throw new Error("legacy consolidation requires claims and discarded arrays");
@@ -385,21 +400,36 @@ async function requestCompletion(
 
 function parseEmbeddingVectors(
   payload: unknown,
+  expectedModel: string,
   expectedCount: number,
   expectedDimensions?: number,
 ): { dimensions: number; vectors: number[][] } {
   if (!payload || typeof payload !== "object") {
     throw new Error("embedding provider returned an invalid payload");
   }
-  const data = (payload as {
+  const response = payload as {
+    model?: unknown;
     data?: Array<{ index?: unknown; embedding?: unknown }>;
-  }).data;
+  };
+  if (response.model !== expectedModel) {
+    throw new Error("embedding provider returned an unexpected model");
+  }
+  const data = response.data;
   if (!Array.isArray(data) || data.length !== expectedCount) {
     throw new Error("embedding provider returned an invalid vector count");
   }
-  const ordered = data.every((item) => Number.isInteger(item?.index))
-    ? [...data].sort((left, right) => Number(left.index) - Number(right.index))
-    : data;
+  const ordered = new Array<(typeof data)[number]>(expectedCount);
+  for (const item of data) {
+    if (
+      !Number.isInteger(item?.index)
+      || Number(item.index) < 0
+      || Number(item.index) >= expectedCount
+      || ordered[Number(item.index)] !== undefined
+    ) {
+      throw new Error("embedding provider returned an invalid vector index");
+    }
+    ordered[Number(item.index)] = item;
+  }
   const vectors = ordered.map((item) => {
     if (
       !Array.isArray(item?.embedding)
@@ -455,6 +485,7 @@ async function requestEmbeddings(
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const parsed = parseEmbeddingVectors(
       await readJsonResponse(response),
+      config.model,
       texts.length,
       config.expectedDimensions,
     );

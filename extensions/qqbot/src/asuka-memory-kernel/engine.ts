@@ -1,19 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
-import { AsukaMemoryLedger } from "./ledger.js";
+import { AsukaMemoryLedger, type RerankCacheContext } from "./ledger.js";
 import {
   buildLegacyConsolidationPrompt,
   buildLegacyExtractionPrompt,
   buildMemoryJudgementPrompt,
+  buildReflectionPrompt,
   buildRerankPrompt,
   parseLegacyConsolidation,
   parseLegacyExtraction,
   parseMemoryJudgement,
+  parseReflectionResult,
   parseRerankResult,
   type LegacyConsolidationDecision,
   type LegacyConsolidationDecisionClaim,
   type LegacyConsolidationPromptItem,
+  type MemoryJudgementContextCoverage,
 } from "./model-tasks.js";
-import { containsDeterministicSecret } from "./policy.js";
+import { containsDeterministicSecretValue } from "./policy.js";
 import type {
   LegacyConsolidationClaim,
   LegacyConsolidationDiscard,
@@ -23,6 +26,7 @@ import type {
   MemoryEngineOptions,
   MemoryEvent,
   MemoryEventInput,
+  MemoryEmbeddingHealth,
   MemoryIngestResult,
   MemoryJob,
   MemoryJobBatchResult,
@@ -33,14 +37,19 @@ import type {
   MemoryVisibility,
 } from "./types.js";
 
-const JUDGEMENT_PROMPT_VERSION = 2;
+const JUDGEMENT_PROMPT_VERSION = 4;
 const RERANK_PROMPT_VERSION = 1;
+const REFLECTION_PROMPT_VERSION = 1;
 const LEGACY_EXTRACTION_PROMPT_VERSION = 1;
 const LEGACY_CONSOLIDATION_PROMPT_VERSION = 1;
 const DEFAULT_JUDGEMENT_TIMEOUT_MS = 12_000;
 const DEFAULT_RERANK_DEADLINE_MS = 1_500;
 const DEFAULT_RERANK_TASK_TIMEOUT_MS = 12_000;
 const DEFAULT_MAX_JOB_ATTEMPTS = 8;
+const DEFAULT_MAX_JUDGEMENT_PROPOSALS = 12;
+const DEFAULT_REFLECTION_INTERVAL_MS = 86_400_000;
+const DEFAULT_REFLECTION_BATCH_SIZE = 24;
+const DEFAULT_EVENT_REFLECTION_DELAY_MS = 5_000;
 const DEFAULT_LEGACY_EXTRACTION_MAX_INPUT_CHARS = 12_000;
 const DEFAULT_LEGACY_EXTRACTION_MAX_PROPOSALS = 12;
 const DEFAULT_LEGACY_EXTRACTION_MAX_TOKENS = 3_200;
@@ -48,7 +57,7 @@ const DEFAULT_LEGACY_CONSOLIDATION_MAX_INPUT_CHARS = 12_000;
 const DEFAULT_LEGACY_CONSOLIDATION_MAX_CLAIMS_PER_BATCH = 32;
 const DEFAULT_LEGACY_CONSOLIDATION_MAX_TOKENS = 4_000;
 const MAX_LEGACY_CONSOLIDATION_ROUNDS = 8;
-const MAX_CURRENT_CLAIMS_FOR_JUDGEMENT = 40;
+const MAX_JUDGEMENT_EVIDENCE_REFERENCES = 128;
 
 interface AdjudicateResult {
   eventId: string;
@@ -60,6 +69,7 @@ interface LocalRetrieval {
   identityId: string;
   maxPromptChars: number;
   candidates: MemorySearchCandidate[];
+  cacheContext: RerankCacheContext;
   result: MemoryContextResult;
 }
 
@@ -70,6 +80,12 @@ interface LegacyConsolidationRound {
   outputItems: number;
   discardedCandidates: number;
   coveredCandidates: number;
+}
+
+interface JudgementContextSelection {
+  claims: MemoryClaim[];
+  availableClaims: MemoryClaim[];
+  coverage: MemoryJudgementContextCoverage;
 }
 
 function boundedInteger(
@@ -84,6 +100,45 @@ function boundedInteger(
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
+}
+
+function judgementCoverageSummary(coverage: MemoryJudgementContextCoverage) {
+  return {
+    availableClaimCount: coverage.availableClaimCount,
+    includedClaimCount: coverage.includedClaimCount,
+    omittedClaimCount: coverage.omittedClaimCount,
+    requiredClaimCount: coverage.requiredClaimIds.length,
+    includedRequiredClaimCount: coverage.includedRequiredClaimIds.length,
+    missingRequiredReferenceCount: coverage.missingRequiredReferences.length,
+    includedEvidenceCount: coverage.includedEvidenceCount,
+    omittedEvidenceCount: coverage.omittedEvidenceCount,
+  };
+}
+
+function redactedLegacyMetadata(
+  metadata: Record<string, unknown> | undefined,
+  contentHash: string,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const key of [
+    "legacySourceKind",
+    "legacySourcePath",
+    "legacyId",
+    "legacySourceRecordId",
+    "legacyAuditedNonImport",
+  ]) {
+    const value = metadata?.[key];
+    if (
+      (typeof value === "string" || typeof value === "boolean")
+      && !containsDeterministicSecretValue({ [key]: value })
+    ) {
+      result[key] = value;
+    }
+  }
+  if (/^[a-f0-9]{64}$/i.test(contentHash)) {
+    result.legacyContentHash = contentHash;
+  }
+  return result;
 }
 
 export function legacyConsolidationInputHash(
@@ -153,6 +208,20 @@ function reorderCandidates(
   return ordered;
 }
 
+function localFallbackCandidates(
+  candidates: MemorySearchCandidate[],
+): MemorySearchCandidate[] {
+  return candidates.filter((candidate) =>
+    candidate.exactLexicalMatch || candidate.vectorScore > 0
+  );
+}
+
+function rerankCandidateFingerprint(candidates: MemorySearchCandidate[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify(candidates.map((candidate) => candidate.claim)))
+    .digest("hex");
+}
+
 function renderMemoryPrompt(
   candidates: MemorySearchCandidate[],
   maxPromptChars: number,
@@ -189,6 +258,12 @@ export class AsukaMemoryEngine {
   private readonly rerankDeadlineMs: number;
   private readonly rerankTaskTimeoutMs: number;
   private readonly maxJobAttempts: number;
+  private readonly maxJudgementProposals: number;
+  private readonly requireEmbeddings: boolean;
+  private readonly autoReflection: boolean;
+  private readonly reflectionIntervalMs: number;
+  private readonly reflectionBatchSize: number;
+  private readonly reflectionEventDelayMs: number;
   private readonly legacyExtractionMaxInputChars: number;
   private readonly legacyExtractionMaxProposals: number;
   private readonly legacyExtractionMaxTokens: number;
@@ -206,6 +281,32 @@ export class AsukaMemoryEngine {
     this.rerankDeadlineMs = Math.max(10, options.rerankDeadlineMs ?? DEFAULT_RERANK_DEADLINE_MS);
     this.rerankTaskTimeoutMs = Math.max(100, options.rerankTaskTimeoutMs ?? DEFAULT_RERANK_TASK_TIMEOUT_MS);
     this.maxJobAttempts = Math.max(1, options.maxJobAttempts ?? DEFAULT_MAX_JOB_ATTEMPTS);
+    this.maxJudgementProposals = boundedInteger(
+      options.maxJudgementProposals,
+      DEFAULT_MAX_JUDGEMENT_PROPOSALS,
+      1,
+      1_000,
+    );
+    this.requireEmbeddings = options.requireEmbeddings === true;
+    this.autoReflection = options.autoReflection === true;
+    this.reflectionIntervalMs = boundedInteger(
+      options.reflectionIntervalMs,
+      DEFAULT_REFLECTION_INTERVAL_MS,
+      1_000,
+      365 * 86_400_000,
+    );
+    this.reflectionBatchSize = boundedInteger(
+      options.reflectionBatchSize,
+      DEFAULT_REFLECTION_BATCH_SIZE,
+      1,
+      200,
+    );
+    this.reflectionEventDelayMs = boundedInteger(
+      options.reflectionEventDelayMs,
+      DEFAULT_EVENT_REFLECTION_DELAY_MS,
+      0,
+      3_600_000,
+    );
     this.legacyExtractionMaxInputChars = boundedInteger(
       options.legacyExtractionMaxInputChars,
       DEFAULT_LEGACY_EXTRACTION_MAX_INPUT_CHARS,
@@ -244,6 +345,56 @@ export class AsukaMemoryEngine {
     );
     this.model = options.model;
     this.onProjectionChanged = options.onProjectionChanged;
+    if (this.requireEmbeddings && !this.model?.embed) {
+      throw new Error("memory embeddings are required but no embedding adapter is configured");
+    }
+    if (this.requireEmbeddings && !this.ledger.vectorAvailable) {
+      throw new Error("memory embeddings are required but the local vector index is unavailable");
+    }
+  }
+
+  async checkEmbeddingHealth(): Promise<MemoryEmbeddingHealth> {
+    if (!this.model?.embed) {
+      return {
+        required: this.requireEmbeddings,
+        ready: false,
+        reason: "embedding_adapter_unavailable",
+      };
+    }
+    if (!this.ledger.vectorAvailable) {
+      return {
+        required: this.requireEmbeddings,
+        ready: false,
+        reason: "vector_index_unavailable",
+      };
+    }
+    try {
+      const result = await this.model.embed(
+        ["Asuka memory embedding health check"],
+        Math.min(this.judgementTimeoutMs, 5_000),
+      );
+      const vector = result.vectors[0];
+      if (
+        result.vectors.length !== 1
+        || !vector
+        || vector.length !== result.dimensions
+        || vector.some((value) => !Number.isFinite(value))
+      ) {
+        throw new Error("embedding adapter returned an invalid health-check vector");
+      }
+      return {
+        required: this.requireEmbeddings,
+        ready: true,
+        model: result.model,
+        dimensions: result.dimensions,
+      };
+    } catch (error) {
+      return {
+        required: this.requireEmbeddings,
+        ready: false,
+        reason: safeError(error),
+      };
+    }
   }
 
   ingestMemoryEvent(
@@ -251,31 +402,58 @@ export class AsukaMemoryEngine {
     options: {
       enqueue?: boolean;
       jobKind?: "adjudicate" | "legacy_rejudge";
+      legacySource?: {
+        content: string;
+        contentHash: string;
+      };
     } = {},
   ): MemoryIngestResult {
     const normalizedText = input.text.replace(/\s+/g, " ").trim();
-    const containsSecret = containsDeterministicSecret([
-      normalizedText,
-      input.evidence?.excerpt,
-      input.evidence?.transcript,
-      input.evidence?.imageSummary,
-    ].filter(Boolean).join("\n"));
+    const containsSecret = containsDeterministicSecretValue({
+      text: normalizedText,
+      evidence: input.evidence,
+      metadata: input.metadata,
+      legacySourceContent: options.legacySource?.content,
+    });
     const safeInput: MemoryEventInput = containsSecret
       ? {
         ...input,
         text: "[secret-bearing content omitted]",
         evidence: {},
         metadata: {
-          ...(input.metadata ?? {}),
+          ...(options.legacySource
+            ? redactedLegacyMetadata(
+              input.metadata,
+              options.legacySource.contentHash,
+            )
+            : {}),
           secretRedacted: true,
+          ...(options.legacySource
+            ? { legacyRedactionDisposition: "deterministic_secret_filter" }
+            : {}),
         },
       }
       : {
         ...input,
         text: normalizedText,
       };
-    const receipt = this.ledger.appendEvent(safeInput);
-    if (!containsSecret && receipt.inserted && options.enqueue !== false) {
+    const receipt = options.legacySource
+      ? containsSecret
+        ? this.ledger.appendLegacyRedactedEvent(safeInput, {
+          contentHash: options.legacySource.contentHash,
+          contentChars: options.legacySource.content.length,
+        })
+        : this.ledger.appendLegacyEvent(safeInput, options.legacySource, {
+          enqueue: options.enqueue,
+          jobKind: options.jobKind,
+        })
+      : this.ledger.appendEvent(safeInput);
+    if (
+      !containsSecret
+      && !options.legacySource
+      && receipt.inserted
+      && options.enqueue !== false
+    ) {
       this.ledger.enqueueJob(receipt.eventId, options.jobKind ?? "adjudicate");
     }
     return {
@@ -306,17 +484,9 @@ export class AsukaMemoryEngine {
     });
   }
 
-  async adjudicateEvent(
-    eventId: string,
-    options: { runTask?: "adjudicate" | "legacy_rejudge" } = {},
-  ): Promise<AdjudicateResult> {
-    if (options.runTask === "legacy_rejudge") {
-      return this.extractLegacyEvent(eventId);
-    }
-    if (!this.model) throw new Error("memory judgement model is not configured");
-    const event = this.ledger.getEvent(eventId);
-    if (!event) throw new Error(`memory event not found: ${eventId}`);
-    const currentClaims = this.ledger.listClaims({
+  private async judgementContext(event: MemoryEvent): Promise<JudgementContextSelection> {
+    const limit = candidateLimit(dynamicPromptBudget(event.text), undefined);
+    const availableClaims = this.ledger.listClaims({
       identityId: event.identityId,
       states: ["active", "candidate"],
       visibility: event.visibility,
@@ -324,44 +494,298 @@ export class AsukaMemoryEngine {
     }).filter((claim) =>
       claim.metadata.migrationPendingRejudge !== true
       && claim.metadata.migrationPendingConsolidation !== true
-    ).slice(0, MAX_CURRENT_CLAIMS_FOR_JUDGEMENT);
-    const prompt = buildMemoryJudgementPrompt(event, currentClaims);
+      && claim.metadata.reflectionTerminalFailure === undefined
+    );
+    const lexical = this.ledger.searchClaimsForAdjudication({
+      identityId: event.identityId,
+      visibility: event.visibility,
+      query: event.text,
+      now: event.occurredAt,
+      limit,
+    });
+    let vectorClaims: MemoryClaim[] = [];
+    if (this.model?.embed && event.text.trim()) {
+      try {
+        const embedded = await this.model.embed(
+          [event.text],
+          Math.min(this.judgementTimeoutMs, 5_000),
+        );
+        const vector = embedded.vectors[0];
+        if (
+          embedded.vectors.length !== 1
+          || !vector
+          || vector.length !== embedded.dimensions
+        ) {
+          throw new Error("embedding adapter returned an invalid judgement vector");
+        }
+        vectorClaims = this.ledger.searchLocal({
+          identityId: event.identityId,
+          visibility: event.visibility,
+          query: event.text,
+          now: event.occurredAt,
+          limit,
+          vector,
+          embeddingModel: embedded.model,
+        }).map((candidate) => candidate.claim);
+      } catch (error) {
+        if (this.requireEmbeddings) throw error;
+      }
+    }
+    const metadataTargetIds = [
+      ...(typeof event.metadata.targetClaimId === "string"
+        ? [event.metadata.targetClaimId]
+        : []),
+      ...(Array.isArray(event.metadata.targetClaimIds)
+        ? event.metadata.targetClaimIds.filter(
+          (claimId): claimId is string => typeof claimId === "string",
+        )
+        : []),
+    ];
+    const requiredReferences = unique([
+      ...event.generatedFromClaimIds,
+      ...metadataTargetIds,
+    ]);
+    const requiredMatches = new Map<string, MemoryClaim[]>();
+    for (const reference of requiredReferences) {
+      const referenced = this.ledger.getClaim(reference);
+      const rootClaimId = referenced?.rootClaimId ?? reference;
+      requiredMatches.set(reference, availableClaims.filter((claim) =>
+        claim.claimId === reference
+        || claim.rootClaimId === reference
+        || claim.rootClaimId === rootClaimId
+      ));
+    }
+    const requiredClaims = unique(
+      [...requiredMatches.values()].flat().map((claim) => claim.claimId),
+    ).map((claimId) => availableClaims.find((claim) => claim.claimId === claimId)!)
+      .filter(Boolean);
+    const byId = new Map<string, MemoryClaim>();
+    const append = (claim: MemoryClaim): void => {
+      if (byId.size < limit || byId.has(claim.claimId)) {
+        byId.set(claim.claimId, claim);
+      }
+    };
+    for (const claim of requiredClaims) append(claim);
+    for (const seed of [...lexical, ...vectorClaims]) {
+      append(seed);
+      for (const related of availableClaims) {
+        if (
+          related.rootClaimId === seed.rootClaimId
+          || related.semanticKey === seed.semanticKey
+        ) {
+          append(related);
+        }
+      }
+    }
+    const claims = [...byId.values()];
+    const includedIds = new Set(claims.map((claim) => claim.claimId));
+    const evidenceByClaimId: MemoryJudgementContextCoverage["evidenceByClaimId"] = {};
+    let includedEvidenceCount = 0;
+    let omittedEvidenceCount = 0;
+    for (const claim of claims) {
+      const evidence = {
+        supportingEventIds: [] as string[],
+        opposingEventIds: [] as string[],
+      };
+      for (const item of this.ledger.listClaimEvidence(claim.claimId)) {
+        if (item.stance !== "supports" && item.stance !== "opposes") continue;
+        const evidenceEvent = this.ledger.getEvent(item.eventId);
+        if (
+          !evidenceEvent
+          || evidenceEvent.identityId !== event.identityId
+          || evidenceEvent.visibility !== event.visibility
+          || evidenceEvent.occurredAt > event.occurredAt
+        ) {
+          continue;
+        }
+        if (includedEvidenceCount >= MAX_JUDGEMENT_EVIDENCE_REFERENCES) {
+          omittedEvidenceCount += 1;
+          continue;
+        }
+        if (item.stance === "supports") evidence.supportingEventIds.push(item.eventId);
+        else evidence.opposingEventIds.push(item.eventId);
+        includedEvidenceCount += 1;
+      }
+      evidenceByClaimId[claim.claimId] = evidence;
+    }
+    return {
+      claims,
+      availableClaims,
+      coverage: {
+        availableClaimCount: availableClaims.length,
+        includedClaimCount: claims.length,
+        omittedClaimCount: Math.max(0, availableClaims.length - claims.length),
+        requiredClaimIds: requiredClaims.map((claim) => claim.claimId),
+        includedRequiredClaimIds: requiredClaims
+          .filter((claim) => includedIds.has(claim.claimId))
+          .map((claim) => claim.claimId),
+        missingRequiredReferences: requiredReferences.filter((reference) => {
+          const matches = requiredMatches.get(reference) ?? [];
+          return matches.length === 0
+            || matches.every((claim) => !includedIds.has(claim.claimId));
+        }),
+        includedEvidenceCount,
+        omittedEvidenceCount,
+        evidenceByClaimId,
+      },
+    };
+  }
+
+  private assertJudgementCoverage(
+    event: MemoryEvent,
+    judgement: MemoryJudgement,
+    context: JudgementContextSelection,
+  ): void {
+    const includedClaimIds = new Set(context.claims.map((claim) => claim.claimId));
+    const allowedEvidenceIds = new Set<string>([event.eventId]);
+    for (const evidence of Object.values(context.coverage.evidenceByClaimId)) {
+      for (const eventId of evidence.supportingEventIds) allowedEvidenceIds.add(eventId);
+      for (const eventId of evidence.opposingEventIds) allowedEvidenceIds.add(eventId);
+    }
+    if (Array.isArray(event.metadata.contextEventIds)) {
+      for (const eventId of event.metadata.contextEventIds) {
+        if (typeof eventId !== "string") continue;
+        const evidence = this.ledger.getEvent(eventId);
+        if (
+          evidence?.identityId === event.identityId
+          && evidence.visibility === event.visibility
+          && evidence.occurredAt <= event.occurredAt
+        ) {
+          allowedEvidenceIds.add(eventId);
+        }
+      }
+    }
+    for (const proposal of judgement.proposals) {
+      if (
+        proposal.targetClaimId
+        && !includedClaimIds.has(proposal.targetClaimId)
+      ) {
+        throw new Error(
+          `judgement target coverage missing claim ${proposal.targetClaimId}`,
+        );
+      }
+      if (proposal.semanticKey) {
+        const availableRoots = new Set(
+          context.availableClaims
+            .filter((claim) => claim.semanticKey === proposal.semanticKey)
+            .map((claim) => claim.rootClaimId),
+        );
+        const includedRoots = new Set(
+          context.claims
+            .filter((claim) => claim.semanticKey === proposal.semanticKey)
+            .map((claim) => claim.rootClaimId),
+        );
+        const missingRoots = [...availableRoots].filter(
+          (rootClaimId) => !includedRoots.has(rootClaimId),
+        );
+        if (missingRoots.length > 0) {
+          throw new Error(
+            `judgement semantic-root coverage missing ${missingRoots.length} root(s)`,
+          );
+        }
+      }
+      const evidenceIds = unique([
+        ...(proposal.supportingEventIds ?? []),
+        ...(proposal.opposingEventIds ?? []),
+      ]);
+      const missingEvidence = evidenceIds.filter(
+        (eventId) => !allowedEvidenceIds.has(eventId),
+      );
+      if (missingEvidence.length > 0) {
+        throw new Error(
+          `judgement evidence coverage missing ${missingEvidence.length} event(s)`,
+        );
+      }
+    }
+  }
+
+  async adjudicateEvent(
+    eventId: string,
+    options: {
+      runTask?: "adjudicate" | "legacy_rejudge";
+      jobLease?: { jobId: string; leaseToken: string };
+    } = {},
+  ): Promise<AdjudicateResult> {
+    if (options.runTask === "legacy_rejudge") {
+      return this.extractLegacyEvent(eventId);
+    }
+    if (!this.model) throw new Error("memory judgement model is not configured");
+    const event = this.ledger.getEvent(eventId);
+    if (!event) throw new Error(`memory event not found: ${eventId}`);
     const startedAt = Date.now();
     let raw = "";
+    let context: JudgementContextSelection | undefined;
     try {
+      context = await this.judgementContext(event);
+      if (
+        context.coverage.missingRequiredReferences.length > 0
+        || context.coverage.requiredClaimIds.length
+          !== context.coverage.includedRequiredClaimIds.length
+        || context.coverage.omittedEvidenceCount > 0
+      ) {
+        throw new Error("judgement required context coverage overflow");
+      }
+      const prompt = buildMemoryJudgementPrompt(
+        event,
+        context.claims,
+        context.coverage,
+      );
       raw = await this.model.complete({
         task: "adjudicate",
         prompt,
         timeoutMs: this.judgementTimeoutMs,
         schemaVersion: JUDGEMENT_PROMPT_VERSION,
       });
-      const judgement = parseMemoryJudgement(raw, event);
-      const claimIds: string[] = [];
-      const deletedClaimIds: string[] = [];
-      for (const proposal of judgement.proposals) {
-        const result = this.ledger.applyClaimProposal(eventId, proposal);
-        if (result.claimId) claimIds.push(result.claimId);
-        if (result.deletedClaimIds) deletedClaimIds.push(...result.deletedClaimIds);
-      }
-      const uniqueDeletedClaimIds = unique(deletedClaimIds);
-      this.ledger.recordModelRun({
-        task: "adjudicate",
-        promptVersion: JUDGEMENT_PROMPT_VERSION,
-        status: "completed",
-        elapsedMs: Date.now() - startedAt,
-        inputEventId: eventId,
-        resultSummary: JSON.stringify({
-          proposalCount: judgement.proposals.length,
-          claimIds,
-          deletedClaimIds: uniqueDeletedClaimIds,
-          noMemoryReason: judgement.noMemoryReason,
-        }),
+      const judgement = parseMemoryJudgement(
+        raw,
+        event,
+        this.maxJudgementProposals,
+      );
+      this.assertJudgementCoverage(event, judgement, context);
+      const contextCoverage = context.coverage;
+      const committed = this.ledger.commitAdjudication({
+        eventId,
+        proposals: judgement.proposals,
+        modelRun: {
+          promptVersion: JUDGEMENT_PROMPT_VERSION,
+          elapsedMs: Date.now() - startedAt,
+          resultSummary: (results) => JSON.stringify({
+            proposalCount: judgement.proposals.length,
+            claimIds: results.flatMap((result) => result.claimId ? [result.claimId] : []),
+            deletedClaimIds: unique(results.flatMap((result) =>
+              result.deletedClaimIds ?? []
+            )),
+            noMemoryReason: judgement.noMemoryReason,
+            contextCoverage: judgementCoverageSummary(contextCoverage),
+          }),
+        },
+        jobLease: options.jobLease,
       });
+      const claimIds = committed.results.flatMap((result) =>
+        result.claimId ? [result.claimId] : []
+      );
+      const deletedClaimIds = committed.results.flatMap((result) =>
+        result.deletedClaimIds ?? []
+      );
+      const uniqueDeletedClaimIds = unique(deletedClaimIds);
       if (claimIds.length > 0 || uniqueDeletedClaimIds.length > 0) {
-        this.onProjectionChanged?.(event.identityId);
+        try {
+          this.onProjectionChanged?.(event.identityId);
+        } catch {
+          console.warn("[asuka-memory] adjudication projection notification failed");
+        }
       }
       if (claimIds.length > 0 && this.model.embed) {
-        this.ledger.enqueueJob(eventId, "embed");
+        try {
+          this.ledger.enqueueJob(eventId, "embed");
+        } catch {
+          console.warn("[asuka-memory] adjudication embedding enqueue failed");
+        }
+      }
+      try {
+        this.enqueueEventTriggeredReflection(event, context.claims, claimIds);
+      } catch {
+        console.warn("[asuka-memory] adjudication reflection enqueue failed");
       }
       return { eventId, judgement, claimIds };
     } catch (error) {
@@ -371,7 +795,12 @@ export class AsukaMemoryEngine {
         status: "failed",
         elapsedMs: Date.now() - startedAt,
         inputEventId: eventId,
-        resultSummary: raw.slice(0, 500),
+        resultSummary: JSON.stringify({
+          raw: raw.slice(0, 500),
+          contextCoverage: context
+            ? judgementCoverageSummary(context.coverage)
+            : undefined,
+        }),
         error: safeError(error),
       });
       throw error;
@@ -590,6 +1019,8 @@ export class AsukaMemoryEngine {
       topLevelType: decision.topLevelType,
       epistemicStatus: decision.epistemicStatus,
       confidence: decision.confidence,
+      disposition: decision.disposition,
+      rationale: decision.rationale,
       validFrom: decision.validFrom,
       validTo: decision.validTo,
       topic: decision.topic,
@@ -625,6 +1056,8 @@ export class AsukaMemoryEngine {
       topLevelType: decision.topLevelType,
       epistemicStatus: decision.epistemicStatus,
       confidence: decision.confidence,
+      disposition: decision.disposition,
+      rationale: decision.rationale,
       validFrom: decision.validFrom,
       validTo: decision.validTo,
       topic: decision.topic,
@@ -711,6 +1144,12 @@ export class AsukaMemoryEngine {
             topLevelType: candidate.topLevelType,
             epistemicStatus: candidate.epistemicStatus,
             confidence: candidate.confidence,
+            disposition: candidate.metadata.disposition === "active"
+              ? "active"
+              : "candidate",
+            rationale: typeof candidate.metadata.rationale === "string"
+              ? candidate.metadata.rationale
+              : "",
             validFrom: candidate.validFrom,
             validTo: candidate.validTo,
             topic: candidate.topic,
@@ -801,11 +1240,16 @@ export class AsukaMemoryEngine {
             ).length,
             rounds,
           };
-          this.ledger.updateLegacyConsolidationAudit(run.runId, audit);
+          this.ledger.updateLegacyConsolidationAudit(
+            run.runId,
+            run.runToken,
+            audit,
+          );
 
           if (finalClaims) {
             const completed = this.ledger.commitLegacyConsolidation({
               runId: run.runId,
+              runToken: run.runToken,
               claims: finalClaims,
               discarded,
               audit,
@@ -848,7 +1292,12 @@ export class AsukaMemoryEngine {
           sourceEventCount: extractions.length,
           rounds,
         };
-        this.ledger.failLegacyConsolidation(run.runId, safeError(error), audit);
+        this.ledger.failLegacyConsolidation(
+          run.runId,
+          run.runToken,
+          safeError(error),
+          audit,
+        );
         const failed = this.ledger.getLegacyConsolidationRun(
           identityId,
           visibility,
@@ -858,6 +1307,273 @@ export class AsukaMemoryEngine {
       }
     }
     return results;
+  }
+
+  private reflectionClaimsForEvent(event: MemoryEvent): MemoryClaim[] {
+    const requestedIds = event.kind === "reflection" && Array.isArray(event.metadata.targetClaimIds)
+      ? event.metadata.targetClaimIds.filter(
+        (claimId): claimId is string => typeof claimId === "string",
+      )
+      : this.ledger.listClaims({
+        identityId: event.identityId,
+        states: ["active", "candidate"],
+        visibility: event.visibility,
+      }).filter((claim) => claim.sourceEventId === event.eventId)
+        .map((claim) => claim.claimId);
+    return unique(requestedIds)
+      .map((claimId) => this.ledger.getClaim(claimId))
+      .filter((claim): claim is MemoryClaim =>
+        claim !== undefined
+        && claim.identityId === event.identityId
+        && claim.visibility === event.visibility
+        && (claim.state === "active" || claim.state === "candidate")
+        && claim.metadata.lifecycle !== "stable"
+        && claim.metadata.migrationPendingRejudge !== true
+        && claim.metadata.migrationPendingConsolidation !== true
+      );
+  }
+
+  private scheduleReflectionBatch(
+    source: MemoryEvent,
+    claims: MemoryClaim[],
+    trigger: "event" | "periodic",
+    occurredAt = Date.now(),
+    availableAt = occurredAt,
+  ): { event: MemoryEvent; job: MemoryJob } {
+    const targetClaimIds = claims.map((claim) => claim.claimId).sort();
+    const stateHash = createHash("sha256")
+      .update(JSON.stringify(claims.map((claim) => [
+        claim.claimId,
+        claim.state,
+        claim.updatedAt,
+        claim.metadata.lastReflectedAt,
+      ]).sort()))
+      .digest("hex");
+    return this.ledger.scheduleReflectionBatch({
+      accountId: source.accountId,
+      peerKind: source.peerKind,
+      peerId: source.peerId,
+      identityId: source.identityId,
+      visibility: source.visibility,
+      actor: "system",
+      kind: "reflection",
+      text: `Reflect ${targetClaimIds.length} non-stable memory claim(s)`,
+      occurredAt,
+      sourceId: `reflection:${trigger}:${source.eventId}`,
+      dedupeKey: `reflection:${trigger}:${source.eventId}:${stateHash}`,
+      metadata: {
+        trigger,
+        triggerEventId: source.eventId,
+        contextEventIds: [source.eventId],
+        targetClaimIds,
+      },
+    }, availableAt);
+  }
+
+  private enqueueEventTriggeredReflection(
+    event: MemoryEvent,
+    context: MemoryClaim[],
+    changedClaimIds: string[],
+  ): void {
+    if (!this.autoReflection) return;
+    const changed = new Set(changedClaimIds);
+    const changedSemanticKeys = new Set(
+      changedClaimIds
+        .map((claimId) => this.ledger.getClaim(claimId)?.semanticKey)
+        .filter((semanticKey): semanticKey is string => Boolean(semanticKey)),
+    );
+    const claims = context.flatMap((claim) => {
+      if (
+        changed.has(claim.claimId)
+        || !changedSemanticKeys.has(claim.semanticKey)
+      ) {
+        return [];
+      }
+      const live = this.ledger.getClaim(claim.claimId);
+      return live
+        && (live.state === "active" || live.state === "candidate")
+        && live.metadata.lifecycle !== "stable"
+        && live.metadata.reflectionTerminalFailure === undefined
+        ? [live]
+        : [];
+    });
+    if (claims.length === 0) return;
+    this.scheduleReflectionBatch(
+      event,
+      claims,
+      "event",
+      Date.now(),
+      Date.now() + this.reflectionEventDelayMs,
+    );
+  }
+
+  enqueueDueReflections(now = Date.now()): number {
+    if (!this.autoReflection) return 0;
+    const due = this.ledger.listClaims({
+      states: ["active", "candidate"],
+    }).filter((claim) => {
+      if (
+        claim.metadata.lifecycle === "stable"
+        || claim.metadata.migrationPendingRejudge === true
+        || claim.metadata.migrationPendingConsolidation === true
+        || claim.metadata.reflectionTerminalFailure !== undefined
+      ) {
+        return false;
+      }
+      const lastReflectedAt = typeof claim.metadata.lastReflectedAt === "number"
+        ? claim.metadata.lastReflectedAt
+        : claim.createdAt;
+      return now - lastReflectedAt >= this.reflectionIntervalMs;
+    });
+    const groups = new Map<string, MemoryClaim[]>();
+    for (const claim of due) {
+      const source = this.ledger.getEvent(claim.sourceEventId);
+      if (!source) continue;
+      const key = JSON.stringify([
+        source.accountId,
+        source.peerKind,
+        source.peerId,
+        claim.identityId,
+        claim.visibility,
+      ]);
+      const group = groups.get(key) ?? [];
+      group.push(claim);
+      groups.set(key, group);
+    }
+    let enqueued = 0;
+    for (const claims of groups.values()) {
+      for (let index = 0; index < claims.length; index += this.reflectionBatchSize) {
+        const batch = claims.slice(index, index + this.reflectionBatchSize);
+        const source = this.ledger.getEvent(batch[0].sourceEventId);
+        if (!source) continue;
+        const { job } = this.scheduleReflectionBatch(
+          source,
+          batch,
+          "periodic",
+          now,
+          now,
+        );
+        if (job.status === "pending") enqueued += 1;
+      }
+    }
+    return enqueued;
+  }
+
+  private async reflectClaimsForEvent(
+    sourceEventId: string,
+    jobLease: { jobId: string; leaseToken: string },
+  ): Promise<number> {
+    if (!this.model) throw new Error("memory reflection model is not configured");
+    const reflectionEvent = this.ledger.getEvent(sourceEventId);
+    if (!reflectionEvent || reflectionEvent.kind !== "reflection") {
+      throw new Error(`reflection event not found: ${sourceEventId}`);
+    }
+    const claims = this.reflectionClaimsForEvent(reflectionEvent);
+    if (claims.length === 0) return 0;
+    const contextEventIds = Array.isArray(reflectionEvent.metadata.contextEventIds)
+      ? reflectionEvent.metadata.contextEventIds.filter(
+        (eventId): eventId is string => typeof eventId === "string",
+      )
+      : [];
+    const promptClaims = claims.map((claim) => {
+      const eventIds = unique([
+        ...this.ledger.listClaimEvidence(claim.claimId)
+          .filter((item) => item.stance === "supports" || item.stance === "opposes")
+          .map((item) => item.eventId),
+        ...contextEventIds,
+      ]);
+      const evidence = eventIds
+        .map((eventId) => this.ledger.getEvent(eventId))
+        .filter((event): event is MemoryEvent =>
+          event !== undefined
+          && event.identityId === claim.identityId
+          && event.visibility === claim.visibility
+          && event.occurredAt <= reflectionEvent.occurredAt
+        );
+      return { claim, evidence };
+    });
+    const startedAt = Date.now();
+    let raw = "";
+    try {
+      raw = await this.model.complete({
+        task: "reflect",
+        prompt: buildReflectionPrompt(promptClaims, reflectionEvent.occurredAt),
+        timeoutMs: this.judgementTimeoutMs,
+        schemaVersion: REFLECTION_PROMPT_VERSION,
+      });
+      const result = parseReflectionResult(
+        raw,
+        new Set(claims.map((claim) => claim.claimId)),
+      );
+      const beforeById = new Map(claims.map((claim) => [claim.claimId, claim]));
+      const committed = this.ledger.commitReflection({
+        eventId: reflectionEvent.eventId,
+        decisions: result.decisions,
+        jobLease,
+        modelRun: {
+          promptVersion: REFLECTION_PROMPT_VERSION,
+          elapsedMs: Date.now() - startedAt,
+          resultSummary: (results) => JSON.stringify({
+            sourceEventId,
+            targetClaimIds: claims.map((claim) => claim.claimId),
+            decisions: result.decisions.map((decision, index) => {
+              const applied = results[index];
+              return {
+                claimId: decision.claimId,
+                requestedAction: decision.action,
+                requestedDisposition: decision.disposition,
+                rationale: decision.rationale,
+                applied: !applied.ignoredReason,
+                appliedClaimId: applied.claimId,
+                revisionClaimId: decision.action === "revise"
+                  && applied.claimId !== decision.claimId
+                  ? applied.claimId
+                  : undefined,
+                state: applied.state,
+                ignoredReason: applied.ignoredReason,
+              };
+            }),
+          }),
+        },
+      });
+      const changed = committed.results.filter((applied, index) => {
+        if (applied.ignoredReason) return false;
+        const decision = result.decisions[index];
+        return decision.action !== "retain"
+          || beforeById.get(decision.claimId)?.state !== applied.state;
+      }).length;
+      const needsEmbedding = committed.results.some((applied, index) =>
+        !applied.ignoredReason
+        && result.decisions[index].action === "revise"
+        && applied.claimId !== result.decisions[index].claimId
+      );
+      if (changed > 0) {
+        try {
+          this.onProjectionChanged?.(reflectionEvent.identityId);
+        } catch {
+          console.warn("[asuka-memory] reflection projection notification failed");
+        }
+      }
+      if (needsEmbedding && this.model.embed) {
+        try {
+          this.ledger.enqueueJob(reflectionEvent.eventId, "embed");
+        } catch {
+          console.warn("[asuka-memory] reflection embedding enqueue failed");
+        }
+      }
+      return changed;
+    } catch (error) {
+      this.ledger.recordFailedReflectionRunIfLeaseCurrent({
+        eventId: reflectionEvent.eventId,
+        jobId: jobLease.jobId,
+        leaseToken: jobLease.leaseToken,
+        promptVersion: REFLECTION_PROMPT_VERSION,
+        elapsedMs: Date.now() - startedAt,
+        resultSummary: raw.slice(0, 500),
+        error: safeError(error),
+      });
+      throw error;
+    }
   }
 
   private async embedClaimsForEvent(eventId: string): Promise<number> {
@@ -885,28 +1601,40 @@ export class AsukaMemoryEngine {
     return indexed;
   }
 
-  private async processJob(job: MemoryJob): Promise<void> {
+  private async processJob(job: MemoryJob): Promise<boolean> {
     if (job.kind === "adjudicate") {
-      await this.adjudicateEvent(job.eventId);
-      return;
+      await this.adjudicateEvent(job.eventId, {
+        jobLease: {
+          jobId: job.jobId,
+          leaseToken: job.leaseToken!,
+        },
+      });
+      return true;
     }
     if (job.kind === "legacy_rejudge") {
       await this.extractLegacyEvent(job.eventId);
-      return;
+      return false;
     }
     if (job.kind === "embed") {
       await this.embedClaimsForEvent(job.eventId);
-      return;
+      return false;
     }
     if (job.kind === "reflect") {
-      throw new Error("reflection jobs require an explicit reflection batch");
+      await this.reflectClaimsForEvent(job.eventId, {
+        jobId: job.jobId,
+        leaseToken: job.leaseToken!,
+      });
+      return true;
     }
+    return false;
   }
 
   async processPendingMemoryJobs(options: {
     maxJobs?: number;
     kinds?: MemoryJob["kind"][];
     retryDelayMs?: number;
+    now?: number;
+    leaseMs?: number;
   } = {}): Promise<MemoryJobBatchResult> {
     const maxJobs = Math.max(1, Math.min(500, options.maxJobs ?? 25));
     if (!this.model) {
@@ -923,22 +1651,43 @@ export class AsukaMemoryEngine {
     while (processed < maxJobs) {
       const job = this.ledger.claimNextJob({
         kinds: options.kinds,
+        now: options.now,
+        leaseMs: options.leaseMs,
         maxAttempts: this.maxJobAttempts,
       });
       if (!job) break;
+      if (!job.leaseToken) {
+        throw new Error(`claimed memory job is missing a lease token: ${job.jobId}`);
+      }
       processed += 1;
       try {
-        await this.processJob(job);
-        this.ledger.completeJob(job.jobId);
-        completed += 1;
+        const completedInTaskTransaction = await this.processJob(job);
+        if (
+          completedInTaskTransaction
+          || this.ledger.completeJob(job.jobId, job.leaseToken)
+        ) {
+          completed += 1;
+        }
       } catch (error) {
-        this.ledger.failJob(job.jobId, safeError(error), {
-          maxAttempts: this.maxJobAttempts,
-          retryAt: options.retryDelayMs === undefined
-            ? undefined
-            : Date.now() + Math.max(0, Math.floor(options.retryDelayMs)),
-        });
-        failed += 1;
+        const jobError = safeError(error);
+        const retryAt = options.retryDelayMs === undefined
+          ? undefined
+          : (options.now ?? Date.now()) + Math.max(0, Math.floor(options.retryDelayMs));
+        const failure = job.kind === "reflect"
+          && job.attempts >= this.maxJobAttempts
+          ? this.ledger.failTerminalReflectionJobAndQuarantineClaims(
+            job.jobId,
+            job.leaseToken,
+            jobError,
+            this.maxJobAttempts,
+          )
+          : this.ledger.failJob(job.jobId, job.leaseToken, jobError, {
+            maxAttempts: this.maxJobAttempts,
+            retryAt,
+          });
+        if (failure.applied) {
+          failed += 1;
+        }
       }
     }
     return {
@@ -963,8 +1712,17 @@ export class AsukaMemoryEngine {
         this.model.embed([query], timeoutMs),
         timeout.promise,
       ]);
-      if (result === "timeout" || !result.vectors[0]) return undefined;
-      return { model: result.model, vector: result.vectors[0] };
+      if (result === "timeout") return undefined;
+      const vector = result.vectors[0];
+      if (
+        result.vectors.length !== 1
+        || !vector
+        || vector.length !== result.dimensions
+        || vector.some((value) => !Number.isFinite(value))
+      ) {
+        return undefined;
+      }
+      return { model: result.model, vector };
     } catch {
       return undefined;
     } finally {
@@ -1028,29 +1786,40 @@ export class AsukaMemoryEngine {
     embedding?: { model: string; vector: number[] },
   ): LocalRetrieval {
     const startedAt = Date.now();
-    const identityId = this.ledger.resolveIdentity(
+    const identityId = this.ledger.resolveIdentityForRetrieval(
       request.accountId,
       request.peerKind,
       request.peerId,
       request.identityId,
     );
     const maxPromptChars = dynamicPromptBudget(request.query, request.maxPromptChars);
+    const visibility = visibilityForRequest(request);
     const candidates = this.ledger.searchLocal({
       identityId,
-      visibility: visibilityForRequest(request),
+      visibility,
       query: request.query,
       now: request.now,
       limit: candidateLimit(maxPromptChars, request.maxCandidates),
       vector: embedding?.vector,
       embeddingModel: embedding?.model,
+      includeDiversifiedFallback: Boolean(this.model),
     });
-    const cached = this.ledger.readRerankCache(identityId, request.query, request.now);
-    const ordered = cached ? reorderCandidates(candidates, cached.claimIds) : candidates;
+    const cacheContext: RerankCacheContext = {
+      visibility,
+      maxPromptChars,
+      asOf: request.now ?? null,
+      candidateFingerprint: rerankCandidateFingerprint(candidates),
+    };
+    const cached = this.ledger.readRerankCache(identityId, request.query, cacheContext);
+    const ordered = cached
+      ? reorderCandidates(candidates, cached.claimIds)
+      : localFallbackCandidates(candidates);
     const rendered = renderMemoryPrompt(ordered, maxPromptChars);
     return {
       identityId,
       maxPromptChars,
       candidates,
+      cacheContext,
       result: {
         prompt: rendered.prompt,
         claims: request.includeCandidates === false ? [] : rendered.claims,
@@ -1098,7 +1867,7 @@ export class AsukaMemoryEngine {
     const deadlineAt = startedAt + this.rerankDeadlineMs;
     const embedding = await this.queryEmbedding(request.query, deadlineAt);
     const local = this.retrieveLocal(request, embedding);
-    if (!this.model || local.result.claimIds.length === 0) {
+    if (!this.model || local.candidates.length === 0) {
       return { ...local.result, elapsedMs: Date.now() - startedAt };
     }
     const rerankPromise = this.rerank(
@@ -1129,6 +1898,7 @@ export class AsukaMemoryEngine {
           request.query,
           rendered.claims.map((claim) => claim.claimId),
           raced.value.runId,
+          { context: local.cacheContext },
         );
         this.ledger.recordRetrievalFeedback({
           identityId: local.identityId,
@@ -1161,6 +1931,7 @@ export class AsukaMemoryEngine {
     }
 
     void rerankPromise.then((background) => {
+      if (this.ledger.isClosed) return;
       const liveCandidates = this.ledger.revalidateSearchCandidates(
         background.candidates,
         visibilityForRequest(request),
@@ -1173,6 +1944,7 @@ export class AsukaMemoryEngine {
         request.query,
         claimIds,
         background.runId,
+        { context: local.cacheContext },
       );
       this.ledger.recordRetrievalFeedback({
         identityId: local.identityId,
@@ -1182,6 +1954,7 @@ export class AsukaMemoryEngine {
         detail: { deadlineMs: this.rerankDeadlineMs },
       });
     }).catch((error) => {
+      if (this.ledger.isClosed) return;
       const fallback = this.revalidatedFallback(request, local, startedAt);
       this.ledger.recordRetrievalFeedback({
         identityId: local.identityId,
@@ -1212,7 +1985,7 @@ export class AsukaMemoryEngine {
     outcome: "accepted" | "corrected" | "rejected" | "unused";
     detail?: Record<string, unknown>;
   }): void {
-    const identityId = this.ledger.resolveIdentity(
+    const identityId = this.ledger.resolveIdentityForRetrieval(
       input.accountId,
       input.peerKind,
       input.peerId,

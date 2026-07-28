@@ -96,6 +96,7 @@ const configuredModel = {
 let receivedModel;
 const singletonConfig = rootConfig({ model: configuredModel });
 const singleton = initializeAsukaMemoryRuntime(singletonConfig, {
+  allowMissingEmbeddingsForTests: true,
   createModelAdapter(settings) {
     receivedModel = settings;
     return undefined;
@@ -225,6 +226,7 @@ const persistentRoot = rootConfig({
 const firstRuntime = new AsukaMemoryRuntime(
   resolveAsukaMemoryKernelConfig(persistentRoot),
   {
+    allowMissingEmbeddingsForTests: true,
     logger: {
       warn(message) {
         legacyWarnings.push(message);
@@ -299,6 +301,8 @@ const model = {
           epistemicStatus: "explicit",
           sourceKind: "statement",
           confidence: 0.82,
+          disposition: "candidate",
+          rationale: "Assistant-authored context must remain provisional",
           topic: "Asuka 自述",
           lifecycle: "episodic",
         }],
@@ -315,6 +319,8 @@ const model = {
         epistemicStatus: "explicit",
         sourceKind: "statement",
         confidence: city === "苏州" ? 0.93 : 0.98,
+        disposition: "active",
+        rationale: "The user directly stated the current residence",
         topic: "居住状态",
         lifecycle: "bounded",
       }],
@@ -330,6 +336,7 @@ const secondRoot = rootConfig({
 const secondRuntime = initializeAsukaMemoryRuntime(
   secondRoot,
   {
+    allowMissingEmbeddingsForTests: true,
     model,
     logger: {
       warn(message) {
@@ -488,6 +495,8 @@ const revisedClaim = secondRuntime.ledger.applyClaimProposal(
     epistemicStatus: "explicit",
     authority: "user_explicit",
     confidence: 0.93,
+    disposition: "active",
+    rationale: "Fixture model selected active",
     topic: "居住状态",
     lifecycle: "bounded",
     supportingEventIds: supportingEvents.map((event) => event.eventId),
@@ -521,6 +530,8 @@ secondRuntime.ledger.applyClaimProposal(foreignEvent.eventId, {
   epistemicStatus: "explicit",
   authority: "user_explicit",
   confidence: 1,
+  disposition: "active",
+  rationale: "Fixture model selected active",
   topic: "居住状态",
 });
 
@@ -544,6 +555,8 @@ secondRuntime.ledger.applyClaimProposal(publicEventForSameIdentity.eventId, {
   epistemicStatus: "explicit",
   authority: "user_explicit",
   confidence: 1,
+  disposition: "active",
+  rationale: "Fixture model selected active",
   topic: "居住状态",
 });
 
@@ -567,6 +580,8 @@ secondRuntime.ledger.applyClaimProposal(otherPeerEventForSameIdentity.eventId, {
   epistemicStatus: "explicit",
   authority: "user_explicit",
   confidence: 1,
+  disposition: "active",
+  rationale: "Fixture model selected active",
   topic: "居住状态",
 });
 
@@ -743,6 +758,8 @@ const deleteRefreshClaim = secondRuntime.ledger.applyClaimProposal(
     epistemicStatus: "explicit",
     authority: "user_explicit",
     confidence: 1,
+    disposition: "active",
+    rationale: "Fixture model selected active",
     topic: "删除刷新测试",
   },
 );
@@ -908,6 +925,8 @@ deadlineLedger.applyClaimProposal(deadlineEvent.eventId, {
   epistemicStatus: "explicit",
   authority: "user_explicit",
   confidence: 0.99,
+  disposition: "active",
+  rationale: "Fixture model selected active",
   topic: "睡眠",
 });
 
@@ -977,10 +996,77 @@ const spoolAccountId = "spool-account";
 const spoolPeerId = "spool-user";
 const spoolDatabase = path.join(temporaryRoot, "spool", "memory.sqlite");
 const spoolPath = `${spoolDatabase}.ingest-spool.jsonl`;
+const startupMessages = [];
+const startupLogger = {
+  info(message) {
+    startupMessages.push(message);
+  },
+  warn(message) {
+    startupMessages.push(message);
+  },
+  error(message) {
+    startupMessages.push(message);
+  },
+};
+const completionConfig = {
+  baseUrl: "https://memory-completion.example/v1",
+  apiKey: "fixture-completion-key",
+  model: "fixture-completion",
+};
+const embeddingConfig = {
+  endpoint: "https://memory-embedding.example/v1/embeddings",
+  apiKey: "fixture-embedding-key",
+  model: "fixture-embedding",
+  timeoutMs: 1_000,
+  expectedDimensions: 2,
+};
+assert.throws(
+  () => initializeQQBotAsukaMemory(rootConfig({
+    databasePath: path.join(temporaryRoot, "missing-embedding.sqlite"),
+    model: { primary: completionConfig },
+  }), "missing-embedding", startupLogger),
+  /embedding/i,
+);
+assert.throws(
+  () => initializeQQBotAsukaMemory(rootConfig({
+    databasePath: path.join(temporaryRoot, "invalid-embedding.sqlite"),
+    model: { primary: completionConfig },
+    embedding: { ...embeddingConfig, timeoutMs: 0 },
+  }), "invalid-embedding", startupLogger),
+  /embedding/i,
+);
+assert.throws(
+  () => initializeQQBotAsukaMemory(rootConfig({
+    databasePath: path.join(temporaryRoot, "disabled-vector.sqlite"),
+    enableVector: false,
+    model: { primary: completionConfig },
+    embedding: embeddingConfig,
+  }), "disabled-vector", startupLogger),
+  /vector/i,
+);
+assert.equal(getAsukaMemoryRuntime(), undefined);
+assert.equal(
+  startupMessages.some((message) => /runtime enabled|health ready/i.test(message)),
+  false,
+  "failed production initialization must never report the runtime as enabled or ready",
+);
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url) => {
+  assert.equal(String(url), embeddingConfig.endpoint);
+  return new Response(JSON.stringify({
+    model: embeddingConfig.model,
+    data: [{ index: 0, embedding: [1, 0] }],
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+};
 const spoolRoot = rootConfig({
   databasePath: spoolDatabase,
   worker: { enabled: false },
   wiki: { enabled: false },
+  model: { primary: completionConfig },
+  embedding: embeddingConfig,
 });
 assert.ok(initializeQQBotAsukaMemory(spoolRoot, spoolAccountId));
 await resetAsukaMemoryRuntime();
@@ -1036,6 +1122,7 @@ assert.ok(
   "sudo authorization must create a canonical LLM-adjudicated control event",
 );
 await resetAsukaMemoryRuntime();
+globalThis.fetch = originalFetch;
 
 fs.rmSync(temporaryRoot, { recursive: true, force: true });
 assert.ok(
