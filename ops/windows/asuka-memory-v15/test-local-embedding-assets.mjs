@@ -101,15 +101,31 @@ assert.match(install, /curl\.exe[\s\S]*--version[\s\S]*--help[\s\S]*--proxy/);
 assert.match(install, /"--disable"[\s\S]*"--proto"[\s\S]*"--proto-redir"/);
 assert.match(
   install,
-  /"--continue-at"[\s\S]*"--speed-limit"[\s\S]*"--speed-time"/,
+  /"--max-filesize"[\s\S]*"--continue-at"[\s\S]*"--silent"[\s\S]*"--show-error"[\s\S]*"--speed-limit"[\s\S]*"--speed-time"[\s\S]*"--write-out"/,
 );
 assert.match(install, /"--speed-limit", "1024", "--speed-time", "30"/);
+assert.match(
+  install,
+  /"--max-filesize", \(\[string\]\$contract\.model\.sourceBytes\)/,
+);
+assert.match(install, /"--write-out", "%\{http_code\}"/);
 assert.match(install, /\$arguments \+= @\("--continue-at", "-"\)/);
 assert.match(
   install,
-  /\$partialItem\.Length -gt \[int64\]\$contract\.model\.sourceBytes/,
+  /\$partialItem\.Length -gt \[int64\]\$contract\.model\.sourceBytes[\s\S]*Remove-Item -LiteralPath \$sourceModelPartial -Force -ErrorAction Stop/,
 );
-assert.match(install, /\$LASTEXITCODE -eq 33[\s\S]*rejected the partial range/);
+assert.match(
+  install,
+  /\$downloadExitCode -eq 33 -or \$httpStatus -ceq "416"[\s\S]*rejected the partial range/,
+);
+assert.match(
+  install,
+  /Assert-SourceModel -Path \$sourceModelPartial[\s\S]*catch \{[\s\S]*Remove-Item -LiteralPath \$sourceModelPartial -Force -ErrorAction Stop[\s\S]*throw \$validationFailure/,
+);
+assert.match(
+  install,
+  /\$downloadExitCode -eq 63[\s\S]*\$failedPartial\.Attributes[\s\S]*Remove-Item -LiteralPath \$sourceModelPartial -Force -ErrorAction Stop/,
+);
 assert.match(install, /"--noproxy", "\*"/);
 assert.match(install, /"--proxy", \$proxy, "--noproxy", ""/);
 assert.match(install, /Windows proxy settings could not be read safely/);
@@ -301,6 +317,14 @@ assert.match(
 assert.match(
   install,
   /\$existingTaskRunning[\s\S]*Start-ScheduledTask[\s\S]*Wait-EmbeddingApi[\s\S]*Assert-EmbeddingApi/,
+);
+assert.match(
+  install,
+  /\$restoredAssetsVerified[\s\S]*if \(-not \$restoredAssetsVerified\)[\s\S]*Start-ScheduledTask[\s\S]*Assert-EmbeddingApi -Contract \$restoredContract[\s\S]*\$runningTask\.State -cne "Running"[\s\S]*\$restoredOwner\.ExecutablePath[\s\S]*\$restoredOllama[\s\S]*if \(\$existingTaskEnabled\)/,
+);
+assert.match(
+  install,
+  /\(\[string\]\$restoredTask\.State -ceq "Running"\) -ne[\s\S]*\$existingTaskRunning/,
 );
 assert.match(
   install,

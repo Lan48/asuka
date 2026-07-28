@@ -516,17 +516,21 @@ function Assert-CurlCapability {
     "--disable",
     "--fail",
     "--location",
+    "--max-filesize",
     "--proto",
     "--proto-redir",
     "--retry",
     "--retry-all-errors",
     "--connect-timeout",
     "--continue-at",
+    "--silent",
+    "--show-error",
     "--speed-limit",
     "--speed-time",
     "--noproxy",
     "--output",
-    "--proxy"
+    "--proxy",
+    "--write-out"
   )) {
     if (
       $helpOutput -notmatch (
@@ -947,19 +951,24 @@ if (-not (Test-Path -LiteralPath $sourceModel -PathType Leaf)) {
     $partialItem = Get-Item -LiteralPath $sourceModelPartial -Force
     if (
       $partialItem.PSIsContainer -or
-      $partialItem.Attributes -band [IO.FileAttributes]::ReparsePoint -or
-      [int64]$partialItem.Length -gt [int64]$contract.model.sourceBytes
+      $partialItem.Attributes -band [IO.FileAttributes]::ReparsePoint
     ) {
       throw "Pinned Jina GGUF partial download is invalid."
     }
+    if ([int64]$partialItem.Length -gt [int64]$contract.model.sourceBytes) {
+      Remove-Item -LiteralPath $sourceModelPartial -Force -ErrorAction Stop
+      throw "Pinned Jina GGUF partial download exceeded its size limit."
+    }
   }
   $arguments = @(
-    "--disable", "--fail", "--location",
+    "--disable", "--fail", "--location", "--silent", "--show-error",
     "--proto", "=https", "--proto-redir", "=https",
     "--retry", "3", "--retry-all-errors",
     "--connect-timeout", "20",
+    "--max-filesize", ([string]$contract.model.sourceBytes),
     "--speed-limit", "1024", "--speed-time", "30",
-    "--output", $sourceModelPartial
+    "--output", $sourceModelPartial,
+    "--write-out", "%{http_code}"
   )
   if ($resumeDownload) {
     $arguments += @("--continue-at", "-")
@@ -970,19 +979,45 @@ if (-not (Test-Path -LiteralPath $sourceModel -PathType Leaf)) {
     $arguments += @("--noproxy", "*")
   }
   $arguments += @([string]$contract.model.sourceUrl)
-  & $curlPath @arguments
-  if ($LASTEXITCODE -eq 33 -and $resumeDownload) {
+  $httpStatus = [string](& $curlPath @arguments)
+  $downloadExitCode = $LASTEXITCODE
+  if (
+    $resumeDownload -and
+    ($downloadExitCode -eq 33 -or $httpStatus -ceq "416")
+  ) {
     Write-Warning "The server rejected the partial range; restarting this download."
     Remove-Item -LiteralPath $sourceModelPartial -Force
     $arguments = @($arguments | Where-Object {
       [string]$_ -cne "--continue-at" -and [string]$_ -cne "-"
     })
-    & $curlPath @arguments
+    $httpStatus = [string](& $curlPath @arguments)
+    $downloadExitCode = $LASTEXITCODE
   }
-  if ($LASTEXITCODE -ne 0) {
+  if ($downloadExitCode -ne 0) {
+    if (
+      $downloadExitCode -eq 63 -and
+      (Test-Path -LiteralPath $sourceModelPartial -PathType Leaf)
+    ) {
+      $failedPartial = Get-Item -LiteralPath $sourceModelPartial -Force
+      if (-not (
+        $failedPartial.Attributes -band [IO.FileAttributes]::ReparsePoint
+      )) {
+        Remove-Item -LiteralPath $sourceModelPartial -Force -ErrorAction Stop
+      }
+    }
     throw "Pinned Jina GGUF download failed."
   }
-  Assert-SourceModel -Path $sourceModelPartial -Contract $contract
+  try {
+    Assert-SourceModel -Path $sourceModelPartial -Contract $contract
+  } catch {
+    $validationFailure = $_
+    try {
+      Remove-Item -LiteralPath $sourceModelPartial -Force -ErrorAction Stop
+    } catch {
+      throw "Pinned Jina GGUF partial download could not be discarded."
+    }
+    throw $validationFailure
+  }
   Move-Item -LiteralPath $sourceModelPartial -Destination $sourceModel
 }
 Assert-SourceModel -Path $sourceModel -Contract $contract
@@ -1358,6 +1393,8 @@ try {
   }
 
   $restoredContract = $null
+  $restoredOllama = ""
+  $restoredAssetsVerified = $false
   try {
     if ($hadExistingTask) {
       if (
@@ -1394,6 +1431,7 @@ try {
         -Contract $restoredContract
       [void](Assert-OllamaModel -ModelRoot $restoredModelRoot `
         -Contract $restoredContract)
+      $restoredAssetsVerified = $true
     }
   } catch {
     $rollbackErrors += "verification: $($_.Exception.Message)"
@@ -1404,15 +1442,49 @@ try {
       Register-ScheduledTask -TaskName $taskName -TaskPath "\" `
         -Xml $existingTaskXml -Force | Out-Null
       if ($existingTaskRunning) {
+        if (-not $restoredAssetsVerified) {
+          throw "Restored local embedding assets are not verified."
+        }
         Enable-ScheduledTask -TaskName $taskName -TaskPath "\" | Out-Null
         Start-ScheduledTask -TaskName $taskName -TaskPath "\"
-        if ($null -eq $restoredContract) {
-          throw "Restored local embedding contract is unavailable."
-        }
         Wait-EmbeddingApi -Contract $restoredContract `
           -TimeoutSeconds $ReadyTimeoutSeconds
         Assert-EmbeddingApi -Contract $restoredContract `
           -TimeoutSeconds $ReadyTimeoutSeconds
+        $runningTask = Get-ScheduledTask -TaskName $taskName -TaskPath "\" `
+          -ErrorAction Stop
+        if ([string]$runningTask.State -cne "Running") {
+          throw "Restored local embedding task did not remain running."
+        }
+        $restoredListeners = @(
+          Get-NetTCPConnection -LocalPort 11434 -State Listen -ErrorAction Stop
+        )
+        if (
+          $restoredListeners.Count -ne 1 -or
+          [string]$restoredListeners[0].LocalAddress -notin @(
+            "127.0.0.1",
+            "::1"
+          )
+        ) {
+          throw "Restored local embedding listener is not exclusively loopback."
+        }
+        $restoredOwner = Get-CimInstance Win32_Process -Filter (
+          "ProcessId={0}" -f [int]$restoredListeners[0].OwningProcess
+        )
+        if (
+          $null -eq $restoredOwner -or
+          [string]::IsNullOrWhiteSpace(
+            [string]$restoredOwner.ExecutablePath
+          ) -or
+          -not ([IO.Path]::GetFullPath(
+            [string]$restoredOwner.ExecutablePath
+          )).Equals(
+            [IO.Path]::GetFullPath($restoredOllama),
+            [StringComparison]::OrdinalIgnoreCase
+          )
+        ) {
+          throw "Restored local embedding listener has the wrong owner."
+        }
       }
       if ($existingTaskEnabled) {
         Enable-ScheduledTask -TaskName $taskName -TaskPath "\" | Out-Null
@@ -1423,7 +1495,10 @@ try {
         -ErrorAction Stop
       if (
         [bool]$restoredTask.Settings.Enabled -ne $existingTaskEnabled -or
-        (-not $existingTaskRunning -and [string]$restoredTask.State -ceq "Running")
+        (
+          ([string]$restoredTask.State -ceq "Running") -ne
+            $existingTaskRunning
+        )
       ) {
         throw "Restored local embedding task lifecycle does not match."
       }
