@@ -9,13 +9,43 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const opsRoot = path.dirname(fileURLToPath(import.meta.url));
+const localEmbeddingContractPath = path.join(
+  opsRoot,
+  "local-embedding-contract.json",
+);
+const localEmbeddingContract = JSON.parse(
+  fs.readFileSync(localEmbeddingContractPath, "utf8"),
+);
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "asuka-memory-v15-assets-"));
 const projectRoot = path.join(fixtureRoot, "project");
+const buildRoot = path.join(fixtureRoot, "build-worktree");
 const qqbotRoot = path.join(projectRoot, "extensions", "qqbot");
 const releaseOne = path.join(fixtureRoot, "release-one");
 const releaseTwo = path.join(fixtureRoot, "release-two");
 const releaseUnknown = path.join(fixtureRoot, "release-unknown");
+const releaseTampered = path.join(fixtureRoot, "release-tampered");
 const occupiedRelease = path.join(fixtureRoot, "release-occupied");
+const buildAttestationPath = path.join(fixtureRoot, "build-attestation.json");
+const windowsDependencyAttestationPath = path.join(
+  fixtureRoot,
+  "windows-dependency-attestation.json",
+);
+const npmCliPath = (root) => path.join(
+  root,
+  "node_modules",
+  "npm",
+  "bin",
+  "npm-cli.js",
+);
+const configuredNpmCli = npmCliPath(path.join(fixtureRoot, "configured-npm"));
+const baseEnvironment = { ...process.env };
+for (const name of Object.keys(baseEnvironment)) {
+  if (name.toLowerCase() === "npm_execpath") delete baseEnvironment[name];
+}
+const npmEnvironment = {
+  ...baseEnvironment,
+  npm_execpath: configuredNpmCli,
+};
 
 function write(relative, content) {
   const destination = path.join(qqbotRoot, relative);
@@ -36,6 +66,7 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: projectRoot,
     encoding: "utf8",
+    env: npmEnvironment,
     ...options,
   });
   if (result.status !== 0) {
@@ -50,6 +81,7 @@ function runFailure(command, args, pattern, options = {}) {
   const result = spawnSync(command, args, {
     cwd: projectRoot,
     encoding: "utf8",
+    env: npmEnvironment,
     ...options,
   });
   assert.notEqual(result.status, 0, `${command} ${args.join(" ")} must fail`);
@@ -57,7 +89,7 @@ function runFailure(command, args, pattern, options = {}) {
   return result;
 }
 
-function generate(releaseRoot, sourceRoot = projectRoot) {
+function generate(releaseRoot, sourceRoot = buildRoot) {
   run(process.execPath, [
     path.join(opsRoot, "generate-manifest.mjs"),
     "--project-root", sourceRoot,
@@ -65,6 +97,9 @@ function generate(releaseRoot, sourceRoot = projectRoot) {
     "--release-id", "test-release",
     "--account", "default",
     "--peer", "user-1",
+    "--node-version", process.version,
+    "--build-attestation", buildAttestationPath,
+    "--windows-dependency-attestation", windowsDependencyAttestationPath,
   ]);
   return JSON.parse(fs.readFileSync(path.join(releaseRoot, "manifest.json"), "utf8"));
 }
@@ -86,18 +121,88 @@ function assertInstalledWorker(appRoot, worker) {
 }
 
 try {
-  for (const directory of ["bin", "dist", "scripts", "skills", "src"]) {
+  const npmCliFixture = [
+    'import path from "node:path";',
+    'import { pathToFileURL } from "node:url";',
+    "const command = process.argv[2];",
+    "if (command === \"--version\") {",
+    '  process.stdout.write("11.16.0\\n");',
+    "} else if (command === \"test\") {",
+    '  await import(pathToFileURL(path.resolve("scripts/build-fixture.mjs")).href);',
+    "} else if (command !== \"ci\") {",
+    "  throw new Error(`unexpected npm fixture command: ${command}`);",
+    "}",
+    "",
+  ].join("\n");
+  writeAbsolute(configuredNpmCli, npmCliFixture);
+
+  const fallbackNode = path.join(
+    fixtureRoot,
+    "node-with-npm",
+    path.basename(process.execPath),
+  );
+  fs.mkdirSync(path.dirname(fallbackNode), { recursive: true });
+  fs.copyFileSync(process.execPath, fallbackNode);
+  fs.chmodSync(fallbackNode, fs.statSync(process.execPath).mode);
+  writeAbsolute(npmCliPath(path.dirname(fallbackNode)), npmCliFixture);
+
+  for (const directory of ["bin", "scripts", "skills", "src"]) {
     write(`${directory}/fixture-${directory}.txt`, `${directory}-current-worktree\n`);
   }
   write(
     "scripts/migrate-asuka-memory-v15.mjs",
     "process.stdout.write('current-worktree-migrator');\n",
   );
+  write(
+    "scripts/build-fixture.mjs",
+    [
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      'const root = path.resolve("dist");',
+      'fs.mkdirSync(path.join(root, "src", "asuka-memory-kernel"), { recursive: true });',
+      'fs.writeFileSync(path.join(root, "index.js"), "export {};\\n");',
+      'fs.writeFileSync(path.join(root, "src", "config.js"), "export {};\\n");',
+      'fs.writeFileSync(',
+      '  path.join(root, "src", "asuka-memory-kernel", "model-client.js"),',
+      '  "export {};\\n",',
+      ");",
+      "",
+    ].join("\n"),
+  );
   write("src/node_modules/excluded.js", "must-not-ship\n");
   write("src/tests/excluded.test.js", "must-not-ship\n");
-  write("package.json", "{\"name\":\"fixture-qqbot\"}\n");
+  write(
+    "package.json",
+    `${JSON.stringify({
+      name: "fixture-qqbot",
+      version: "1.0.0",
+      scripts: { test: "node scripts/build-fixture.mjs" },
+    }, null, 2)}\n`,
+  );
+  write(
+    "package-lock.json",
+    `${JSON.stringify({
+      name: "fixture-qqbot",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        "": {
+          name: "fixture-qqbot",
+          version: "1.0.0",
+        },
+      },
+    }, null, 2)}\n`,
+  );
+  writeAbsolute(path.join(projectRoot, ".gitignore"), "**/dist/\n**/node_modules/\n");
+  fs.cpSync(
+    opsRoot,
+    path.join(projectRoot, "ops", "windows", "asuka-memory-v15"),
+    { recursive: true },
+  );
 
   run("git", ["init"]);
+  run("git", ["config", "core.autocrlf", "false"]);
   run("git", ["add", "."]);
   run("git", [
     "-c", "user.name=Asuka Fixture",
@@ -105,38 +210,176 @@ try {
     "-c", "commit.gpgsign=false",
     "commit", "-m", "fixture",
   ]);
+  run("git", ["worktree", "add", "-b", "fixture-release", buildRoot, "HEAD"]);
+  const attestationArgs = (output) => [
+    path.join(opsRoot, "attest-release-build.mjs"),
+    "--kind", "build",
+    "--project-root", buildRoot,
+    "--output", output,
+  ];
+  const invalidNpmCliDirectory = npmCliPath(path.join(fixtureRoot, "directory-npm"));
+  fs.mkdirSync(invalidNpmCliDirectory, { recursive: true });
+  runFailure(
+    process.execPath,
+    attestationArgs(path.join(fixtureRoot, "directory-attestation.json")),
+    /npm CLI must be a regular file/i,
+    {
+      env: { ...baseEnvironment, npm_execpath: invalidNpmCliDirectory },
+    },
+  );
+  const linkedNpmCli = npmCliPath(path.join(fixtureRoot, "linked-npm"));
+  fs.mkdirSync(path.dirname(linkedNpmCli), { recursive: true });
+  const linkedNpmCliTarget = path.join(fixtureRoot, "linked-npm-target");
+  fs.mkdirSync(linkedNpmCliTarget);
+  fs.symlinkSync(linkedNpmCliTarget, linkedNpmCli, "junction");
+  runFailure(
+    process.execPath,
+    attestationArgs(path.join(fixtureRoot, "linked-attestation.json")),
+    /npm CLI must be a regular file/i,
+    {
+      env: { ...baseEnvironment, npm_execpath: linkedNpmCli },
+    },
+  );
+  const untrustedNpmCli = path.join(fixtureRoot, "untrusted-npm-cli.js");
+  fs.writeFileSync(untrustedNpmCli, npmCliFixture);
+  runFailure(
+    process.execPath,
+    attestationArgs(path.join(fixtureRoot, "untrusted-attestation.json")),
+    /npm_execpath must identify a trusted npm CLI path/i,
+    {
+      env: { ...baseEnvironment, npm_execpath: untrustedNpmCli },
+    },
+  );
+  runFailure(
+    process.execPath,
+    attestationArgs(path.join(fixtureRoot, "missing-attestation.json")),
+    /npm CLI is missing/i,
+    {
+      env: {
+        ...baseEnvironment,
+        npm_execpath: npmCliPath(path.join(fixtureRoot, "missing-npm")),
+      },
+    },
+  );
+  run(fallbackNode, attestationArgs(buildAttestationPath), {
+    env: baseEnvironment,
+  });
+  const buildAttestation = JSON.parse(
+    fs.readFileSync(buildAttestationPath, "utf8"),
+  );
+  writeAbsolute(
+    windowsDependencyAttestationPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      kind: "windows_runtime_dependencies",
+      mode: "clean_linked_worktree",
+      gitCommit: buildAttestation.gitCommit,
+      gitBranch: buildAttestation.gitBranch,
+      platform: "win32",
+      architecture: "x64",
+      nodeVersion: buildAttestation.nodeVersion,
+      npmVersion: buildAttestation.npmVersion,
+      lockfilePath: buildAttestation.lockfilePath,
+      lockfileSha256: buildAttestation.lockfileSha256,
+      commands: ["npm ci --ignore-scripts"],
+      runtimeDependencyTree: {
+        path: "node_modules",
+        fileCount: 1,
+        bytes: 1,
+        sha256: "0".repeat(64),
+      },
+    }, null, 2)}\n`,
+  );
 
   const first = generate(releaseOne);
   const second = generate(releaseTwo);
+  const {
+    contractSource: embeddingContractSource,
+    contractSha256: embeddingContractSha256,
+    ...manifestEmbeddingContract
+  } = first.requirements.embedding;
   assert.equal(first.source.provenance, "git");
   assert.match(first.source.gitCommit, /^[a-f0-9]{40}$/);
   assert.ok(first.source.gitBranch.length > 0);
+  assert.equal(first.source.buildAttestation.runtimeTreeSha256, first.source.runtimeTreeSha256);
+  assert.equal(first.source.windowsDependencyAttestation.platform, "win32");
+  assert.equal(first.runtimeDependencyTree.architecture, "x64");
+  assert.equal(embeddingContractSource, "ops/local-embedding-contract.json");
+  assert.equal(
+    embeddingContractSha256,
+    sha256(path.join(
+      buildRoot,
+      "ops",
+      "windows",
+      "asuka-memory-v15",
+      "local-embedding-contract.json",
+    )),
+  );
+  assert.deepEqual(manifestEmbeddingContract, localEmbeddingContract);
+  assert.equal(
+    manifestEmbeddingContract.model.family,
+    "jina-embeddings-v5-text-small",
+  );
+  assert.equal(manifestEmbeddingContract.model.task, "retrieval");
+  assert.equal(manifestEmbeddingContract.model.dimensions, 1_024);
+  assert.equal(manifestEmbeddingContract.model.license, "CC-BY-NC-4.0");
+  assert.equal(
+    manifestEmbeddingContract.api.endpoint,
+    "http://127.0.0.1:11434/v1/embeddings",
+  );
 
   fs.mkdirSync(occupiedRelease);
   const sentinel = path.join(occupiedRelease, "do-not-delete.txt");
   fs.writeFileSync(sentinel, "preserve-me\n");
   runFailure(process.execPath, [
     path.join(opsRoot, "generate-manifest.mjs"),
-    "--project-root", projectRoot,
+    "--project-root", buildRoot,
     "--release-root", occupiedRelease,
     "--release-id", "occupied-release",
     "--account", "default",
     "--peer", "user-1",
+    "--node-version", process.version,
+    "--build-attestation", buildAttestationPath,
+    "--windows-dependency-attestation", windowsDependencyAttestationPath,
   ], /release root already exists/i);
   assert.equal(fs.readFileSync(sentinel, "utf8"), "preserve-me\n");
   assert.equal(fs.existsSync(path.join(occupiedRelease, "manifest.json")), false);
 
-  const gitDirectory = path.join(projectRoot, ".git");
-  const hiddenGitDirectory = path.join(projectRoot, ".git-disabled-for-test");
-  fs.renameSync(gitDirectory, hiddenGitDirectory);
-  let unknown;
-  try {
-    unknown = generate(releaseUnknown);
-  } finally {
-    fs.renameSync(hiddenGitDirectory, gitDirectory);
-  }
-  assert.equal(unknown.source.provenance, "unknown");
-  assert.equal(unknown.source.worktreeDirty, true);
+  runFailure(process.execPath, [
+    path.join(opsRoot, "generate-manifest.mjs"),
+    "--project-root", fixtureRoot,
+    "--release-root", path.join(fixtureRoot, "release-no-git"),
+    "--release-id", "unknown-release",
+    "--account", "default",
+    "--peer", "user-1",
+    "--node-version", process.version,
+    "--build-attestation", buildAttestationPath,
+    "--windows-dependency-attestation", windowsDependencyAttestationPath,
+  ], /unable to read source commit from Git/i);
+
+  const distIndex = path.join(buildRoot, "extensions", "qqbot", "dist", "index.js");
+  const distBeforeTamper = fs.readFileSync(distIndex);
+  fs.appendFileSync(distIndex, "// ignored tamper\n");
+  runFailure(process.execPath, [
+    path.join(opsRoot, "generate-manifest.mjs"),
+    "--project-root", buildRoot,
+    "--release-root", releaseTampered,
+    "--release-id", "tampered-release",
+    "--account", "default",
+    "--peer", "user-1",
+    "--node-version", process.version,
+    "--build-attestation", buildAttestationPath,
+    "--windows-dependency-attestation", windowsDependencyAttestationPath,
+  ], /build attestation does not match/i);
+  fs.writeFileSync(distIndex, distBeforeTamper);
+
+  const unknown = structuredClone(first);
+  unknown.source.provenance = "unknown";
+  fs.mkdirSync(releaseUnknown);
+  fs.writeFileSync(
+    path.join(releaseUnknown, "manifest.json"),
+    `${JSON.stringify(unknown, null, 2)}\n`,
+  );
 
   assert.equal(first.appRoot, String.raw`D:\app\asuka`);
   assert.equal(first.releaseId, "test-release");
@@ -159,19 +402,27 @@ try {
     first.opsFiles.every((entry) => !/\/test-[^/]+\.mjs$/.test(entry.source)),
     "release must exclude executable test fixtures",
   );
-  for (const required of [
+  const requiredExecutableHelpers = [
     "ops/asuka-memory-sync.ps1",
     "ops/common.ps1",
     "ops/configure-memory-kernel.mjs",
+    "ops/create-recovery-baseline.ps1",
     "ops/deploy.ps1",
     "ops/freeze-and-backup-v15.ps1",
+    "ops/install-local-embedding.ps1",
+    "ops/local-embedding-contract.json",
+    "ops/normalize-task-actions.ps1",
     "ops/preflight.ps1",
-    "ops/rollback.ps1",
-    "ops/verify.ps1",
+    "ops/recover-v15-baseline.ps1",
     "ops/restore-vault-generated.mjs",
+    "ops/rollback.ps1",
+    "ops/start-local-embedding.ps1",
     "ops/verify-ledger.mjs",
     "ops/verify-model-config.mjs",
-  ]) {
+    "ops/verify.ps1",
+  ];
+  assert.deepEqual(first.requiredExecutableHelpers, requiredExecutableHelpers);
+  for (const required of requiredExecutableHelpers) {
     assert.ok(first.opsFiles.some((entry) => entry.source === required), `${required} not packaged`);
   }
 
@@ -313,6 +564,14 @@ try {
   const preflight = fs.readFileSync(path.join(opsRoot, "preflight.ps1"), "utf8");
   const rollback = fs.readFileSync(path.join(opsRoot, "rollback.ps1"), "utf8");
   const verify = fs.readFileSync(path.join(opsRoot, "verify.ps1"), "utf8");
+  const createRecoveryBaseline = fs.readFileSync(
+    path.join(opsRoot, "create-recovery-baseline.ps1"),
+    "utf8",
+  );
+  const recoverBaseline = fs.readFileSync(
+    path.join(opsRoot, "recover-v15-baseline.ps1"),
+    "utf8",
+  );
   const verifyLedger = fs.readFileSync(path.join(opsRoot, "verify-ledger.mjs"), "utf8");
   const normalizeTaskActions = fs.readFileSync(
     path.join(opsRoot, "normalize-task-actions.ps1"),
@@ -481,7 +740,7 @@ try {
   const gatewayStop = deploy.indexOf("Disable-AndStopAsukaTask -Name $gatewayTaskName");
   const gatewayStart = deploy.indexOf("Start-ScheduledTask -TaskName $gatewayTaskName");
   const syncStart = deploy.indexOf("Start-ScheduledTask -TaskName $syncTaskName");
-  const preflightRun = deploy.indexOf("$preflight = Invoke-AsukaNative");
+  const preflightRun = deploy.indexOf("$preflight = Invoke-AsukaLockedScript");
   const rejudgementRun = deploy.indexOf('"--rejudge"');
   const rejudgementGate = deploy.indexOf("$rejudgementGate = $migrationReport.rejudgementGate");
   const memoryConfigRun = deploy.indexOf("$memoryConfigRun = Invoke-AsukaNative");
@@ -542,19 +801,32 @@ try {
   assert.match(preflight, /@\{upstream\}/);
   assert.doesNotMatch(preflight, /origin\/main/);
   assert.match(deploy, /\[string\]\$FrozenBackupPath/);
-  assert.match(deploy, /\$preflightArguments \+= @\("-FrozenBackupPath"/);
-  assert.match(deploy, /\$gatewaySnapshot\.wasRunning = \(/);
-  assert.match(deploy, /frozenBackupPath = if \(\$null -eq \$frozenBackup\)/);
+  assert.match(
+    deploy,
+    /\$preflightParameters\["FrozenBackupPath"\] = \$FrozenBackupPath/,
+  );
+  assert.match(deploy, /FrozenBackupPath is required for an attested fail-closed deployment/);
+  assert.match(deploy, /Read-AsukaFrozenBackup[\s\S]*-VerifyCurrentHashes/);
+  assert.match(deploy, /\[string\]\$TaskNormalizationAttestationPath/);
+  assert.match(
+    deploy,
+    /Read-AsukaTaskNormalizationAttestation[\s\S]*-VerifyCurrentTasks/,
+  );
+  assert.match(
+    deploy,
+    /\$gatewaySnapshot = \[pscustomobject\]@\{[\s\S]*?enabled = \$true[\s\S]*?state = "Running"[\s\S]*?wasRunning = \$true/,
+  );
+  assert.match(
+    deploy,
+    /\$syncSnapshot = \[pscustomobject\]@\{[\s\S]*?enabled = \$true[\s\S]*?state = "Running"[\s\S]*?wasRunning = \$true/,
+  );
+  assert.match(deploy, /frozenBackupPath = \$frozenBackup\.path/);
   assert.match(deploy, /Configured OpenClaw configuration is invalid/);
   assert.match(deploy, /Installed sync worker does not match the release integrity contract/);
-  assert.match(freeze, /\[string\]\$SealExistingBackupPath/);
+  assert.doesNotMatch(freeze, /SealExistingBackupPath/);
   assert.match(freeze, /@\{upstream\}/);
   assert.doesNotMatch(freeze, /origin\/main/);
-  assert.match(freeze, /Write-AsukaBackupIntegrity -BackupPath \$sealedPath/);
   assert.match(freeze, /Test-AsukaFrozenCopyIntegrity/);
-  assert.match(freeze, /Sealing changed the existing frozen backup manifest/);
-  assert.match(freeze, /VerifiedCopies = \$verifiedCopies\.Count/);
-  assert.match(freeze, /TasksBeforePreserved = \$true/);
   assert.match(common, /function Read-AsukaFrozenBackup/);
   assert.match(common, /function Test-AsukaFrozenCopyIntegrity/);
   assert.match(
@@ -567,11 +839,15 @@ try {
   assert.match(common, /source worktree must be clean/);
   assert.match(
     common,
-    /function Get-AsukaDirectoryIntegrity[\s\S]*?Sort-Object path[\s\S]*?function Write-AsukaBackupIntegrity/,
+    /function Sort-AsukaRecordsOrdinal[\s\S]*?\[StringComparer\]::Ordinal\.Compare/,
   );
   assert.match(
     common,
-    /Get-ChildItem -LiteralPath \$root -File -Recurse -Force -ErrorAction Stop[\s\S]*?\$ExcludeReparsePoints[\s\S]*?\[IO\.FileAttributes\]::ReparsePoint/,
+    /function Get-AsukaDirectoryIntegrity[\s\S]*?\$files = @\(Sort-AsukaRecordsOrdinal -Records @\(\$records\) -Property "path"\)[\s\S]*?function Write-AsukaBackupIntegrity/,
+  );
+  assert.match(
+    common,
+    /function Get-AsukaDirectoryIntegrity[\s\S]*?Get-ChildItem -LiteralPath \$directory -Force -ErrorAction Stop[\s\S]*?\$item\.Attributes -band \[IO\.FileAttributes\]::ReparsePoint[\s\S]*?if \(\$ExcludeReparsePoints\)[\s\S]*?continue[\s\S]*?Directory tree contains an unsupported reparse point/,
   );
   assert.match(
     common,
@@ -664,17 +940,83 @@ try {
   assert.match(configureMemory, /const visibility = "private"/);
   assert.match(configureMemory, /mismatches\.push\("wiki\.peerKind"\)/);
   assert.match(configureMemory, /mismatches\.push\("wiki\.visibility"\)/);
-  assert.doesNotMatch(configureMemory, /apiKey\s*:/);
+  assert.match(configureMemory, /requireEmbeddings:\s*true/);
+  assert.match(configureMemory, /object\(manifest\.requirements\)\.embedding/);
+  assert.match(configureMemory, /endpoint:\s*embeddingApi\.endpoint/);
+  assert.match(configureMemory, /apiKey:\s*embeddingApi\.apiKey/);
+  assert.match(configureMemory, /model:\s*embeddingModel\.name/);
+  assert.match(configureMemory, /expectedDimensions:\s*embeddingModel\.dimensions/);
+  assert.doesNotMatch(configureMemory, /qwen3-embedding/);
+  assert.match(configureMemory, /intervalMs:\s*86_400_000/);
+  assert.match(configureMemory, /batchSize:\s*24/);
+  assert.match(configureMemory, /eventDelayMs:\s*5_000/);
   assert.doesNotMatch(readme, /background LLM rejudgement/i);
-  assert.match(readme, /SealExistingBackupPath/);
+  const prerequisiteStep = readme.indexOf("## Install the local embedding prerequisite");
+  const baselineStep = readme.indexOf("## Create and use the immutable recovery baseline");
+  const normalizeStep = readme.indexOf("## Normalize scheduled task actions");
+  const preflightStep = readme.indexOf("## Preflight");
+  const deployStep = readme.indexOf("## Deploy");
+  const verifyStep = readme.indexOf("## Verify");
+  assert.ok(
+    prerequisiteStep >= 0
+      && prerequisiteStep < baselineStep
+      && baselineStep < normalizeStep
+      && normalizeStep < preflightStep
+      && preflightStep < deployStep
+      && deployStep < verifyStep,
+    "operator runbook must order prerequisite, baseline, normalize, preflight, deploy, verify",
+  );
+  assert.match(readme, /existing Authenticode-signed Ollama executable on the C drive/);
+  assert.match(readme, /CC-BY-NC-4\.0/);
+  assert.match(readme, /Clash HTTP or mixed listener on[\s\S]*loopback/);
+  assert.match(readme, /D:\\app\\asuka\\models\\jina-v5-text-small/);
+  assert.match(readme, /D:\\app\\asuka\\models\\ollama/);
+  assert.match(readme, /D:\\app\\asuka\\embedding/);
+  assert.match(readme, /C:\\Users\\<user>\\AppData\\Local\\Programs\\Ollama\\ollama\.exe/);
+  assert.match(readme, /install-local-embedding\.ps1[\s\S]*-VerifyOnly/);
+  assert.match(
+    readme,
+    /Application rollback deliberately[\s\S]*does not uninstall, stop, unregister, remove, or downgrade Ollama/,
+  );
+  assert.doesNotMatch(readme, /qwen3-embedding/);
+  assert.match(readme, /Create a release-bound frozen backup/);
+  assert.match(readme, /worktree add -b "\$release_branch" "\$build_root" "\$release_commit"/);
+  assert.match(readme, /npm@11\.16\.0/);
+  assert.match(readme, /test "\$\(node --version\)" = "v24\.18\.0"/);
+  assert.match(readme, /\$env:Path = "\$toolBin;\$env:Path"/);
+  assert.match(
+    readme,
+    /\$toolBin = "D:\\app\\asuka\\tools\\node-v24\.18\.0"/,
+  );
+  assert.doesNotMatch(readme, /node-v24\.18\.0-npm-11\.16\.0/);
+  assert.match(readme, /\(npm --version\) -ne "11\.16\.0"/);
+  assert.match(readme, /-ReleaseRoot \$release/);
+  assert.match(readme, /-TaskNormalizationAttestationPath \$taskAttestation/);
+  assert.doesNotMatch(readme, /-SealExistingBackupPath/);
+  assert.match(readme, /upgrade-20260727-001932/);
+  assert.match(readme, /create-recovery-baseline\.ps1/);
+  assert.match(readme, /recover-v15-baseline\.ps1/);
   assert.match(readme, /v15-20260727-124326-adaptive-memory-kernel/);
-  assert.match(readme, /preserves `backup-manifest\.json`[\s\S]*`tasksBefore`/);
+  assert.match(readme, /Do not use it as this deployment's[\s\S]*frozen input/);
   assert.match(normalizeTaskActions, /Read-AsukaFrozenBackup[\s\S]*-VerifyCurrentHashes/);
   assert.match(normalizeTaskActions, /Export-ScheduledTask/);
   assert.match(normalizeTaskActions, /Test-AsukaPowerShellFileAction/);
   assert.match(normalizeTaskActions, /Set-AsukaTaskFromSnapshot/);
   assert.match(normalizeTaskActions, /argumentsPreserved/);
   assert.match(normalizeTaskActions, /workingDirectoryPreserved/);
+  assert.doesNotMatch(
+    [
+      deploy,
+      freeze,
+      normalizeTaskActions,
+      preflight,
+      rollback,
+      verify,
+      createRecoveryBaseline,
+      recoverBaseline,
+    ].join("\n"),
+    /DeploymentLockHeld/,
+  );
 
   const configuredOpenClaw = path.join(fixtureRoot, "configured-openclaw.json");
   writeAbsolute(
@@ -714,13 +1056,25 @@ try {
               },
             },
             embedding: {
-              baseUrl: "https://embedding.invalid",
+              endpoint: "https://embedding.invalid/v1/embeddings",
               apiKey: "embedding-secret",
               model: "embedding-model",
+              timeoutMs: 15_000,
+              expectedDimensions: 3,
+              untouched: "keep-embedding",
             },
+            requireEmbeddings: false,
             enableVector: false,
+            reflection: {
+              enabled: false,
+              intervalMs: 1_000,
+              batchSize: 1,
+              eventDelayMs: 0,
+              untouched: "keep-reflection",
+            },
             timeouts: {
               judgementMs: 45_000,
+              rerankTaskMs: 90_000,
             },
             migration: {
               extractionMaxTokens: 7_000,
@@ -746,7 +1100,12 @@ try {
   const configuredKernel = configured.channels.qqbot.memoryKernel;
   assert.equal(configureReport.ok, true);
   assert.equal(configureReport.modelConfigurationPreserved, true);
-  assert.doesNotMatch(configureRun.stdout, /memory-secret|embedding-secret/);
+  assert.doesNotMatch(
+    configureRun.stdout,
+    /memory-secret|embedding-secret|memory-model|embedding-model/,
+  );
+  assert.equal(configureRun.stdout.includes(first.requirements.embedding.api.apiKey), false);
+  assert.equal(configureRun.stdout.includes(first.requirements.embedding.model.name), false);
   assert.equal(configured.untouchedRoot, "keep-root");
   assert.equal(configured.plugins.untouchedPluginRoot, "keep-plugin-root");
   assert.equal(configured.plugins.entries["memory-core"].enabled, true);
@@ -767,11 +1126,27 @@ try {
     String.raw`D:\app\asuka\home\.openclaw\qqbot\data\asuka-memory\memory-ledger.sqlite`,
   );
   assert.equal(configuredKernel.model.primary.apiKey, "memory-secret");
-  assert.equal(configuredKernel.embedding.apiKey, "embedding-secret");
-  assert.equal(configuredKernel.enableVector, false);
+  assert.equal(configuredKernel.model.primary.model, "memory-model");
+  assert.deepEqual(configuredKernel.embedding, {
+    endpoint: first.requirements.embedding.api.endpoint,
+    apiKey: first.requirements.embedding.api.apiKey,
+    model: first.requirements.embedding.model.name,
+    timeoutMs: 15_000,
+    expectedDimensions: first.requirements.embedding.model.dimensions,
+    untouched: "keep-embedding",
+  });
+  assert.equal(configuredKernel.enableVector, true);
+  assert.equal(configuredKernel.requireEmbeddings, true);
+  assert.deepEqual(configuredKernel.reflection, {
+    enabled: true,
+    intervalMs: 1_000,
+    batchSize: 1,
+    eventDelayMs: 0,
+    untouched: "keep-reflection",
+  });
   assert.equal(configuredKernel.timeouts.judgementMs, 45_000);
   assert.equal(configuredKernel.timeouts.retrievalMs, 1_500);
-  assert.equal(configuredKernel.timeouts.rerankTaskMs, 60_000);
+  assert.equal(configuredKernel.timeouts.rerankTaskMs, 90_000);
   assert.equal(configuredKernel.migration.extractionMaxTokens, 7_000);
   assert.equal(configuredKernel.migration.consolidationMaxTokens, 9_000);
   assert.equal(configuredKernel.worker.enabled, true);
@@ -802,7 +1177,99 @@ try {
   assert.equal(verifyOnlyReport.ok, true);
   assert.equal(verifyOnlyReport.peerKind, "direct");
   assert.equal(verifyOnlyReport.visibility, "private");
+  assert.doesNotMatch(
+    verifyOnlyRun.stdout,
+    /memory-secret|embedding-secret|memory-model|embedding-model/,
+  );
+  assert.equal(verifyOnlyRun.stdout.includes(first.requirements.embedding.api.apiKey), false);
+  assert.equal(verifyOnlyRun.stdout.includes(first.requirements.embedding.model.name), false);
   assert.equal(fs.readFileSync(configuredOpenClaw, "utf8"), configuredBeforeVerify);
+
+  const productionMismatchCases = [
+    ["enabled", ["channels", "qqbot", "memoryKernel", "enabled"], false],
+    ["databasePath", ["channels", "qqbot", "memoryKernel", "databasePath"], "D:\\wrong.sqlite"],
+    ["enableVector", ["channels", "qqbot", "memoryKernel", "enableVector"], false],
+    ["requireEmbeddings", ["channels", "qqbot", "memoryKernel", "requireEmbeddings"], false],
+    [
+      "embedding.endpoint",
+      ["channels", "qqbot", "memoryKernel", "embedding", "endpoint"],
+      `${first.requirements.embedding.api.endpoint}-wrong`,
+    ],
+    [
+      "embedding.apiKey",
+      ["channels", "qqbot", "memoryKernel", "embedding", "apiKey"],
+      "wrong-embedding-secret",
+    ],
+    [
+      "embedding.model",
+      ["channels", "qqbot", "memoryKernel", "embedding", "model"],
+      `${first.requirements.embedding.model.name}-wrong`,
+    ],
+    [
+      "embedding.expectedDimensions",
+      ["channels", "qqbot", "memoryKernel", "embedding", "expectedDimensions"],
+      first.requirements.embedding.model.dimensions + 1,
+    ],
+    [
+      "reflection.enabled",
+      ["channels", "qqbot", "memoryKernel", "reflection", "enabled"],
+      false,
+    ],
+  ];
+  for (const [label, segments, invalidValue] of productionMismatchCases) {
+    const invalidConfig = JSON.parse(configuredBeforeVerify);
+    const field = segments.at(-1);
+    const parent = segments.slice(0, -1).reduce(
+      (value, segment) => value[segment],
+      invalidConfig,
+    );
+    parent[field] = invalidValue;
+    const invalidConfigPath = path.join(
+      fixtureRoot,
+      `invalid-${label.replaceAll(".", "-")}.json`,
+    );
+    writeAbsolute(invalidConfigPath, `${JSON.stringify(invalidConfig, null, 2)}\n`);
+    const failure = runFailure(process.execPath, [
+      path.join(opsRoot, "configure-memory-kernel.mjs"),
+      "--config", invalidConfigPath,
+      "--manifest", path.join(releaseOne, "manifest.json"),
+      "--verify-only", "true",
+    ], new RegExp(label.replaceAll(".", "\\.")));
+    assert.doesNotMatch(
+      `${failure.stderr}\n${failure.stdout}`,
+      /memory-secret|embedding-secret|memory-model|embedding-model|wrong-embedding-secret/,
+    );
+    assert.equal(
+      `${failure.stderr}\n${failure.stdout}`.includes(
+        first.requirements.embedding.api.apiKey,
+      ),
+      false,
+    );
+    assert.equal(
+      `${failure.stderr}\n${failure.stdout}`.includes(
+        first.requirements.embedding.model.name,
+      ),
+      false,
+    );
+  }
+  const baseUrlOnlyEmbedding = JSON.parse(configuredBeforeVerify);
+  const baseUrlOnlyEmbeddingConfig = baseUrlOnlyEmbedding.channels.qqbot.memoryKernel.embedding;
+  delete baseUrlOnlyEmbeddingConfig.endpoint;
+  baseUrlOnlyEmbeddingConfig.baseUrl = first.requirements.embedding.api.endpoint;
+  const baseUrlOnlyEmbeddingPath = path.join(
+    fixtureRoot,
+    "invalid-embedding-base-url-only.json",
+  );
+  writeAbsolute(
+    baseUrlOnlyEmbeddingPath,
+    `${JSON.stringify(baseUrlOnlyEmbedding, null, 2)}\n`,
+  );
+  runFailure(process.execPath, [
+    path.join(opsRoot, "configure-memory-kernel.mjs"),
+    "--config", baseUrlOnlyEmbeddingPath,
+    "--manifest", path.join(releaseOne, "manifest.json"),
+    "--verify-only", "true",
+  ], /embedding\.endpoint/);
 
   for (const [field, invalidValue] of [
     ["peerKind", "group"],
@@ -990,7 +1457,7 @@ try {
         "  @{ Name = 'alternate stream'; Expected = $false; Execute = $trustedHost; Arguments = '-File \"' + $target + ':evil\"' },",
         "  @{ Name = 'missing file value'; Expected = $false; Execute = $trustedHost; Arguments = '-File' },",
         "  @{ Name = 'second file after script'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments + ' -File \"C:\\evil.ps1\"' },",
-        "  @{ Name = 'unexpected script argument'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments + ' -Once' },",
+        "  @{ Name = 'unexpected script argument'; Expected = $false; Execute = $trustedHost; Arguments = $validArguments + ' -Once' }",
         ")",
         "foreach ($case in $cases) {",
         "  $workingDirectory = if ($case.ContainsKey('WorkingDirectory')) { $case.WorkingDirectory } else { '' }",
@@ -1060,7 +1527,7 @@ try {
         "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $missing | Out-Null } 'file is missing' 'missing protected file'",
         "  $extra = Copy-IntegrityFixture -Name 'extra'",
         "  Set-Content -LiteralPath (Join-Path $extra 'payload\\extra.txt') -Value 'extra' -Encoding ASCII",
-        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $extra | Out-Null } 'missing, extra, or modified' 'extra protected file'",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $extra | Out-Null } 'unmanifested protected file' 'extra protected file'",
         "  $sameSize = Copy-IntegrityFixture -Name 'same-size-hash'",
         "  $sameSizeFile = Join-Path $sameSize 'payload\\data.bin'",
         "  $sameSizeBytes = [IO.File]::ReadAllBytes($sameSizeFile)",

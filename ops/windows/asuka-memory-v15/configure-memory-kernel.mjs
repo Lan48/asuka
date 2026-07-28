@@ -67,10 +67,33 @@ const identityId = String(
 ).trim();
 const peerKind = "direct";
 const visibility = "private";
+const embeddingRequirement = object(object(manifest.requirements).embedding);
+const embeddingApi = object(embeddingRequirement.api);
+const embeddingModel = object(embeddingRequirement.model);
+if (
+  embeddingRequirement.schemaVersion !== 1
+  || embeddingApi.endpoint !== "http://127.0.0.1:11434/v1/embeddings"
+  || typeof embeddingApi.apiKey !== "string"
+  || !embeddingApi.apiKey
+  || typeof embeddingModel.name !== "string"
+  || !embeddingModel.name
+  || !Number.isInteger(embeddingModel.dimensions)
+  || embeddingModel.dimensions < 1
+) {
+  throw new Error("manifest is missing a valid local embedding contract");
+}
+const embeddingIdentity = {
+  endpoint: embeddingApi.endpoint,
+  apiKey: embeddingApi.apiKey,
+  model: embeddingModel.name,
+  expectedDimensions: embeddingModel.dimensions,
+};
 const root = object(config);
 const channels = object(root.channels);
 const qqbot = object(channels.qqbot);
 const current = object(qqbot.memoryKernel);
+const currentEmbedding = object(current.embedding);
+const currentReflection = object(current.reflection);
 const currentTimeouts = object(current.timeouts);
 const currentMigration = object(current.migration);
 const currentWorker = object(current.worker);
@@ -83,17 +106,40 @@ const activeMemoryConfig = object(activeMemoryPlugin.config);
 const memoryWikiPlugin = object(pluginEntries["memory-wiki"]);
 const databasePath = childPath(appRoot, migration.database);
 const memoryRoot = childPath(appRoot, "obsidian-vault/Asuka/Memory");
+const productionEmbedding = {
+  ...currentEmbedding,
+  timeoutMs: currentEmbedding.timeoutMs ?? 5_000,
+  ...embeddingIdentity,
+};
+const productionReflection = {
+  ...defaults(currentReflection, {
+    intervalMs: 86_400_000,
+    batchSize: 24,
+    eventDelayMs: 5_000,
+  }),
+  enabled: true,
+};
+const rerankTaskMs = currentTimeouts.rerankTaskMs ?? 60_000;
 
 const memoryKernel = {
   ...current,
   enabled: true,
   databasePath,
-  enableVector: current.enableVector !== false,
+  enableVector: true,
+  requireEmbeddings: true,
+  embedding: {
+    ...currentEmbedding,
+    ...productionEmbedding,
+  },
+  reflection: {
+    ...currentReflection,
+    ...productionReflection,
+  },
   timeouts: {
     ...currentTimeouts,
     judgementMs: currentTimeouts.judgementMs ?? 30_000,
     retrievalMs: 1_500,
-    rerankTaskMs: 60_000,
+    rerankTaskMs,
   },
   migration: {
     ...currentMigration,
@@ -163,6 +209,8 @@ const updated = {
 if (verifyOnly) {
   const actual = object(object(object(config).channels).qqbot).memoryKernel;
   const actualKernel = object(actual);
+  const actualEmbedding = object(actualKernel.embedding);
+  const actualReflection = object(actualKernel.reflection);
   const actualTimeouts = object(actualKernel.timeouts);
   const actualWorker = object(actualKernel.worker);
   const actualWiki = object(actualKernel.wiki);
@@ -178,8 +226,16 @@ if (verifyOnly) {
   const mismatches = [];
   if (actualKernel.enabled !== true) mismatches.push("enabled");
   if (!sameWindowsPath(actualKernel.databasePath, databasePath)) mismatches.push("databasePath");
+  if (actualKernel.enableVector !== true) mismatches.push("enableVector");
+  if (actualKernel.requireEmbeddings !== true) mismatches.push("requireEmbeddings");
+  for (const [field, expected] of Object.entries(productionEmbedding)) {
+    if (actualEmbedding[field] !== expected) mismatches.push(`embedding.${field}`);
+  }
+  for (const [field, expected] of Object.entries(productionReflection)) {
+    if (actualReflection[field] !== expected) mismatches.push(`reflection.${field}`);
+  }
   if (actualTimeouts.retrievalMs !== 1_500) mismatches.push("timeouts.retrievalMs");
-  if (actualTimeouts.rerankTaskMs !== 60_000) mismatches.push("timeouts.rerankTaskMs");
+  if (actualTimeouts.rerankTaskMs !== rerankTaskMs) mismatches.push("timeouts.rerankTaskMs");
   if (actualWorker.enabled !== true) mismatches.push("worker.enabled");
   if (actualWiki.enabled !== true) mismatches.push("wiki.enabled");
   if (!sameWindowsPath(actualWiki.memoryRoot, memoryRoot)) mismatches.push("wiki.memoryRoot");
@@ -218,6 +274,14 @@ const persisted = JSON.parse(fs.readFileSync(configPath, "utf8"));
 const persistedKernel = persisted.channels?.qqbot?.memoryKernel;
 if (
   persistedKernel?.enabled !== true
+  || persistedKernel.enableVector !== true
+  || persistedKernel.requireEmbeddings !== true
+  || Object.entries(productionEmbedding).some(
+    ([field, expected]) => persistedKernel.embedding?.[field] !== expected,
+  )
+  || Object.entries(productionReflection).some(
+    ([field, expected]) => persistedKernel.reflection?.[field] !== expected,
+  )
   || persistedKernel.wiki?.peerKind !== peerKind
   || persistedKernel.wiki?.visibility !== visibility
   || persistedKernel.timeouts?.retrievalMs !== 1_500

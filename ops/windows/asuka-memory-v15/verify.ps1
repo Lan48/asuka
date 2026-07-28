@@ -13,19 +13,62 @@ $ProgressPreference = "SilentlyContinue"
 Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot "common.ps1")
 $env:GIT_TERMINAL_PROMPT = "0"
+$lockStream = $null
 
 try {
+  $lockStream = Enter-AsukaDeploymentLock -AppRoot $AppRoot
+  $AppRoot = [IO.Path]::GetFullPath($AppRoot).TrimEnd("\")
   if ([string]::IsNullOrWhiteSpace($CurrentStatePath)) {
     $CurrentStatePath = Join-Path $AppRoot "run\asuka-memory-v15-current.json"
   }
+  $CurrentStatePath = [IO.Path]::GetFullPath($CurrentStatePath)
+  [void](Assert-AsukaNoReparsePointPath -Root $AppRoot `
+    -Path $CurrentStatePath)
   if (-not (Test-Path -LiteralPath $CurrentStatePath -PathType Leaf)) {
     throw "Deployment state is missing: $CurrentStatePath"
   }
   $currentState = Get-Content -LiteralPath $CurrentStatePath -Raw -Encoding UTF8 |
     ConvertFrom-Json
-  if ([string]$currentState.phase -ne "active") {
+  $stateSchemaVersion = Assert-AsukaJsonInteger -Object $currentState `
+    -Property "schemaVersion" -Minimum 1 -Maximum 1
+  if (
+    $stateSchemaVersion -ne 1 -or
+    [string]$currentState.phase -cne "active" -or
+    [string]$currentState.releaseId -notmatch
+      "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+  ) {
     throw "Asuka v1.5 is not active; current phase is '$($currentState.phase)'."
   }
+  foreach ($taskState in @(
+    $currentState.gatewayTask,
+    $currentState.syncTask
+  )) {
+    [void](Assert-AsukaJsonBoolean -Object $taskState -Property "enabled")
+    [void](Assert-AsukaJsonBoolean -Object $taskState `
+      -Property "wasRunning")
+    if ([string]$taskState.state -cne "Running") {
+      throw "Deployment state contains an invalid scheduled-task lifecycle."
+    }
+  }
+  foreach ($readyProperty in @(
+    "port",
+    "process",
+    "gatewayReady",
+    "websocketReady"
+  )) {
+    [void](Assert-AsukaJsonBoolean -Object $currentState.gatewayReady `
+      -Property $readyProperty)
+  }
+  if (
+    -not (
+      $currentState.PSObject.Properties.Name -contains
+        "hadPreexistingLedger"
+    ) -or
+    -not ($currentState.hadPreexistingLedger -is [bool])
+  ) {
+    throw "Deployment state hadPreexistingLedger must be a boolean."
+  }
+  $hadPreexistingLedger = [bool]$currentState.hadPreexistingLedger
 
   if (
     [string]::IsNullOrWhiteSpace($ManifestPath) -and
@@ -44,12 +87,65 @@ try {
   if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
     $ManifestPath = Join-Path $ReleaseRoot "manifest.json"
   }
+  $ReleaseRoot = [IO.Path]::GetFullPath($ReleaseRoot).TrimEnd("\")
+  $ManifestPath = [IO.Path]::GetFullPath($ManifestPath)
+  $expectedManifestPath = Resolve-AsukaChildPath -Root $ReleaseRoot `
+    -Relative "manifest.json"
+  if (
+    -not $ManifestPath.Equals(
+      $expectedManifestPath,
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$currentState.manifestPath
+    )).Equals(
+      $ManifestPath,
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    [string]$currentState.manifestSha256 -notmatch "^[a-fA-F0-9]{64}$" -or
+    (Get-AsukaSha256 -Path $ManifestPath) -cne
+      ([string]$currentState.manifestSha256).ToLowerInvariant()
+  ) {
+    throw "Deployment state is not bound to the selected release manifest."
+  }
 
   $manifest = Read-AsukaManifest -Path $ManifestPath
-  if ([string]$currentState.releaseId -ne [string]$manifest.releaseId) {
+  if (
+    [string]::IsNullOrWhiteSpace([string]$manifest.appRoot) -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$manifest.appRoot
+    )).TrimEnd("\").Equals(
+      $AppRoot,
+      [StringComparison]::OrdinalIgnoreCase
+    )
+  ) {
+    throw "Manifest appRoot does not match requested AppRoot."
+  }
+  if ([string]$currentState.releaseId -cne [string]$manifest.releaseId) {
     throw "Deployment state and manifest releaseId do not match."
   }
+  $releaseId = [string]$manifest.releaseId
+  $deploymentRunRoot = Resolve-AsukaChildPath -Root $AppRoot `
+    -Relative ("run\deployments\{0}" -f $releaseId)
+  if (-not (Test-Path -LiteralPath $deploymentRunRoot -PathType Container)) {
+    throw "Deployment sidecar directory is missing: $deploymentRunRoot"
+  }
+  $deploymentStatePath = Join-Path $deploymentRunRoot "deployment-state.json"
+  if (
+    -not (Test-Path -LiteralPath $deploymentStatePath -PathType Leaf) -or
+    (Get-AsukaSha256 -Path $deploymentStatePath) -cne
+      (Get-AsukaSha256 -Path $CurrentStatePath)
+  ) {
+    throw "Current deployment state does not match its release sidecar."
+  }
   $releaseFiles = @(Test-AsukaReleaseFiles -Manifest $manifest -ReleaseRoot $ReleaseRoot)
+  $trustedPowerShell = [IO.Path]::GetFullPath(
+    (Join-Path $env:SystemRoot `
+      "System32\WindowsPowerShell\v1.0\powershell.exe")
+  )
+  $embeddingVerification = Invoke-AsukaLocalEmbeddingVerification `
+    -ReleaseRoot $ReleaseRoot -TrustedPowerShell $trustedPowerShell `
+    -Manifest $manifest
   $syncScript = Resolve-AsukaChildPath -Root $AppRoot `
     -Relative ([string]$manifest.syncWorker.destination)
   $expectedSyncScriptHash = ([string]$manifest.syncWorker.sha256).ToLowerInvariant()
@@ -70,10 +166,145 @@ try {
   ) {
     throw "Installed sync worker does not match the release integrity contract."
   }
-  if (-not (Test-Path -LiteralPath ([string]$currentState.backupPath) -PathType Container)) {
+
+  $backupsRoot = [IO.Path]::GetFullPath(
+    (Join-Path $AppRoot "backups")
+  ).TrimEnd("\")
+  $backupPath = [IO.Path]::GetFullPath(
+    [string]$currentState.backupPath
+  ).TrimEnd("\")
+  $snapshotPath = [IO.Path]::GetFullPath(
+    [string]$currentState.snapshotPath
+  ).TrimEnd("\")
+  if (
+    -not $backupPath.StartsWith(
+      "$backupsRoot\",
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not $snapshotPath.Equals(
+      (Join-Path $backupPath "snapshot"),
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not (Test-Path -LiteralPath $snapshotPath -PathType Container)
+  ) {
     throw "The active deployment no longer has a complete rollback backup."
   }
-  $backupIntegrity = Test-AsukaBackupIntegrity -BackupPath ([string]$currentState.backupPath)
+  [void](Assert-AsukaNoReparsePointPath -Root $backupsRoot -Path $backupPath)
+  $backupIntegrity = Test-AsukaBackupIntegrity -BackupPath $snapshotPath
+  $snapshotManifestPath = Join-Path $snapshotPath "manifest.json"
+  $backupSummaryPath = Join-Path $snapshotPath "backup.json"
+  $backupSummary = Get-Content -LiteralPath $backupSummaryPath `
+    -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (
+    (Get-AsukaSha256 -Path $snapshotManifestPath) -cne
+      ([string]$currentState.manifestSha256).ToLowerInvariant() -or
+    ([string]$backupSummary.sourceManifestSha256).ToLowerInvariant() -cne
+      ([string]$currentState.manifestSha256).ToLowerInvariant() -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$backupSummary.snapshotPath
+    )).TrimEnd("\").Equals(
+      $snapshotPath,
+      [StringComparison]::OrdinalIgnoreCase
+    )
+  ) {
+    throw "Rollback snapshot is not bound to the active release manifest."
+  }
+
+  if (
+    -not ($currentState.PSObject.Properties.Name -contains "taskAttestation") -or
+    [string]$currentState.taskAttestation.snapshotPath -cne
+      "tasks/attestation.json" -or
+    [string]$currentState.taskAttestation.sha256 -notmatch
+      "^[a-fA-F0-9]{64}$"
+  ) {
+    throw "Deployment state has no sealed task normalization attestation."
+  }
+  $sealedTaskAttestationPath = Resolve-AsukaChildPath -Root $snapshotPath `
+    -Relative "tasks\attestation.json"
+  if (
+    (Get-AsukaSha256 -Path $sealedTaskAttestationPath) -cne
+      ([string]$currentState.taskAttestation.sha256).ToLowerInvariant() -or
+    ([string]$backupSummary.taskAttestationSha256).ToLowerInvariant() -cne
+      ([string]$currentState.taskAttestation.sha256).ToLowerInvariant()
+  ) {
+    throw "Sealed task normalization attestation hash does not match deployment state."
+  }
+  $frozenBackupPath = [IO.Path]::GetFullPath(
+    [string]$currentState.frozenBackupPath
+  ).TrimEnd("\")
+  if (-not $frozenBackupPath.StartsWith(
+    "$backupsRoot\",
+    [StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw "Deployment state has an invalid frozen backup path."
+  }
+  $taskAttestation = Read-AsukaTaskNormalizationAttestation `
+    -Path $sealedTaskAttestationPath -AppRoot $AppRoot `
+    -ManifestPath $ManifestPath -Manifest $manifest `
+    -FrozenBackupPath $frozenBackupPath -SealedSnapshotPath $snapshotPath `
+    -VerifyCurrentTasks -ExpectedCurrentState "Running"
+  if (
+    [string]$taskAttestation.sha256 -cne
+      ([string]$currentState.taskAttestation.sha256).ToLowerInvariant() -or
+    [string]$currentState.gatewayTask.taskPath -cne
+      [string]$taskAttestation.gateway.taskPath -or
+    [string]$currentState.syncTask.taskPath -cne
+      [string]$taskAttestation.sync.taskPath
+  ) {
+    throw "Active scheduled tasks are not bound to the sealed attestation."
+  }
+
+  $ledger = Resolve-AsukaChildPath -Root $AppRoot `
+    -Relative ([string]$manifest.migration.database)
+  $activationJournalPath = Join-Path $deploymentRunRoot `
+    "activation-journal.json"
+  [void](Assert-AsukaNoReparsePointPath -Root $deploymentRunRoot `
+    -Path $activationJournalPath)
+  if (
+    -not ($currentState.PSObject.Properties.Name -contains
+      "activationJournal") -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$currentState.activationJournal.path
+    )).Equals(
+      $activationJournalPath,
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    [string]$currentState.activationJournal.sha256 -notmatch
+      "^[a-fA-F0-9]{64}$" -or
+    -not (Test-Path -LiteralPath $activationJournalPath -PathType Leaf) -or
+    (Get-AsukaSha256 -Path $activationJournalPath) -cne
+      ([string]$currentState.activationJournal.sha256).ToLowerInvariant()
+  ) {
+    throw "Activation journal path or SHA-256 does not match deployment state."
+  }
+  $activationJournal = Get-Content -LiteralPath $activationJournalPath `
+    -Raw -Encoding UTF8 | ConvertFrom-Json
+  $activationSchemaVersion = Assert-AsukaJsonInteger `
+    -Object $activationJournal -Property "schemaVersion" `
+    -Minimum 1 -Maximum 1
+  $activatedLedgerBytes = Assert-AsukaJsonInteger `
+    -Object $activationJournal.activatedLedger -Property "bytes" -Minimum 1
+  $activationCompleted = Assert-AsukaJsonBoolean `
+    -Object $activationJournal -Property "completed"
+  $activationHadPreexistingLedger = Assert-AsukaJsonBoolean `
+    -Object $activationJournal -Property "hadPreexistingLedger" `
+    -Expected $hadPreexistingLedger
+  if (
+    $activationSchemaVersion -ne 1 -or
+    -not $activationCompleted -or
+    [string]$activationJournal.releaseId -cne $releaseId -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$activationJournal.ledgerPath
+    )).Equals($ledger, [StringComparison]::OrdinalIgnoreCase) -or
+    [string]$activationJournal.activatedLedger.sha256 -notmatch
+      "^[a-fA-F0-9]{64}$" -or
+    $activatedLedgerBytes -lt 1 -or
+    [bool]$activationHadPreexistingLedger -ne
+      $hadPreexistingLedger
+  ) {
+    throw "Activation journal schema does not match the active deployment."
+  }
+
   if (
     -not ($currentState.PSObject.Properties.Name -contains "migration") -or
     $null -eq $currentState.migration
@@ -81,25 +312,114 @@ try {
     throw "Deployment state has no persisted migration result."
   }
   $persistedMigration = $currentState.migration
+  $migrationRoot = Resolve-AsukaChildPath -Root $deploymentRunRoot `
+    -Relative "migration"
+  $migrationReportPath = [IO.Path]::GetFullPath(
+    [string]$persistedMigration.reportPath
+  )
   if (
     -not ($persistedMigration.PSObject.Properties.Name -contains "reportPath") -or
     [string]::IsNullOrWhiteSpace([string]$persistedMigration.reportPath) -or
-    -not (Test-Path -LiteralPath ([string]$persistedMigration.reportPath) -PathType Leaf)
+    -not $migrationReportPath.StartsWith(
+      "$migrationRoot\",
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not (Test-Path -LiteralPath $migrationReportPath -PathType Leaf) -or
+    [string]$persistedMigration.reportSha256 -notmatch "^[a-fA-F0-9]{64}$" -or
+    (Get-AsukaSha256 -Path $migrationReportPath) -cne
+      ([string]$persistedMigration.reportSha256).ToLowerInvariant()
   ) {
     throw "Persisted migration report is missing."
   }
-  $migrationReport = Get-Content -LiteralPath ([string]$persistedMigration.reportPath) `
+  [void](Assert-AsukaNoReparsePointPath -Root $migrationRoot `
+    -Path $migrationReportPath)
+  $migrationReport = Get-Content -LiteralPath $migrationReportPath `
     -Raw -Encoding UTF8 | ConvertFrom-Json
   if (
     -not ($migrationReport.PSObject.Properties.Name -contains "rejudgement") -or
-    $null -eq $migrationReport.rejudgement
+    $null -eq $migrationReport.rejudgement -or
+    $null -eq $persistedMigration.rejudgement
   ) {
     throw "Persisted migration report has no legacy rejudgement result."
+  }
+  [void](Assert-AsukaJsonBoolean -Object $persistedMigration.integrity `
+    -Property "ok")
+  [void](Assert-AsukaJsonBoolean -Object $migrationReport.integrity `
+    -Property "ok")
+  [void](Assert-AsukaJsonBoolean -Object $migrationReport.migrationGate `
+    -Property "passed")
+  foreach ($migrationCounter in @(
+    "discoveredRecords",
+    "importedEvents",
+    "duplicateEvents",
+    "pendingRejudgements"
+  )) {
+    $persistedCount = Assert-AsukaJsonInteger -Object $persistedMigration `
+      -Property $migrationCounter -Minimum 0
+    $reportCount = Assert-AsukaJsonInteger -Object $migrationReport.migration `
+      -Property $migrationCounter -Minimum 0
+    if ($persistedCount -ne $reportCount) {
+      throw "Persisted migration counts do not match the sealed report."
+    }
+  }
+  foreach ($duplicatedField in @(
+    [pscustomobject]@{
+      persisted = $persistedMigration.rejudgement
+      report = $migrationReport.rejudgement
+    },
+    [pscustomobject]@{
+      persisted = $persistedMigration.rejudgementGate
+      report = $migrationReport.rejudgementGate
+    },
+    [pscustomobject]@{
+      persisted = $persistedMigration.integrity
+      report = $migrationReport.integrity
+    },
+    [pscustomobject]@{
+      persisted = $persistedMigration.stats
+      report = $migrationReport.stats
+    }
+  )) {
+    if (
+      ($duplicatedField.persisted | ConvertTo-Json -Depth 24 -Compress) -cne
+        ($duplicatedField.report | ConvertTo-Json -Depth 24 -Compress)
+    ) {
+      throw "Persisted migration result does not match the sealed report."
+    }
+  }
+  if (
+    -not ($persistedMigration.PSObject.Properties.Name -contains "cohort") -or
+    $null -eq $persistedMigration.cohort -or
+    [string]$persistedMigration.cohort.sha256 -notmatch
+      "^[a-fA-F0-9]{64}$"
+  ) {
+    throw "Persisted migration cohort SHA-256 is missing."
   }
   foreach ($gate in @(
     $persistedMigration.rejudgementGate,
     $migrationReport.rejudgementGate
   )) {
+    if ($null -eq $gate) {
+      throw "Persisted legacy rejudgement gate is missing or has blockers."
+    }
+    [void](Assert-AsukaJsonBoolean -Object $gate -Property "passed")
+    foreach ($counter in @(
+      [pscustomobject]@{ target = $gate.jobs; property = "pending" },
+      [pscustomobject]@{ target = $gate.jobs; property = "running" },
+      [pscustomobject]@{ target = $gate.jobs; property = "failed" },
+      [pscustomobject]@{ target = $gate.claims; property = "provisionalOpen" },
+      [pscustomobject]@{ target = $gate.extractions; property = "completed" },
+      [pscustomobject]@{ target = $gate.extractions; property = "withClaims" },
+      [pscustomobject]@{ target = $gate.events; property = "eligible" },
+      [pscustomobject]@{ target = $gate.coverage; property = "sourceEvents" },
+      [pscustomobject]@{
+        target = $gate.coverage
+        property = "coveredSourceEvents"
+      }
+    )) {
+      [void](Assert-AsukaJsonInteger -Object $counter.target `
+        -Property ([string]$counter.property) -Minimum 0)
+    }
     $consolidationStatus = [string]$gate.consolidation.status
     $consolidationComplete = (
       $consolidationStatus -eq "completed" -or
@@ -110,8 +430,6 @@ try {
       $consolidationStatus -ne "completed"
     )
     if (
-      $null -eq $gate -or
-      -not [bool]$gate.passed -or
       [int]$gate.jobs.pending -ne 0 -or
       [int]$gate.jobs.running -ne 0 -or
       [int]$gate.jobs.failed -ne 0 -or
@@ -161,6 +479,20 @@ try {
     if (-not $isPreservedDependency -and $expectedRuntimePaths -notcontains $activeRelative) {
       throw "Active runtime contains an unexpected file: $activeRelative"
     }
+  }
+  $activeDependencyIntegrity = Test-AsukaRuntimeDependencyTree `
+    -Manifest $manifest -PluginRoot $activePlugin
+  if (
+    -not ($currentState.PSObject.Properties.Name -contains
+      "runtimeDependencyTree") -or
+    [int]$currentState.runtimeDependencyTree.fileCount -ne
+      [int]$activeDependencyIntegrity.fileCount -or
+    [int64]$currentState.runtimeDependencyTree.bytes -ne
+      [int64]$activeDependencyIntegrity.bytes -or
+    [string]$currentState.runtimeDependencyTree.sha256 -cne
+      [string]$activeDependencyIntegrity.sha256
+  ) {
+    throw "Active runtime dependency tree does not match deployment state."
   }
 
   $node = Join-Path $AppRoot (
@@ -213,7 +545,6 @@ try {
     throw "Active memory model configuration is not ready: $($modelConfigProbe.Output)"
   }
 
-  $ledger = Resolve-AsukaChildPath -Root $AppRoot -Relative ([string]$manifest.migration.database)
   $ledgerVerifier = Join-Path $ReleaseRoot "ops\verify-ledger.mjs"
   $ledgerResult = Invoke-AsukaNative -FilePath $node -Arguments @(
     $ledgerVerifier,
@@ -273,8 +604,10 @@ try {
 
   $gatewayTaskName = [string]$manifest.requirements.tasks.gateway
   $syncTaskName = [string]$manifest.requirements.tasks.sync
-  $gatewayTask = Get-AsukaTaskSnapshot -Name $gatewayTaskName
-  $syncTask = Get-AsukaTaskSnapshot -Name $syncTaskName
+  $gatewayTask = Get-AsukaTaskSnapshot -Name $gatewayTaskName `
+    -TaskPath ([string]$taskAttestation.gateway.taskPath)
+  $syncTask = Get-AsukaTaskSnapshot -Name $syncTaskName `
+    -TaskPath ([string]$taskAttestation.sync.taskPath)
   if (-not $gatewayTask.enabled -or -not $gatewayTask.wasRunning) {
     throw "$gatewayTaskName is not enabled and running."
   }
@@ -382,12 +715,17 @@ try {
     }
   }
 
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+    $lockStream = $null
+  }
   Write-AsukaEnvelope -Ok $true -Operation "verify" -Data ([ordered]@{
     releaseId = [string]$manifest.releaseId
     releaseFiles = $releaseFiles.Count
     activeRuntimeFiles = $activeHashes.Count
     node = $nodeVersionResult.Output.Trim()
     openClaw = [string]$openClawPackageJson.version
+    localEmbedding = $embeddingVerification
     kernelConfig = ($kernelConfigProbe.Output.Trim() | ConvertFrom-Json)
     modelConfig = ($modelConfigProbe.Output.Trim() | ConvertFrom-Json)
     ledger = $ledgerReport
@@ -413,6 +751,14 @@ try {
     backupIntegrity = $backupIntegrity
   }) -ErrorMessage $null -ExitCode 0
 } catch {
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+    $lockStream = $null
+  }
   Write-AsukaEnvelope -Ok $false -Operation "verify" -Data $null `
     -ErrorMessage $_.Exception.Message -ExitCode 1
+} finally {
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+  }
 }

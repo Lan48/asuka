@@ -1,10 +1,11 @@
 [CmdletBinding()]
 param(
   [string]$AppRoot = "D:\app\asuka",
-  [string]$ReleaseId = "v15-preimplementation",
-  [string]$SealExistingBackupPath = "",
-  [string]$GatewayTaskName = "AsukaGateway",
-  [string]$SyncTaskName = "AsukaMemorySync"
+  [string]$ReleaseRoot = "",
+  [string]$ManifestPath = "",
+  [string]$ReleaseId = "",
+  [string]$GatewayTaskName = "",
+  [string]$SyncTaskName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,66 +13,91 @@ $ProgressPreference = "SilentlyContinue"
 
 . (Join-Path $PSScriptRoot "common.ps1")
 
+$operation = "freeze-and-backup-v15"
+$lockStream = $null
+$backupRoot = $null
+
+try {
+$lockStream = Enter-AsukaDeploymentLock -AppRoot $AppRoot
 $AppRoot = [IO.Path]::GetFullPath($AppRoot).TrimEnd("\")
+if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+  $ReleaseRoot = Split-Path -Parent $PSScriptRoot
+}
+$ReleaseRoot = [IO.Path]::GetFullPath($ReleaseRoot).TrimEnd("\")
+if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+  $ManifestPath = Join-Path $ReleaseRoot "manifest.json"
+}
+$ManifestPath = [IO.Path]::GetFullPath($ManifestPath)
+$manifest = Read-AsukaManifest -Path $ManifestPath
+[void](Test-AsukaReleaseFiles -Manifest $manifest -ReleaseRoot $ReleaseRoot)
+if (
+  -not [string]::IsNullOrWhiteSpace([string]$manifest.appRoot) -and
+  -not ([IO.Path]::GetFullPath([string]$manifest.appRoot)).Equals(
+    $AppRoot,
+    [StringComparison]::OrdinalIgnoreCase
+  )
+) {
+  throw "Manifest appRoot does not match requested AppRoot."
+}
+
+$manifestReleaseId = [string]$manifest.releaseId
+if (
+  -not [string]::IsNullOrWhiteSpace($ReleaseId) -and
+  $ReleaseId -cne $manifestReleaseId
+) {
+  throw "ReleaseId does not match the release manifest."
+}
+$ReleaseId = $manifestReleaseId
 if ($ReleaseId -notmatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$") {
   throw "ReleaseId contains unsafe characters."
 }
+
+$manifestGatewayTaskName = [string]$manifest.requirements.tasks.gateway
+$manifestSyncTaskName = [string]$manifest.requirements.tasks.sync
+if (
+  -not [string]::IsNullOrWhiteSpace($GatewayTaskName) -and
+  $GatewayTaskName -cne $manifestGatewayTaskName
+) {
+  throw "Gateway task name does not match the release manifest."
+}
+if (
+  -not [string]::IsNullOrWhiteSpace($SyncTaskName) -and
+  $SyncTaskName -cne $manifestSyncTaskName
+) {
+  throw "Sync task name does not match the release manifest."
+}
+$GatewayTaskName = $manifestGatewayTaskName
+$SyncTaskName = $manifestSyncTaskName
 foreach ($taskName in @($GatewayTaskName, $SyncTaskName)) {
   if ($taskName -notmatch "^[A-Za-z0-9_.-]+$") {
-    throw "Scheduled-task name contains unsafe characters."
+    throw "Release manifest contains an unsafe scheduled-task name."
   }
 }
-
-if (-not [string]::IsNullOrWhiteSpace($SealExistingBackupPath)) {
-  $sealedPath = [IO.Path]::GetFullPath($SealExistingBackupPath).TrimEnd("\")
-  $allowedBackupsRoot = [IO.Path]::GetFullPath(
-    (Join-Path $AppRoot "backups")
-  ).TrimEnd("\")
-  if (
-    -not $sealedPath.StartsWith(
-      "$allowedBackupsRoot\",
-      [StringComparison]::OrdinalIgnoreCase
-    )
-  ) {
-    throw "Existing frozen backup must be a child of the Asuka backups directory."
-  }
-  $legacyManifestPath = Join-Path $sealedPath "backup-manifest.json"
-  $legacyMarkerPath = Join-Path $sealedPath "BACKUP_COMPLETE"
-  foreach ($required in @($legacyManifestPath, $legacyMarkerPath)) {
-    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-      throw "Existing frozen backup is incomplete: $required"
-    }
-  }
-  $legacyManifest = Get-Content -LiteralPath $legacyManifestPath -Raw -Encoding UTF8 |
-    ConvertFrom-Json
-  $verifiedCopies = @(
-    Test-AsukaFrozenCopyIntegrity -Manifest $legacyManifest -AppRoot $AppRoot `
-      -BackupPath $sealedPath
-  )
-  $legacyManifestHash = Get-AsukaSha256 -Path $legacyManifestPath
-  [void](Write-AsukaBackupIntegrity -BackupPath $sealedPath)
-  $sealed = Read-AsukaFrozenBackup -Path $sealedPath -AppRoot $AppRoot `
-    -GatewayTaskName $GatewayTaskName -SyncTaskName $SyncTaskName
-  if ((Get-AsukaSha256 -Path $legacyManifestPath) -ne $legacyManifestHash) {
-    throw "Sealing changed the existing frozen backup manifest."
-  }
-  [pscustomobject]@{
-    Success = $true
-    Mode = "seal-existing"
-    BackupRoot = $sealed.path
-    Manifest = $sealed.manifestPath
-    FileCount = $sealed.backupIntegrity.fileCount
-    Bytes = $sealed.backupIntegrity.bytes
-    TreeSha256 = $sealed.backupIntegrity.treeSha256
-    VerifiedCopies = $verifiedCopies.Count
-    TasksBeforePreserved = $true
-  } | ConvertTo-Json -Compress
-  return
+$gatewayPort = [int]$manifest.requirements.gatewayPort
+$nodeVersion = [string]$manifest.requirements.nodeVersion
+if ($gatewayPort -lt 1 -or $gatewayPort -gt 65535) {
+  throw "Release manifest has an invalid Gateway port."
 }
+if (
+  [string]$PSVersionTable.PSEdition -ne "Desktop" -or
+  [int]$PSVersionTable.PSVersion.Major -ne 5 -or
+  [int]$PSVersionTable.PSVersion.Minor -ne 1 -or
+  -not [Environment]::Is64BitProcess
+) {
+  throw "Native 64-bit Windows PowerShell 5.1 Desktop is required."
+}
+$releaseManifestSha256 = Get-AsukaSha256 -Path $ManifestPath
 
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $backupRoot = Join-Path $AppRoot "backups\v15-$timestamp-$ReleaseId"
 $vault = Join-Path $AppRoot "obsidian-vault"
+$syncLock = Join-Path $AppRoot "run\asuka-memory-sync.lock"
+$gatewayScript = Join-Path $AppRoot "asuka-gateway-task.ps1"
+$syncScript = Resolve-AsukaChildPath -Root $AppRoot `
+  -Relative ([string]$manifest.syncWorker.destination)
+$nodeRuntime = Join-Path $AppRoot (
+  "tools\node-{0}" -f [string]$manifest.requirements.nodeVersion
+)
 $tasksDirectory = Join-Path $backupRoot "scheduled-tasks"
 $manifestPath = Join-Path $backupRoot "backup-manifest.json"
 $taskNames = @(
@@ -153,7 +179,11 @@ if (Test-Path -LiteralPath $backupRoot) {
 if (-not (Test-Path -LiteralPath $vault -PathType Container)) {
   throw "Vault does not exist: $vault"
 }
+if (-not (Test-Path -LiteralPath $nodeRuntime -PathType Container)) {
+  throw "Manifest-selected Node.js runtime does not exist: $nodeRuntime"
+}
 
+Assert-AsukaNoGitOperation -Repository $vault
 $vaultHead = Get-VaultGitValue -Arguments @("rev-parse", "HEAD")
 $vaultBranch = Get-VaultGitValue -Arguments @("branch", "--show-current")
 $vaultUpstream = Get-VaultGitValue -Arguments @(
@@ -191,11 +221,70 @@ if (
   )
 }
 
+$trustedPowerShell = [IO.Path]::GetFullPath(
+  (Join-Path $PSHOME "powershell.exe")
+)
+$manifestTasks = @(
+  [pscustomobject]@{
+    name = $GatewayTaskName
+    script = $gatewayScript
+  },
+  [pscustomobject]@{
+    name = $SyncTaskName
+    script = $syncScript
+  }
+)
+foreach ($expectedTask in $manifestTasks) {
+  $snapshot = Get-AsukaTaskSnapshot -Name ([string]$expectedTask.name)
+  if ([string]$snapshot.name -cne [string]$expectedTask.name) {
+    throw "Scheduled-task state name does not match the release manifest."
+  }
+  $actions = @($snapshot.actions)
+  if ($actions.Count -ne 1) {
+    throw "$($expectedTask.name) must have exactly one action."
+  }
+  $rawExecute = ([string]$actions[0].execute).Trim()
+  $canonicalExecute = $false
+  if ([IO.Path]::IsPathRooted($rawExecute)) {
+    $canonicalExecute = (
+      [IO.Path]::GetFullPath($rawExecute)
+    ).Equals($trustedPowerShell, [StringComparison]::OrdinalIgnoreCase)
+  }
+  if (
+    -not $canonicalExecute -and
+    -not $rawExecute.Equals(
+      "powershell.exe",
+      [StringComparison]::OrdinalIgnoreCase
+    )
+  ) {
+    throw "$($expectedTask.name) executable does not match the release contract."
+  }
+  $validatedAction = [pscustomobject]@{
+    execute = $trustedPowerShell
+    arguments = [string]$actions[0].arguments
+    workingDirectory = [string]$actions[0].workingDirectory
+  }
+  if (
+    -not (
+      Test-AsukaPowerShellFileAction -Action $validatedAction `
+        -ScriptPath ([string]$expectedTask.script) `
+        -AllowedWorkingDirectory $AppRoot
+    )
+  ) {
+    throw "$($expectedTask.name) action does not match the release contract."
+  }
+}
+
 $taskSnapshot = @($taskNames | ForEach-Object {
-  $task = Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue
-  if ($task) {
+  $tasks = @(Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue)
+  if ($tasks.Count -gt 1) {
+    throw "Scheduled-task lookup is ambiguous: $_"
+  }
+  if ($tasks.Count -eq 1) {
+    $task = $tasks[0]
     [pscustomobject]@{
-      Name = $_
+      Name = [string]$task.TaskName
+      TaskPath = [string]$task.TaskPath
       State = [string]$task.State
       Enabled = [string]$task.State -ne "Disabled"
     }
@@ -203,34 +292,38 @@ $taskSnapshot = @($taskNames | ForEach-Object {
 })
 $criticalHashesBefore = Get-BackupCriticalHashes
 
-New-Item -ItemType Directory -Force -Path $tasksDirectory | Out-Null
-foreach ($taskName in $taskNames) {
-  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-  if ($task) {
-    Export-ScheduledTask -TaskName $taskName |
-      Set-Content -LiteralPath (Join-Path $tasksDirectory "$taskName.xml") -Encoding Unicode
-  }
-}
-
 foreach ($taskName in @($SyncTaskName, $GatewayTaskName)) {
   Disable-ScheduledTask -TaskName $taskName | Out-Null
   Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
   Wait-BackupTaskStopped -Name $taskName
 }
-
-if (Get-NetTCPConnection -LocalPort 19001 -State Listen -ErrorAction SilentlyContinue) {
-  throw "Gateway port 19001 remained open after task stop"
+if (-not (Test-AsukaExclusiveFileAccess -Path $syncLock)) {
+  throw "Memory sync lock remained owned after stopping $SyncTaskName."
 }
+Assert-AsukaGatewayStopped -AppRoot $AppRoot -Port $gatewayPort
+Assert-AsukaNoGitOperation -Repository $vault
 
-$gatewayProcesses = @(Get-CimInstance Win32_Process |
-  Where-Object {
-    $_.Name -match "^(node|powershell)\.exe$" -and
-    $_.CommandLine -match [regex]::Escape($AppRoot) -and
-    $_.CommandLine -match "(openclaw\.mjs.*gateway|asuka-gateway-task\.ps1)"
-  } |
-  Select-Object ProcessId, Name, CommandLine)
-if ($gatewayProcesses.Count -gt 0) {
-  throw "Gateway process remained after task stop: $($gatewayProcesses.ProcessId -join ',')"
+New-Item -ItemType Directory -Force -Path $tasksDirectory | Out-Null
+$taskXml = @()
+foreach ($taskName in $taskNames) {
+  $tasks = @(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)
+  if ($tasks.Count -gt 1) {
+    throw "Scheduled-task lookup is ambiguous: $taskName"
+  }
+  if ($tasks.Count -eq 1) {
+    $task = $tasks[0]
+    $taskXmlPath = Join-Path $tasksDirectory "$taskName.xml"
+    Export-ScheduledTask -TaskName ([string]$task.TaskName) `
+      -TaskPath ([string]$task.TaskPath) |
+      Set-Content -LiteralPath $taskXmlPath -Encoding Unicode
+    if (@($GatewayTaskName, $SyncTaskName) -ccontains $taskName) {
+      $taskXml += [pscustomobject]@{
+        Name = $taskName
+        Path = "scheduled-tasks\$taskName.xml"
+        Sha256 = Get-AsukaSha256 -Path $taskXmlPath
+      }
+    }
+  }
 }
 
 $copies = @()
@@ -242,8 +335,8 @@ $copies += Invoke-BackupRobocopy -Source (Join-Path $AppRoot "obsidian-vault") `
   -Destination (Join-Path $backupRoot "obsidian-vault")
 $copies += Invoke-BackupRobocopy -Source (Join-Path $AppRoot "tools\node_modules\openclaw") `
   -Destination (Join-Path $backupRoot "tools\node_modules\openclaw")
-$copies += Invoke-BackupRobocopy -Source (Join-Path $AppRoot "tools\node-v24.18.0") `
-  -Destination (Join-Path $backupRoot "tools\node-v24.18.0")
+$copies += Invoke-BackupRobocopy -Source $nodeRuntime `
+  -Destination (Join-Path $backupRoot "tools\node-$nodeVersion")
 $copies += Invoke-BackupRobocopy -Source (Join-Path $AppRoot "ssh") `
   -Destination (Join-Path $backupRoot "ssh") -CopyAll
 
@@ -271,12 +364,67 @@ if ($bundleResult.ExitCode -ne 0) {
   throw "Git bundle creation failed."
 }
 
-$manifest = [ordered]@{
+Assert-AsukaNoGitOperation -Repository $vault
+$vaultHeadAfter = Get-VaultGitValue -Arguments @("rev-parse", "HEAD")
+$vaultBranchAfter = Get-VaultGitValue -Arguments @("branch", "--show-current")
+$vaultUpstreamAfter = Get-VaultGitValue -Arguments @(
+  "rev-parse",
+  "--abbrev-ref",
+  "--symbolic-full-name",
+  "@{upstream}"
+)
+$vaultStatusAfter = Get-VaultGitValue -Arguments @(
+  "status",
+  "--porcelain=v1",
+  "--untracked-files=all"
+)
+$vaultAheadAfter = [int](Get-VaultGitValue -Arguments @(
+  "rev-list",
+  "--count",
+  "@{upstream}..HEAD"
+))
+$vaultBehindAfter = [int](Get-VaultGitValue -Arguments @(
+  "rev-list",
+  "--count",
+  "HEAD..@{upstream}"
+))
+if (
+  $vaultHeadAfter -cne $vaultHead -or
+  $vaultBranchAfter -cne $vaultBranch -or
+  $vaultUpstreamAfter -cne $vaultUpstream -or
+  -not [string]::IsNullOrWhiteSpace($vaultStatusAfter) -or
+  $vaultAheadAfter -ne $vaultAhead -or
+  $vaultBehindAfter -ne $vaultBehind
+) {
+  throw "Vault changed while the frozen backup was being copied."
+}
+
+$criticalHashesAfter = @(Get-BackupCriticalHashes)
+if ($criticalHashesAfter.Count -ne $criticalHashesBefore.Count) {
+  throw "Critical source files changed while the frozen backup was being copied."
+}
+$criticalHashesByPath = @{}
+foreach ($entry in $criticalHashesBefore) {
+  $criticalHashesByPath[[string]$entry.Path] = [string]$entry.Sha256
+}
+foreach ($entry in $criticalHashesAfter) {
+  if (
+    -not $criticalHashesByPath.ContainsKey([string]$entry.Path) -or
+    [string]$entry.Sha256 -ne $criticalHashesByPath[[string]$entry.Path]
+  ) {
+    throw "Critical source files changed while the frozen backup was being copied."
+  }
+}
+
+$backupManifest = [ordered]@{
   schemaVersion = 1
   releaseId = $ReleaseId
+  releaseManifestSha256 = $releaseManifestSha256
   backupRoot = $backupRoot
   createdAt = (Get-Date).ToUniversalTime().ToString("o")
   appRoot = $AppRoot
+  gatewayPort = $gatewayPort
+  nodeVersion = $nodeVersion
   vault = [ordered]@{
     branch = $vaultBranch
     upstream = $vaultUpstream
@@ -286,6 +434,7 @@ $manifest = [ordered]@{
     behind = $vaultBehind
   }
   tasksBefore = $taskSnapshot
+  taskXml = $taskXml
   tasksAfter = @(@($GatewayTaskName, $SyncTaskName) | ForEach-Object {
     $task = Get-ScheduledTask -TaskName $_
     [pscustomobject]@{
@@ -294,20 +443,29 @@ $manifest = [ordered]@{
       Enabled = [string]$task.State -ne "Disabled"
     }
   })
-  port19001After = [bool](
-    Get-NetTCPConnection -LocalPort 19001 -State Listen -ErrorAction SilentlyContinue
+  gatewayPortAfter = [bool](
+    Get-NetTCPConnection -LocalPort $gatewayPort -State Listen `
+      -ErrorAction SilentlyContinue
   )
   criticalHashesBefore = $criticalHashesBefore
   copies = $copies
 }
-Write-AsukaJsonFile -Path $manifestPath -Value $manifest
+$verifiedCopies = @(
+  Test-AsukaFrozenCopyIntegrity -Manifest $backupManifest -AppRoot $AppRoot `
+    -BackupPath $backupRoot
+)
+Write-AsukaJsonFile -Path $manifestPath -Value $backupManifest
 Set-Content -LiteralPath (Join-Path $backupRoot "BACKUP_COMPLETE") `
-  -Value $manifest.createdAt -Encoding ASCII
+  -Value $backupManifest.createdAt -Encoding ASCII
 [void](Write-AsukaBackupIntegrity -BackupPath $backupRoot)
 $frozen = Read-AsukaFrozenBackup -Path $backupRoot -AppRoot $AppRoot `
   -GatewayTaskName $GatewayTaskName -SyncTaskName $SyncTaskName -VerifyCurrentHashes
 
-[pscustomobject]@{
+if ($null -ne $lockStream) {
+  Exit-AsukaDeploymentLock -Lease $lockStream
+  $lockStream = $null
+}
+Write-AsukaEnvelope -Ok $true -Operation $operation -Data ([ordered]@{
   Success = $true
   Mode = "freeze"
   BackupRoot = $backupRoot
@@ -317,11 +475,28 @@ $frozen = Read-AsukaFrozenBackup -Path $backupRoot -AppRoot $AppRoot `
   GatewayEnabled = [string](Get-ScheduledTask -TaskName $GatewayTaskName).State -ne "Disabled"
   MemorySyncState = [string](Get-ScheduledTask -TaskName $SyncTaskName).State
   MemorySyncEnabled = [string](Get-ScheduledTask -TaskName $SyncTaskName).State -ne "Disabled"
-  Port19001 = [bool](
-    Get-NetTCPConnection -LocalPort 19001 -State Listen -ErrorAction SilentlyContinue
+  GatewayPort = $gatewayPort
+  GatewayPortListening = [bool](
+    Get-NetTCPConnection -LocalPort $gatewayPort -State Listen `
+      -ErrorAction SilentlyContinue
   )
   Manifest = $manifestPath
+  VerifiedCopies = $verifiedCopies.Count
   FileCount = $frozen.backupIntegrity.fileCount
   Bytes = $frozen.backupIntegrity.bytes
   TreeSha256 = $frozen.backupIntegrity.treeSha256
-} | ConvertTo-Json -Compress
+}) -ErrorMessage $null -ExitCode 0
+} catch {
+  $failure = $_.Exception.Message
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+    $lockStream = $null
+  }
+  Write-AsukaEnvelope -Ok $false -Operation $operation -Data ([ordered]@{
+    backupRoot = $backupRoot
+  }) -ErrorMessage $failure -ExitCode 1
+} finally {
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+  }
+}

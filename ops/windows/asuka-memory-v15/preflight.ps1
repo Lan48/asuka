@@ -12,8 +12,45 @@ $ProgressPreference = "SilentlyContinue"
 Set-StrictMode -Version 2.0
 . (Join-Path $PSScriptRoot "common.ps1")
 $env:GIT_TERMINAL_PROMPT = "0"
+$lockStream = $null
+
+function Assert-AsukaJsonInteger {
+  param(
+    [Parameter(Mandatory = $true)][object]$Object,
+    [Parameter(Mandatory = $true)][string]$Property,
+    [long]$Minimum = [long]::MinValue,
+    [long]$Maximum = [long]::MaxValue
+  )
+
+  if (
+    $null -eq $Object -or
+    -not ($Object.PSObject.Properties.Name -contains $Property)
+  ) {
+    throw "JSON field '$Property' is required."
+  }
+  $value = $Object.$Property
+  if (
+    -not (
+      $value -is [byte] -or
+      $value -is [sbyte] -or
+      $value -is [int16] -or
+      $value -is [uint16] -or
+      $value -is [int32] -or
+      $value -is [uint32] -or
+      $value -is [int64]
+    )
+  ) {
+    throw "JSON field '$Property' must be an integer."
+  }
+  $integer = [long]$value
+  if ($integer -lt $Minimum -or $integer -gt $Maximum) {
+    throw "JSON field '$Property' is outside its allowed range."
+  }
+  return $integer
+}
 
 try {
+  $lockStream = Enter-AsukaDeploymentLock -AppRoot $AppRoot
   if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
     $ReleaseRoot = Split-Path -Parent $PSScriptRoot
   }
@@ -23,9 +60,11 @@ try {
 
   $manifest = Read-AsukaManifest -Path $ManifestPath
   if (
-    -not [string]::IsNullOrWhiteSpace([string]$manifest.appRoot) -and
-    -not ([IO.Path]::GetFullPath([string]$manifest.appRoot)).Equals(
-      [IO.Path]::GetFullPath($AppRoot),
+    [string]::IsNullOrWhiteSpace([string]$manifest.appRoot) -or
+    -not ([IO.Path]::GetFullPath(
+      [string]$manifest.appRoot
+    )).TrimEnd("\").Equals(
+      ([IO.Path]::GetFullPath($AppRoot)).TrimEnd("\"),
       [StringComparison]::OrdinalIgnoreCase
     )
   ) {
@@ -64,17 +103,48 @@ try {
     $parsedPowerShellScripts += [string]$entry.source
   }
 
-  if ([version]$PSVersionTable.PSVersion -lt [version]"5.1") {
-    throw "PowerShell 5.1 or newer is required."
+  if (
+    [string]$PSVersionTable.PSEdition -ne "Desktop" -or
+    [int]$PSVersionTable.PSVersion.Major -ne 5 -or
+    [int]$PSVersionTable.PSVersion.Minor -ne 1
+  ) {
+    throw "Native Windows PowerShell 5.1 Desktop is required."
+  }
+  if (-not [Environment]::Is64BitProcess) {
+    throw "The deployment gate must run in a 64-bit PowerShell process."
+  }
+  $trustedPowerShell = [IO.Path]::GetFullPath(
+    (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")
+  )
+  $currentPowerShell = [IO.Path]::GetFullPath(
+    [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  )
+  $psHomePowerShell = [IO.Path]::GetFullPath(
+    (Join-Path $PSHOME "powershell.exe")
+  )
+  if (
+    -not (Test-Path -LiteralPath $trustedPowerShell -PathType Leaf) -or
+    -not $currentPowerShell.Equals(
+      $trustedPowerShell,
+      [StringComparison]::OrdinalIgnoreCase
+    ) -or
+    -not $psHomePowerShell.Equals(
+      $trustedPowerShell,
+      [StringComparison]::OrdinalIgnoreCase
+    )
+  ) {
+    throw "The deployment gate must run in native System32 Windows PowerShell."
   }
   $os = Get-CimInstance Win32_OperatingSystem
   if ([string]$os.OSArchitecture -notmatch "64") {
     throw "A 64-bit Windows runtime is required."
   }
+  $embeddingVerification = Invoke-AsukaLocalEmbeddingVerification `
+    -ReleaseRoot $ReleaseRoot -TrustedPowerShell $trustedPowerShell `
+    -Manifest $manifest
 
-  $node = Join-Path $AppRoot (
-    "tools\node-{0}\node.exe" -f [string]$manifest.requirements.nodeVersion
-  )
+  $node = Resolve-AsukaNodePath -AppRoot $AppRoot `
+    -NodeVersion ([string]$manifest.requirements.nodeVersion)
   $openClawEntry = Join-Path $AppRoot "tools\node_modules\openclaw\openclaw.mjs"
   $openClawPackage = Join-Path $AppRoot "tools\node_modules\openclaw\package.json"
   $openClawRoot = Join-Path $AppRoot "tools\node_modules\openclaw"
@@ -157,14 +227,20 @@ try {
     throw "Legacy rejudgement model configuration is not resolvable: $($modelProbeResult.Output)"
   }
   $modelProbe = $modelProbeResult.Output.Trim() | ConvertFrom-Json
+  $completionModels = Assert-AsukaJsonInteger -Object $modelProbe `
+    -Property "completionModels" -Minimum 1
+  $networkCalls = Assert-AsukaJsonInteger -Object $modelProbe `
+    -Property "networkCalls" -Minimum 0 -Maximum 0
   if (
-    -not [bool]$modelProbe.ok -or
+    -not (Assert-AsukaJsonBoolean -Object $modelProbe -Property "ok") -or
     [string]$modelProbe.completion -ne "ready" -or
-    [int]$modelProbe.completionModels -lt 1 -or
-    [int]$modelProbe.networkCalls -ne 0
+    $completionModels -lt 1 -or
+    $networkCalls -ne 0
   ) {
     throw "Legacy rejudgement model configuration probe returned an invalid result."
   }
+  $dependencyIntegrity = Test-AsukaRuntimeDependencyTree -Manifest $manifest `
+    -PluginRoot $activePlugin
 
   foreach ($module in @($manifest.requirements.requiredModules)) {
     $modulePackage = Join-Path $activePlugin "node_modules\$module\package.json"
@@ -185,6 +261,16 @@ try {
   if (-not [string]::IsNullOrWhiteSpace($FrozenBackupPath)) {
     $frozenBackup = Read-AsukaFrozenBackup -Path $FrozenBackupPath -AppRoot $AppRoot `
       -GatewayTaskName $gatewayTaskName -SyncTaskName $syncTaskName -VerifyCurrentHashes
+    if (
+      ([string]$frozenBackup.manifest.releaseManifestSha256).ToLowerInvariant() -cne
+        (Get-AsukaSha256 -Path $ManifestPath) -or
+      [int]$frozenBackup.manifest.gatewayPort -ne
+        [int]$manifest.requirements.gatewayPort -or
+      [string]$frozenBackup.manifest.nodeVersion -cne
+        [string]$manifest.requirements.nodeVersion
+    ) {
+      throw "Frozen backup does not match the release manifest, Gateway port, or Node.js version."
+    }
   }
   $gatewayTask = Get-AsukaTaskSnapshot -Name $gatewayTaskName
   $syncTask = Get-AsukaTaskSnapshot -Name $syncTaskName
@@ -254,10 +340,6 @@ try {
   } else {
     $syncStatus = $null
   }
-  if (-not (Test-AsukaExclusiveFileAccess -Path $deployLockPath)) {
-    throw "Another Asuka v1.5 deployment is already running."
-  }
-
   Assert-AsukaNoGitOperation -Repository $vault
   $dirty = Invoke-AsukaGit -Repository $vault -Arguments @(
     "status", "--porcelain", "--", "Asuka/Memory"
@@ -333,7 +415,7 @@ try {
   if ($head.ExitCode -ne 0) {
     throw "Unable to read Vault HEAD: $($head.Output)"
   }
-  Write-AsukaEnvelope -Ok $true -Operation "preflight" -Data ([ordered]@{
+  $result = [ordered]@{
     releaseId = [string]$manifest.releaseId
     releaseFiles = $verifiedReleaseFiles.Count
     parsedPowerShellScripts = $parsedPowerShellScripts
@@ -342,6 +424,7 @@ try {
     powershell = $PSVersionTable.PSVersion.ToString()
     node = $nodeVersion
     openClaw = $openClawVersion
+    localEmbedding = $embeddingVerification
     configValidation = $configValidation.Output.Trim()
     rejudgementModel = $modelProbe
     baselineMode = if ($null -eq $frozenBackup) { "live" } else { "frozen" }
@@ -370,8 +453,23 @@ try {
     )
     requiredFreeBytes = [int64]$requiredFree
     availableFreeBytes = [int64]$drive.Free
-  }) -ErrorMessage $null -ExitCode 0
+    runtimeDependencyTreeSha256 = [string]$dependencyIntegrity.sha256
+  }
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+    $lockStream = $null
+  }
+  Write-AsukaEnvelope -Ok $true -Operation "preflight" -Data $result `
+    -ErrorMessage $null -ExitCode 0
 } catch {
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+    $lockStream = $null
+  }
   Write-AsukaEnvelope -Ok $false -Operation "preflight" -Data $null `
     -ErrorMessage $_.Exception.Message -ExitCode 1
+} finally {
+  if ($null -ne $lockStream) {
+    Exit-AsukaDeploymentLock -Lease $lockStream
+  }
 }

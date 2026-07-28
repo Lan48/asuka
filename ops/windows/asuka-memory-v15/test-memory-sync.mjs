@@ -55,6 +55,7 @@ function gitOutput(cwd, args) {
 }
 
 function configureClone(repo, name) {
+  runGit(repo, ["config", "core.autocrlf", "false"]);
   runGit(repo, ["config", "user.name", name]);
   runGit(repo, ["config", "user.email", `${name.toLowerCase()}@example.invalid`]);
 }
@@ -328,7 +329,7 @@ try {
   assertWorkerContract();
 
   runGit(fixtureRoot, ["init", "--bare", "--initial-branch=main", origin]);
-  runGit(fixtureRoot, ["clone", origin, worker]);
+  runGit(fixtureRoot, ["-c", "core.autocrlf=false", "clone", origin, worker]);
   configureClone(worker, "Worker");
   write(worker, "Asuka/Memory/topic.md", "shared topic\n");
   write(worker, "Asuka/Memory/local-claims.json", '{"claims":[]}\n');
@@ -342,7 +343,7 @@ try {
   ]);
   runGit(worker, ["commit", "-m", "fixture: initialize memory vault"]);
   runGit(worker, ["push", "-u", "origin", "main"]);
-  runGit(fixtureRoot, ["clone", origin, peer]);
+  runGit(fixtureRoot, ["-c", "core.autocrlf=false", "clone", origin, peer]);
   configureClone(peer, "Peer");
 
   ingest(worker, "happy", "scoped memory reaches the origin");
