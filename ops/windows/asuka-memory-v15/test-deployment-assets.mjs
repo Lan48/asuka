@@ -902,6 +902,11 @@ try {
     /function Test-AsukaBackupIntegrity[\s\S]*?function Read-AsukaManifest/,
   )?.[0] ?? "";
   assert.doesNotMatch(backupVerifier, /Assert-AsukaNoReparsePointsInTree/);
+  assert.doesNotMatch(backupVerifier, /Resolve-AsukaChildPath -Root \$backupRoot/);
+  assert.match(
+    backupVerifier,
+    /Resolve-AsukaLexicalChildPath -Root \$backupRoot[\s\S]*?\$actual = Get-AsukaDirectoryIntegrity -Path \$backupRoot/,
+  );
   assert.match(
     backupVerifier,
     /foreach \(\$path in @\(\$manifestPath, \$markerPath\)\) \{[\s\S]*?Assert-AsukaNoReparsePointPath -Root \$backupRoot -Path \$path[\s\S]*?Get-Content -LiteralPath \$markerPath/,

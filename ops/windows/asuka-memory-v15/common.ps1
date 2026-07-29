@@ -448,7 +448,7 @@ function Test-AsukaRuntimeDependencyTree {
   return $integrity
 }
 
-function Resolve-AsukaChildPath {
+function Resolve-AsukaLexicalChildPath {
   param(
     [Parameter(Mandatory = $true)][string]$Root,
     [Parameter(Mandatory = $true)][string]$Relative
@@ -466,6 +466,18 @@ function Resolve-AsukaChildPath {
   ) {
     throw "Path escapes its allowed root: $Relative"
   }
+  return $candidate
+}
+
+function Resolve-AsukaChildPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$Relative
+  )
+
+  $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd("\")
+  $candidate = Resolve-AsukaLexicalChildPath -Root $rootFull `
+    -Relative $Relative
   [void](Assert-AsukaNoReparsePointPath -Root $rootFull -Path $candidate)
   return $candidate
 }
@@ -664,7 +676,8 @@ function Test-AsukaBackupIntegrity {
       throw "Backup file manifest contains a duplicate protected path: $relative"
     }
     $recordPaths[$pathKey] = $true
-    $file = Resolve-AsukaChildPath -Root $backupRoot -Relative $relative
+    $file = Resolve-AsukaLexicalChildPath -Root $backupRoot `
+      -Relative $relative
     $canonicalRelative = $file.Substring($backupRoot.Length).TrimStart("\").Replace("\", "/")
     if (-not $canonicalRelative.Equals($relative, [StringComparison]::OrdinalIgnoreCase)) {
       throw "Backup file manifest contains a non-canonical protected path: $relative"
