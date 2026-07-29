@@ -22,6 +22,7 @@ const OVERRIDES_END = "<!-- ASUKA_MEMORY_OVERRIDES_END -->";
 const PENDING_FILE = ".asuka-memory-pending";
 const SCOPE_FILE = ".asuka-memory-scope.json";
 const SCOPE_MARKER_PREFIX = "<!-- ASUKA_MEMORY_SCOPE ";
+const MEMORY_INDEX_FILE = "Asuka Memory.md";
 
 interface WikiProjectionOptions {
   memoryRoot: string;
@@ -469,7 +470,7 @@ export function projectMemoryWiki(
   }
   const allowLegacyUnbound = existingBinding === undefined;
   const entitiesDirectory = path.join(memoryRoot, "entities");
-  const indexFile = path.join(memoryRoot, "index.md");
+  const indexFile = path.join(memoryRoot, MEMORY_INDEX_FILE);
   const eventScopeMatches = new Map<string, boolean>();
   const eventMatchesScope = (eventId: string): boolean => {
     const cached = eventScopeMatches.get(eventId);

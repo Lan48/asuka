@@ -1210,7 +1210,7 @@ const firstProjection = projectMemoryWiki(
   wikiProjectionOptions,
 );
 assert.equal(firstProjection.pageCount, 1, "only a topic with real claims should generate a page");
-assert.ok(firstProjection.changedFiles.some((file) => file.endsWith("index.md")));
+assert.ok(firstProjection.changedFiles.some((file) => file.endsWith("Asuka Memory.md")));
 const entityFile = firstProjection.changedFiles.find((file) => file.includes(`${path.sep}entities${path.sep}`));
 assert.ok(entityFile);
 

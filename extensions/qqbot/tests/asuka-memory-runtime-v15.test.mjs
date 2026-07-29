@@ -585,6 +585,16 @@ secondRuntime.ledger.applyClaimProposal(otherPeerEventForSameIdentity.eventId, {
   topic: "居住状态",
 });
 
+const genericIndexFile = path.join(memoryRoot, "index.md");
+const genericIndex = [
+  "# Wiki Index",
+  "",
+  "<!-- openclaw:wiki:index:start -->",
+  "- Generic compile output",
+  "<!-- openclaw:wiki:index:end -->",
+  "",
+].join("\n");
+fs.writeFileSync(genericIndexFile, genericIndex, "utf8");
 const projected = await secondRuntime.flushWiki();
 assert.ok(projected?.pageCount);
 assert.equal(fs.existsSync(path.join(memoryRoot, ".asuka-memory-pending")), true);
@@ -595,7 +605,12 @@ const entityFile = fs.readdirSync(path.join(memoryRoot, "entities"))
     && fs.readFileSync(file, "utf8").includes("用户现在住在")
   );
 assert.ok(entityFile, "Wiki projection must create a topic page");
-const indexFile = path.join(memoryRoot, "index.md");
+const indexFile = path.join(memoryRoot, "Asuka Memory.md");
+assert.equal(
+  fs.readFileSync(genericIndexFile, "utf8"),
+  genericIndex,
+  "ledger projection must not overwrite the generic OpenClaw Wiki index",
+);
 const relativeEntity = path.relative(memoryRoot, entityFile)
   .split(path.sep)
   .join("/")
