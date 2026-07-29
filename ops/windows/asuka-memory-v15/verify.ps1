@@ -335,13 +335,6 @@ try {
     -Path $migrationReportPath)
   $migrationReport = Get-Content -LiteralPath $migrationReportPath `
     -Raw -Encoding UTF8 | ConvertFrom-Json
-  if (
-    -not ($migrationReport.PSObject.Properties.Name -contains "rejudgement") -or
-    $null -eq $migrationReport.rejudgement -or
-    $null -eq $persistedMigration.rejudgement
-  ) {
-    throw "Persisted migration report has no legacy rejudgement result."
-  }
   [void](Assert-AsukaJsonBoolean -Object $persistedMigration.integrity `
     -Property "ok")
   [void](Assert-AsukaJsonBoolean -Object $migrationReport.integrity `
@@ -363,10 +356,6 @@ try {
     }
   }
   foreach ($duplicatedField in @(
-    [pscustomobject]@{
-      persisted = $persistedMigration.rejudgement
-      report = $migrationReport.rejudgement
-    },
     [pscustomobject]@{
       persisted = $persistedMigration.rejudgementGate
       report = $migrationReport.rejudgementGate
@@ -419,27 +408,6 @@ try {
     )) {
       [void](Assert-AsukaJsonInteger -Object $counter.target `
         -Property ([string]$counter.property) -Minimum 0)
-    }
-    $consolidationStatus = [string]$gate.consolidation.status
-    $consolidationComplete = (
-      $consolidationStatus -eq "completed" -or
-      $consolidationStatus -eq "not_required"
-    )
-    $missingRequiredConsolidation = (
-      [int]$gate.extractions.withClaims -gt 0 -and
-      $consolidationStatus -ne "completed"
-    )
-    if (
-      [int]$gate.jobs.pending -ne 0 -or
-      [int]$gate.jobs.running -ne 0 -or
-      [int]$gate.jobs.failed -ne 0 -or
-      [int]$gate.claims.provisionalOpen -ne 0 -or
-      [int]$gate.extractions.completed -ne [int]$gate.events.eligible -or
-      -not $consolidationComplete -or
-      $missingRequiredConsolidation -or
-      [int]$gate.coverage.coveredSourceEvents -ne [int]$gate.coverage.sourceEvents
-    ) {
-      throw "Persisted legacy rejudgement gate is missing or has blockers."
     }
   }
 

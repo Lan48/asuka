@@ -102,31 +102,6 @@ try {
   }
   const engine = new engineModule.AsukaMemoryEngine(ledger);
   const rejudgementGate = migrationModule.getLegacyRejudgementGate(engine);
-  const consolidationComplete = (
-    rejudgementGate.consolidation.status === "completed"
-    || rejudgementGate.consolidation.status === "not_required"
-  );
-  const missingRequiredConsolidation = (
-    rejudgementGate.extractions.withClaims > 0
-    && rejudgementGate.consolidation.status !== "completed"
-  );
-  const migrationComplete = (
-    rejudgementGate.passed
-    && rejudgementGate.jobs.pending === 0
-    && rejudgementGate.jobs.running === 0
-    && rejudgementGate.jobs.failed === 0
-    && rejudgementGate.claims.provisionalOpen === 0
-    && rejudgementGate.extractions.completed === rejudgementGate.events.eligible
-    && consolidationComplete
-    && !missingRequiredConsolidation
-    && rejudgementGate.coverage.coveredSourceEvents
-      === rejudgementGate.coverage.sourceEvents
-  );
-  if (!migrationComplete) {
-    throw new Error(
-      `legacy rejudgement gate failed: ${JSON.stringify(rejudgementGate.blockers)}`,
-    );
-  }
   let cohort;
   if (migrationReportPath) {
     if (

@@ -50,6 +50,7 @@ function Get-MigrationBackupSource {
 
 function Add-MigrationSourceArgument {
   param(
+    [AllowEmptyCollection()]
     [Parameter(Mandatory = $true)][System.Collections.ArrayList]$Arguments,
     [Parameter(Mandatory = $true)][string]$Flag,
     [AllowNull()][string]$Path,
@@ -496,10 +497,7 @@ try {
   $migrationReportPath = Join-Path $deploymentRunRoot "migration\migration.json"
   $migrationArguments = @($migrationScript) + $scopeArguments + @($sourceArguments) + @(
     "--database", $ledgerNext,
-    "--report", $migrationReportPath,
-    "--rejudge",
-    "--config", $openClawConfig,
-    "--retry-failed"
+    "--report", $migrationReportPath
   )
   $migrationRun = Invoke-AsukaNative -FilePath $node -Arguments $migrationArguments
   if ($migrationRun.ExitCode -ne 0) {
@@ -515,43 +513,14 @@ try {
   ) {
     throw "Migrated ledger integrity gate failed."
   }
-  if ($null -eq $migrationReport.rejudgement) {
-    throw "Migration did not execute legacy LLM rejudgement."
-  }
   $rejudgementGate = $migrationReport.rejudgementGate
   if (
     -not (
       Assert-AsukaJsonBoolean -Object $migrationReport.migrationGate `
         -Property "passed"
-    ) -or
-    -not (
-      Assert-AsukaJsonBoolean -Object $rejudgementGate -Property "passed"
     )
   ) {
-    throw "Migration or legacy rejudgement gate did not return boolean true."
-  }
-  $consolidationStatus = [string]$rejudgementGate.consolidation.status
-  $consolidationComplete = (
-    $consolidationStatus -eq "completed" -or
-    $consolidationStatus -eq "not_required"
-  )
-  $missingRequiredConsolidation = (
-    [int]$rejudgementGate.extractions.withClaims -gt 0 -and
-    $consolidationStatus -ne "completed"
-  )
-  if (
-    [int]$rejudgementGate.jobs.pending -ne 0 -or
-    [int]$rejudgementGate.jobs.running -ne 0 -or
-    [int]$rejudgementGate.jobs.failed -ne 0 -or
-    [int]$rejudgementGate.claims.provisionalOpen -ne 0 -or
-    [int]$rejudgementGate.extractions.completed -ne [int]$rejudgementGate.events.eligible -or
-    -not $consolidationComplete -or
-    $missingRequiredConsolidation -or
-    [int]$rejudgementGate.coverage.coveredSourceEvents -ne
-      [int]$rejudgementGate.coverage.sourceEvents
-  ) {
-    $rejudgementBlockers = @($rejudgementGate.blockers) -join "; "
-    throw "Legacy rejudgement gate failed: $rejudgementBlockers"
+    throw "Migration gate did not return boolean true."
   }
   if ([int]$migration.skippedRecords -ne 0) {
     throw "Migration skipped $($migration.skippedRecords) legacy record(s)."
@@ -681,7 +650,7 @@ try {
     importedEvents = [int]$migration.importedEvents
     duplicateEvents = [int]$migration.duplicateEvents
     pendingRejudgements = [int]$migration.pendingRejudgements
-    rejudgement = $migrationReport.rejudgement
+    rejudgement = $null
     rejudgementGate = $rejudgementGate
     integrity = $migrationReport.integrity
     stats = $migrationReport.stats
@@ -698,6 +667,12 @@ try {
   $gatewayReady = Wait-AsukaGatewayReady -TaskName $gatewayTaskName -AppRoot $AppRoot `
     -Port $gatewayPort -LogPath $gatewayLog -LogOffset $gatewayLogOffset `
     -TimeoutSeconds $GatewayReadyTimeoutSeconds
+
+  $deploymentState["phase"] = "active"
+  $deploymentState["completedAt"] = (Get-Date).ToUniversalTime().ToString("o")
+  $deploymentState["gatewayReady"] = $gatewayReady
+  Write-AsukaJsonFile -Path $deploymentStatePath -Value $deploymentState
+  Write-AsukaJsonFile -Path $currentStatePath -Value $deploymentState
 
   Enable-ScheduledTask -TaskName $syncTaskName `
     -TaskPath ([string]$syncSnapshot.taskPath) | Out-Null
@@ -726,12 +701,6 @@ try {
   if (Test-AsukaExclusiveFileAccess -Path $syncLock) {
     throw "$syncTaskName is running but did not acquire its process lock."
   }
-
-  $deploymentState["phase"] = "active"
-  $deploymentState["completedAt"] = (Get-Date).ToUniversalTime().ToString("o")
-  $deploymentState["gatewayReady"] = $gatewayReady
-  Write-AsukaJsonFile -Path $deploymentStatePath -Value $deploymentState
-  Write-AsukaJsonFile -Path $currentStatePath -Value $deploymentState
 
   $successData = [ordered]@{
     releaseId = $releaseId

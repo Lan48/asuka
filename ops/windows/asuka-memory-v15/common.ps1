@@ -2618,7 +2618,7 @@ function Wait-AsukaGatewayReady {
     $portReady = Test-AsukaPortListening -Port $Port
     $processReady = @(Get-AsukaGatewayProcesses -AppRoot $AppRoot).Count -gt 0
     $lastText = Read-AsukaLogFromOffset -Path $LogPath -Offset $LogOffset
-    $gatewayReady = $lastText -match "(?i)Gateway ready"
+    $gatewayReady = $lastText -match "(?i)Gateway ready|\[gateway\] ready"
     $connectedMatches = [regex]::Matches(
       $lastText,
       "(?i)WebSocket connected|Session resumed|Ready with .* session:"

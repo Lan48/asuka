@@ -15,7 +15,10 @@ import type {
   MemoryTopLevelType,
 } from "./types.js";
 
-const LEGACY_SOURCE_MAX_NODES = 10_000;
+const LEGACY_SOURCE_MAX_NODES =
+  process.env.ASUKA_LEGACY_SOURCE_MAX_NODES?.trim() === "unlimited"
+    ? Number.POSITIVE_INFINITY
+    : 10_000;
 const LEGACY_SOURCE_MAX_DEPTH = 128;
 const LEGACY_LOCATOR_HASH_DOMAIN = "asuka-legacy-locator-v1";
 

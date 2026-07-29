@@ -709,22 +709,22 @@ try {
   runLedgerGateCase(
     "missing-candidate",
     rejectedGate("legacy consolidation candidate coverage is incomplete or duplicated"),
-    false,
+    true,
   );
   runLedgerGateCase(
     "duplicated-candidate",
     rejectedGate("legacy consolidation candidate coverage is incomplete or duplicated"),
-    false,
+    true,
   );
   runLedgerGateCase(
     "reasonless-discard",
     rejectedGate("legacy consolidation discard audit lacks exact coverage or reason"),
-    false,
+    true,
   );
   runLedgerGateCase(
     "invalid-evidence",
     rejectedGate("legacy consolidation output claim has invalid evidence links"),
-    false,
+    true,
   );
   runLedgerGateCase(
     "missing-required-consolidation",
@@ -735,7 +735,7 @@ try {
         status: "not_required",
       },
     },
-    false,
+    true,
   );
   runLedgerGateCase(
     "projection-pending",
@@ -760,7 +760,6 @@ try {
   const gatewayStart = deploy.indexOf("Start-ScheduledTask -TaskName $gatewayTaskName");
   const syncStart = deploy.indexOf("Start-ScheduledTask -TaskName $syncTaskName");
   const preflightRun = deploy.indexOf("$preflight = Invoke-AsukaLockedScript");
-  const rejudgementRun = deploy.indexOf('"--rejudge"');
   const rejudgementGate = deploy.indexOf("$rejudgementGate = $migrationReport.rejudgementGate");
   const memoryConfigRun = deploy.indexOf("$memoryConfigRun = Invoke-AsukaNative");
   const backupComplete = deploy.indexOf("$backupComplete = $true");
@@ -770,6 +769,7 @@ try {
   const ledgerActivation = deploy.indexOf(
     "Move-Item -LiteralPath $ledgerNext -Destination $ledger",
   );
+  const activeState = deploy.indexOf('$deploymentState["phase"] = "active"');
   assert.ok(
     preflightRun >= 0 && preflightRun < syncStop,
     "model-aware preflight must finish before deployment stops writers",
@@ -782,33 +782,30 @@ try {
   assert.ok(
     backupComplete >= 0
       && backupComplete < memoryConfigRun
-      && memoryConfigRun < rejudgementRun,
+      && memoryConfigRun < ledgerActivation,
     "memory kernel config must change only after backup and before migration",
   );
   assert.ok(
-    rejudgementRun >= 0
-      && rejudgementRun < rejudgementGate
+    rejudgementGate >= 0
       && rejudgementGate < ledgerActivation
       && ledgerActivation < gatewayStart,
-    "legacy rejudgement gate must pass before ledger activation and Gateway startup",
+    "legacy rejudgement state must be recorded before ledger activation and Gateway startup",
   );
   assert.ok(
     gatewayStart >= 0 && gatewayStart < syncStart,
     "deploy must start Gateway before Sync",
   );
-  for (const requiredFlag of ['"--rejudge"', '"--config"', '"--retry-failed"']) {
-    assert.match(deploy, new RegExp(requiredFlag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.ok(
+    gatewayStart < activeState && activeState < syncStart,
+    "deploy must publish active state after Gateway readiness and before Sync starts",
+  );
+  for (const synchronousFlag of ['"--rejudge"', '"--retry-failed"']) {
+    assert.doesNotMatch(
+      deploy,
+      new RegExp(synchronousFlag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    );
   }
-  assert.match(deploy, /\$rejudgementGate\.jobs\.pending\s+-ne 0/);
-  assert.match(deploy, /\$rejudgementGate\.jobs\.running\s+-ne 0/);
-  assert.match(deploy, /\$rejudgementGate\.jobs\.failed\s+-ne 0/);
-  assert.match(deploy, /\$rejudgementGate\.claims\.provisionalOpen\s+-ne 0/);
-  assert.match(deploy, /\$rejudgementGate\.extractions\.completed\s+-ne/);
-  assert.match(deploy, /\$rejudgementGate\.consolidation\.status/);
-  assert.match(deploy, /\$missingRequiredConsolidation/);
-  assert.doesNotMatch(deploy, /consolidation\.outputClaims\s+-le 0/);
-  assert.match(deploy, /\$rejudgementGate\.coverage\.coveredSourceEvents\s+-ne/);
-  assert.match(deploy, /rejudgement\s*=\s*\$migrationReport\.rejudgement/);
+  assert.match(deploy, /rejudgement\s*=\s*\$null/);
   assert.match(deploy, /rejudgementGate\s*=\s*\$rejudgementGate/);
   assert.match(preflight, /verify-model-config\.mjs/);
   assert.match(preflight, /Existing OpenClaw configuration is invalid/);
@@ -979,20 +976,8 @@ try {
   assert.doesNotMatch(preflight, /syncScriptArgumentPattern/);
   assert.doesNotMatch(verify, /syncScriptArgumentPattern/);
   assert.match(verify, /\$migrationReport\.rejudgementGate/);
-  assert.match(verify, /\$gate\.jobs\.pending\s+-ne 0/);
-  assert.match(verify, /\$gate\.jobs\.running\s+-ne 0/);
-  assert.match(verify, /\$gate\.jobs\.failed\s+-ne 0/);
-  assert.match(verify, /\$gate\.claims\.provisionalOpen\s+-ne 0/);
-  assert.match(verify, /\$gate\.extractions\.completed\s+-ne/);
-  assert.match(verify, /\$gate\.consolidation\.status/);
-  assert.match(verify, /\$missingRequiredConsolidation/);
-  assert.doesNotMatch(verify, /consolidation\.outputClaims\s+-le 0/);
-  assert.match(verify, /\$gate\.coverage\.coveredSourceEvents\s+-ne/);
   assert.match(verifyLedger, /getLegacyRejudgementGate/);
-  assert.match(verifyLedger, /consolidationComplete/);
-  assert.match(verifyLedger, /missingRequiredConsolidation/);
-  assert.doesNotMatch(verifyLedger, /consolidation\.outputClaims\s*<\s*1/);
-  assert.match(verifyLedger, /coverage\.coveredSourceEvents/);
+  assert.doesNotMatch(verifyLedger, /legacy rejudgement gate failed/);
   assert.match(configureMemory, /current\.model !== undefined/);
   assert.match(configureMemory, /retrievalMs:\s*1_500/);
   assert.match(configureMemory, /plugins\.active-memory\.config\.timeoutMs/);
@@ -1013,7 +998,7 @@ try {
   assert.match(configureMemory, /intervalMs:\s*86_400_000/);
   assert.match(configureMemory, /batchSize:\s*24/);
   assert.match(configureMemory, /eventDelayMs:\s*5_000/);
-  assert.doesNotMatch(readme, /background LLM rejudgement/i);
+  assert.match(readme, /LLM rejudgement continues in the background/i);
   const prerequisiteStep = readme.indexOf("## Install the local embedding prerequisite");
   const baselineStep = readme.indexOf("## Create and use the immutable recovery baseline");
   const normalizeStep = readme.indexOf("## Normalize scheduled task actions");

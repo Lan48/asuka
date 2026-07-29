@@ -321,25 +321,19 @@ Deployment then:
    and peer paths while preserving explicit model settings. Both foreground
    retrieval and `active-memory` are fixed to 1500 ms; late LLM reranking has a
    separate 60-second background budget.
-4. Migrates frozen legacy sources into `memory-ledger.sqlite.next`, extracts
-   candidates from every eligible record, then globally consolidates all
-   candidates in each identity/visibility scope with the configured LLM.
-5. Requires SQLite integrity, foreign-key integrity, zero skipped records, a
-   source map for every discovered legacy record, zero pending/running/failed
-   extraction jobs, complete source/evidence coverage, exactly one consolidated
-   result or audited discard reason for every candidate, and zero open
-   provisional migration claims. A fully audited all-discard result is valid.
-6. Atomically activates the staged QQBot runtime and ledger only after the
-   extraction and consolidation gate passes.
+4. Migrates every frozen legacy source into `memory-ledger.sqlite.next` with
+   exact provenance and queues candidate extraction and consolidation jobs.
+5. Requires SQLite integrity, foreign-key integrity, zero skipped records, and
+   a source map for every discovered legacy record before activation.
+6. Atomically activates the staged QQBot runtime and ledger, then lets the
+   Gateway process legacy LLM rejudgement in bounded background batches.
 7. Compiles and lints Memory Wiki.
 8. Starts and verifies Gateway before Memory Sync is allowed to start.
 
-Choice A is a one-time full reorganization: legacy facts, inferred material,
-state, digests, reference indexes, and session evidence enter the new ledger
-with provenance. Candidate extraction and global consolidation finish
-synchronously on the staged ledger. Neither the formal ledger nor Gateway is
-activated while an extraction job, unaccounted evidence item, incomplete
-consolidation run, or provisional migration claim remains open.
+Choice A remains a one-time full reorganization: legacy facts, inferred
+material, state, digests, reference indexes, and session evidence enter the new
+ledger with provenance. LLM rejudgement continues in the background after
+Gateway startup, so provider throttling cannot block normal Asuka use.
 
 GitHub push completion is not a runtime success gate. Memory Sync debounces the
 generated Vault changes and retries a queued push without blocking Asuka.
