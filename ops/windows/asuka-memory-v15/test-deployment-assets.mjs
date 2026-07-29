@@ -925,6 +925,9 @@ try {
     freeze,
     /Frozen backup requires a running, enabled baseline/,
   );
+  for (const script of [common, freeze, rollback, createRecoveryBaseline]) {
+    assert.doesNotMatch(script, /\$matches\b/i);
+  }
   assert.match(
     freeze,
     /\$sealedIntegrity = Write-AsukaBackupIntegrity -BackupPath \$backupRoot/,

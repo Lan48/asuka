@@ -25,26 +25,26 @@ function Resolve-AsukaUniqueRecoverySource {
     [switch]$File
   )
 
-  $matches = @()
+  $candidateMatches = @()
   foreach ($relative in $Candidates) {
     $candidate = Resolve-AsukaChildPath -Root $Root -Relative $relative
     $pathType = if ($File) { "Leaf" } else { "Container" }
     if (Test-Path -LiteralPath $candidate -PathType $pathType) {
-      $matches += $candidate
+      $candidateMatches += $candidate
     }
   }
-  if ($matches.Count -eq 0) {
+  if ($candidateMatches.Count -eq 0) {
     throw "Legacy recovery source has no allowlisted $Name layout."
   }
-  if ($matches.Count -ne 1) {
+  if ($candidateMatches.Count -ne 1) {
     throw "Legacy recovery source has an ambiguous $Name layout."
   }
   if ($File) {
-    [void](Assert-AsukaNoReparsePointPath -Root $Root -Path $matches[0])
+    [void](Assert-AsukaNoReparsePointPath -Root $Root -Path $candidateMatches[0])
   } else {
-    Assert-AsukaNoReparsePointsInTree -Path $matches[0]
+    Assert-AsukaNoReparsePointsInTree -Path $candidateMatches[0]
   }
-  return [string]$matches[0]
+  return [string]$candidateMatches[0]
 }
 
 function Copy-AsukaRecoveryTree {

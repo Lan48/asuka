@@ -468,20 +468,20 @@ try {
       xmlPath = Join-Path $snapshotPath "tasks\$syncTaskName.xml"
     }
   )) {
-    $matches = @(
+    $taskMatches = @(
       $taskAttestation.tasks |
         Where-Object { [string]$_.role -ceq [string]$taskContract.role }
     )
     if (
-      $matches.Count -ne 1 -or
-      [string]$matches[0].taskName -cne [string]$taskContract.name -or
-      [string]$matches[0].taskPath -cne [string]$taskContract.taskPath -or
-      [string]$matches[0].canonicalXmlSha256 -notmatch "^[a-fA-F0-9]{64}$" -or
-      (Get-AsukaStringSha256 -Value ([string]$matches[0].canonicalXml)) -cne
-        ([string]$matches[0].canonicalXmlSha256).ToLowerInvariant() -or
+      $taskMatches.Count -ne 1 -or
+      [string]$taskMatches[0].taskName -cne [string]$taskContract.name -or
+      [string]$taskMatches[0].taskPath -cne [string]$taskContract.taskPath -or
+      [string]$taskMatches[0].canonicalXmlSha256 -notmatch "^[a-fA-F0-9]{64}$" -or
+      (Get-AsukaStringSha256 -Value ([string]$taskMatches[0].canonicalXml)) -cne
+        ([string]$taskMatches[0].canonicalXmlSha256).ToLowerInvariant() -or
       (Get-AsukaStringSha256 -Value (
         [IO.File]::ReadAllText([string]$taskContract.xmlPath)
-      )) -cne ([string]$matches[0].canonicalXmlSha256).ToLowerInvariant()
+      )) -cne ([string]$taskMatches[0].canonicalXmlSha256).ToLowerInvariant()
     ) {
       throw "Rollback task XML does not match its canonical attestation."
     }

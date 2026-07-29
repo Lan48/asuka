@@ -291,14 +291,14 @@ $taskSnapshot = @($taskNames | ForEach-Object {
   }
 })
 foreach ($taskName in @($GatewayTaskName, $SyncTaskName)) {
-  $matches = @(
+  $taskMatches = @(
     $taskSnapshot |
       Where-Object { [string]$_.Name -ceq $taskName }
   )
   if (
-    $matches.Count -ne 1 -or
-    [string]$matches[0].State -ne "Running" -or
-    -not [bool]$matches[0].Enabled
+    $taskMatches.Count -ne 1 -or
+    [string]$taskMatches[0].State -ne "Running" -or
+    -not [bool]$taskMatches[0].Enabled
   ) {
     throw "Frozen backup requires a running, enabled baseline: $taskName"
   }

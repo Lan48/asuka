@@ -1479,11 +1479,11 @@ function Read-AsukaTaskNormalizationAttestation {
   }
   $validated = [ordered]@{}
   foreach ($role in @($expectedTasks.Keys)) {
-    $matches = @($tasks | Where-Object { [string]$_.role -ceq $role })
-    if ($matches.Count -ne 1) {
+    $roleMatches = @($tasks | Where-Object { [string]$_.role -ceq $role })
+    if ($roleMatches.Count -ne 1) {
       throw "Task normalization attestation has no unique '$role' task."
     }
-    $task = $matches[0]
+    $task = $roleMatches[0]
     $expectedName = [string]$expectedTasks[$role]
     if (
       [string]$task.taskName -cne $expectedName -or
@@ -1800,15 +1800,15 @@ function Test-AsukaFrozenBackupSemantics {
     throw "Frozen backup must contain exactly two scheduled-task XML records."
   }
   foreach ($taskName in @($GatewayTaskName, $SyncTaskName)) {
-    $matches = @(
+    $taskXmlMatches = @(
       $taskXmlEntries |
         Where-Object { [string]$_.Name -ceq $taskName }
     )
     $expectedRelative = "scheduled-tasks\$taskName.xml"
     if (
-      $matches.Count -ne 1 -or
-      [string]$matches[0].Path -cne $expectedRelative -or
-      [string]$matches[0].Sha256 -notmatch "^[a-fA-F0-9]{64}$"
+      $taskXmlMatches.Count -ne 1 -or
+      [string]$taskXmlMatches[0].Path -cne $expectedRelative -or
+      [string]$taskXmlMatches[0].Sha256 -notmatch "^[a-fA-F0-9]{64}$"
     ) {
       throw "Frozen backup task XML record is invalid: $taskName"
     }
@@ -1816,7 +1816,7 @@ function Test-AsukaFrozenBackupSemantics {
       -Relative $expectedRelative
     if (
       (Get-AsukaSha256 -Path $taskXmlPath) -cne
-        ([string]$matches[0].Sha256).ToLowerInvariant()
+        ([string]$taskXmlMatches[0].Sha256).ToLowerInvariant()
     ) {
       throw "Frozen backup task XML hash is invalid: $taskName"
     }
