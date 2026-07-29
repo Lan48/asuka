@@ -3065,9 +3065,20 @@ await verifyIntegrityInvariant("adjudication parser rejects malformed semantic d
     );
     assert.equal(parse(base).proposals.length, 1);
     assert.equal(
-      parse({ ...base, targetClaimId: null }).proposals[0].targetClaimId,
+      parse({
+        ...base,
+        action: null,
+        targetClaimId: null,
+        validFrom: null,
+        validTo: null,
+        topic: null,
+        entityIds: null,
+        opposingEventIds: null,
+        lifecycle: null,
+        metadata: null,
+      }).proposals[0].targetClaimId,
       undefined,
-      "a null optional target must be treated as omitted",
+      "null optional proposal fields must be treated as omitted",
     );
     assert.throws(
       () => parse({ ...base, disposition: undefined }),
@@ -3174,9 +3185,11 @@ await verifyIntegrityInvariant("adjudication parser rejects malformed semantic d
           epistemicStatus: "explicit",
           sourceKind: "statement",
           confidence: 1,
-          topic: "居住状态",
-          entityIds: ["user"],
-          lifecycle: "bounded",
+          validFrom: null,
+          validTo: null,
+          topic: null,
+          entityIds: null,
+          lifecycle: null,
         }],
         noMemoryReason: null,
       }),

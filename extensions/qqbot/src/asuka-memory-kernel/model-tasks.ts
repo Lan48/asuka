@@ -97,7 +97,7 @@ function strictOptionalModelString(
   maxLength: number,
   errorMessage: string,
 ): string | undefined {
-  if (value === undefined) return undefined;
+  if (value === undefined || value === null) return undefined;
   return strictRequiredModelString(value, maxLength, errorMessage);
 }
 
@@ -120,8 +120,14 @@ function parseValidityInterval(
   value: { validFrom?: unknown; validTo?: unknown },
   errorMessage: string,
 ): { validFrom?: number; validTo?: number } {
-  const hasValidFrom = Object.prototype.hasOwnProperty.call(value, "validFrom");
-  const hasValidTo = Object.prototype.hasOwnProperty.call(value, "validTo");
+  const hasValidFrom = (
+    Object.prototype.hasOwnProperty.call(value, "validFrom")
+    && value.validFrom !== null
+  );
+  const hasValidTo = (
+    Object.prototype.hasOwnProperty.call(value, "validTo")
+    && value.validTo !== null
+  );
   const validFrom = timestampValue(value.validFrom);
   const validTo = timestampValue(value.validTo);
   if (
@@ -201,10 +207,11 @@ function validateProposal(
     throw new Error(`memory proposal ${index} has an invalid confidence`);
   }
   const epistemicStatus = value.epistemicStatus as MemoryEpistemicStatus;
-  if (value.action !== undefined && !ACTIONS.has(value.action as string)) {
+  const rawAction = value.action === null ? undefined : value.action;
+  if (rawAction !== undefined && !ACTIONS.has(rawAction as string)) {
     throw new Error(`memory proposal ${index} has an invalid action`);
   }
-  const action = (value.action ?? "add") as ClaimProposal["action"];
+  const action = (rawAction ?? "add") as ClaimProposal["action"];
   const rawTargetClaimId = value.targetClaimId === null
     ? undefined
     : value.targetClaimId;
@@ -219,10 +226,10 @@ function validateProposal(
   ) {
     throw new Error(`memory proposal ${index} has fields incompatible with ${action}`);
   }
-  if (value.lifecycle !== undefined && !LIFECYCLES.has(value.lifecycle as string)) {
+  if (value.lifecycle != null && !LIFECYCLES.has(value.lifecycle as string)) {
     throw new Error(`memory proposal ${index} has an invalid lifecycle`);
   }
-  const lifecycle = value.lifecycle as ClaimProposal["lifecycle"];
+  const lifecycle = (value.lifecycle ?? undefined) as ClaimProposal["lifecycle"];
   const sourceKind = strictOptionalModelString(
     value.sourceKind,
     40,
@@ -233,14 +240,14 @@ function validateProposal(
     500,
     `memory proposal ${index} has an invalid rationale`,
   );
-  if (value.disposition !== undefined && !DISPOSITIONS.has(value.disposition as string)) {
+  if (value.disposition != null && !DISPOSITIONS.has(value.disposition as string)) {
     throw new Error(`memory proposal ${index} has an invalid disposition`);
   }
-  const disposition = value.disposition as ClaimProposal["disposition"];
+  const disposition = (value.disposition ?? undefined) as ClaimProposal["disposition"];
   if (
     action !== "add"
     && action !== "revise"
-    && value.disposition !== undefined
+    && disposition !== undefined
   ) {
     throw new Error(`memory proposal ${index} has fields incompatible with ${action}`);
   }
@@ -271,7 +278,7 @@ function validateProposal(
   const metadata = value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata)
     ? value.metadata as Record<string, unknown>
     : {};
-  if (value.metadata !== undefined && Object.keys(metadata).length === 0 && (
+  if (value.metadata != null && Object.keys(metadata).length === 0 && (
     !value.metadata || typeof value.metadata !== "object" || Array.isArray(value.metadata)
   )) {
     throw new Error(`memory proposal ${index} has invalid metadata`);
@@ -323,11 +330,11 @@ function presentString(value: unknown, maximum: number): boolean {
 }
 
 function validOptionalTimestamp(value: unknown): boolean {
-  return value === undefined || timestampValue(value) !== undefined;
+  return value == null || timestampValue(value) !== undefined;
 }
 
 function validOptionalStringArray(value: unknown, maximum = 32): boolean {
-  return value === undefined
+  return value == null
     || (
       Array.isArray(value)
       && value.length <= maximum
@@ -367,13 +374,13 @@ function validateLegacyProposal(event: MemoryEvent, value: unknown, index: numbe
     throw new Error(`legacy extraction proposal ${index} has an invalid confidence`);
   }
   if (
-    proposal.action !== undefined
+    proposal.action != null
     && proposal.action !== "add"
   ) {
     throw new Error(`legacy extraction proposal ${index} cannot mutate final claims`);
   }
   if (
-    proposal.lifecycle !== undefined
+    proposal.lifecycle != null
     && !LIFECYCLES.has(proposal.lifecycle as string)
   ) {
     throw new Error(`legacy extraction proposal ${index} has an invalid lifecycle`);
@@ -387,7 +394,7 @@ function validateLegacyProposal(event: MemoryEvent, value: unknown, index: numbe
     throw new Error(`legacy extraction proposal ${index} has an invalid validity interval`);
   }
   if (
-    proposal.topic !== undefined
+    proposal.topic != null
     && !presentString(proposal.topic, LEGACY_PROPOSAL_STRING_LIMITS.topic)
   ) {
     throw new Error(`legacy extraction proposal ${index} has an invalid topic`);
@@ -754,7 +761,7 @@ export function parseLegacyConsolidation(
       throw new Error(`legacy consolidation claim ${index} has an invalid rationale`);
     }
     if (
-      value.lifecycle !== undefined
+      value.lifecycle != null
       && !LIFECYCLES.has(value.lifecycle as string)
     ) {
       throw new Error(`legacy consolidation claim ${index} has an invalid lifecycle`);
@@ -767,7 +774,7 @@ export function parseLegacyConsolidation(
     if (validFrom !== undefined && validTo !== undefined && validTo <= validFrom) {
       throw new Error(`legacy consolidation claim ${index} has an invalid validity interval`);
     }
-    if (value.topic !== undefined && !presentString(value.topic, 160)) {
+    if (value.topic != null && !presentString(value.topic, 160)) {
       throw new Error(`legacy consolidation claim ${index} has an invalid topic`);
     }
     if (!validOptionalStringArray(value.entityIds)) {
@@ -789,7 +796,7 @@ export function parseLegacyConsolidation(
       validTo,
       topic: stringValue(value.topic, 160),
       entityIds: stringArray(value.entityIds),
-      lifecycle: value.lifecycle as ClaimProposal["lifecycle"],
+      lifecycle: (value.lifecycle ?? undefined) as ClaimProposal["lifecycle"],
     };
   });
   const discarded = result.discarded.map((raw, index) => {
