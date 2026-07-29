@@ -223,6 +223,39 @@ const persistentRoot = rootConfig({
     overrideImportIntervalMs: 20,
   },
 });
+const nonStarvingWikiRoot = path.join(temporaryRoot, "non-starving-wiki");
+const nonStarvingRuntime = new AsukaMemoryRuntime(
+  resolveAsukaMemoryKernelConfig(rootConfig({
+    databasePath: path.join(temporaryRoot, "non-starving.sqlite"),
+    worker: { enabled: false },
+    wiki: {
+      enabled: true,
+      memoryRoot: nonStarvingWikiRoot,
+      accountId: "default",
+      peerKind: "direct",
+      peerId: "user-1",
+      identityId,
+      visibility: "private",
+      debounceMs: 30,
+      overrideImportIntervalMs: 30,
+    },
+  })),
+  { allowMissingEmbeddingsForTests: true },
+);
+const repeatedProjectionSignals = setInterval(() => {
+  nonStarvingRuntime.scheduleWikiProjection();
+}, 5);
+try {
+  await wait(50);
+  assert.equal(
+    fs.existsSync(path.join(nonStarvingWikiRoot, "Asuka Memory.md")),
+    true,
+    "continuous claim changes must not starve the bounded Wiki projection window",
+  );
+} finally {
+  clearInterval(repeatedProjectionSignals);
+  await nonStarvingRuntime.close();
+}
 const firstRuntime = new AsukaMemoryRuntime(
   resolveAsukaMemoryKernelConfig(persistentRoot),
   {

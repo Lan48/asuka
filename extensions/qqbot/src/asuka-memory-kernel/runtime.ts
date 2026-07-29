@@ -486,7 +486,7 @@ export class AsukaMemoryRuntime {
     ) {
       return;
     }
-    if (this.wikiTimer) clearTimeout(this.wikiTimer);
+    if (this.wikiTimer) return;
     this.wikiTimer = setTimeout(() => {
       this.wikiTimer = undefined;
       void this.flushWiki().catch((error) => {
