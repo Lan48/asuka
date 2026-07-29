@@ -1536,7 +1536,7 @@ function Read-AsukaTaskNormalizationAttestation {
       throw "Task normalization backup XML hash does not match: $expectedName"
     }
     $expectedXml = Get-AsukaComparableTaskXml -Path $backupXmlPath `
-      -Command $trustedPowerShell -SetCommand
+      -Command ([string]$attestation.trustedPowerShell) -SetCommand
     $attestedXml = Get-AsukaComparableTaskXml `
       -XmlText ([string]$task.canonicalXml)
     if (-not $attestedXml.Equals(

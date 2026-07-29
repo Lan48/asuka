@@ -133,6 +133,16 @@ assert.match(
   taskAttestationReader,
   /System32\\WindowsPowerShell\\v1\.0\\powershell\.exe/,
 );
+assert.match(
+  taskAttestationReader,
+  /Get-AsukaComparableTaskXml -Path \$backupXmlPath[\s\S]*-Command \(\[string\]\$attestation\.trustedPowerShell\) -SetCommand/,
+  "task XML comparison must preserve the casing of the already trusted attested PowerShell path",
+);
+assert.doesNotMatch(
+  taskAttestationReader,
+  /Get-AsukaComparableTaskXml -Path \$backupXmlPath[\s\S]*-Command \$trustedPowerShell -SetCommand/,
+  "task XML comparison must not inject host-dependent Windows path casing",
+);
 
 assert.match(generateManifest, /buildAttestation/);
 assert.match(generateManifest, /runtimeDependencyTree/);
