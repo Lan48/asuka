@@ -3064,6 +3064,11 @@ await verifyIntegrityInvariant("adjudication parser rejects malformed semantic d
       parserLedger.getEvent(source.eventId),
     );
     assert.equal(parse(base).proposals.length, 1);
+    assert.equal(
+      parse({ ...base, targetClaimId: null }).proposals[0].targetClaimId,
+      undefined,
+      "a null optional target must be treated as omitted",
+    );
     assert.throws(
       () => parse({ ...base, disposition: undefined }),
       /missing disposition or rationale/i,
@@ -3107,6 +3112,14 @@ await verifyIntegrityInvariant("adjudication parser rejects malformed semantic d
         disposition: "active",
       }),
       /fields incompatible with delete/i,
+    );
+    assert.throws(
+      () => parse({
+        ...base,
+        action: "revise",
+        targetClaimId: null,
+      }),
+      /fields incompatible with revise/i,
     );
     assert.throws(
       () => parse({ ...base, targetClaimId: "unexpected-target" }),

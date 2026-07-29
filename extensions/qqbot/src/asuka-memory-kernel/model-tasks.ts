@@ -205,13 +205,16 @@ function validateProposal(
     throw new Error(`memory proposal ${index} has an invalid action`);
   }
   const action = (value.action ?? "add") as ClaimProposal["action"];
+  const rawTargetClaimId = value.targetClaimId === null
+    ? undefined
+    : value.targetClaimId;
   const targetClaimId = strictOptionalModelString(
-    value.targetClaimId,
+    rawTargetClaimId,
     200,
     `memory proposal ${index} has an invalid targetClaimId`,
   );
   if (
-    (action === "add" && value.targetClaimId !== undefined)
+    (action === "add" && rawTargetClaimId !== undefined)
     || (action !== "add" && !targetClaimId)
   ) {
     throw new Error(`memory proposal ${index} has fields incompatible with ${action}`);
