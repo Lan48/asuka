@@ -290,6 +290,19 @@ $taskSnapshot = @($taskNames | ForEach-Object {
     }
   }
 })
+foreach ($taskName in @($GatewayTaskName, $SyncTaskName)) {
+  $matches = @(
+    $taskSnapshot |
+      Where-Object { [string]$_.Name -ceq $taskName }
+  )
+  if (
+    $matches.Count -ne 1 -or
+    [string]$matches[0].State -ne "Running" -or
+    -not [bool]$matches[0].Enabled
+  ) {
+    throw "Frozen backup requires a running, enabled baseline: $taskName"
+  }
+}
 $criticalHashesBefore = Get-BackupCriticalHashes
 
 foreach ($taskName in @($SyncTaskName, $GatewayTaskName)) {
@@ -457,9 +470,10 @@ $verifiedCopies = @(
 Write-AsukaJsonFile -Path $manifestPath -Value $backupManifest
 Set-Content -LiteralPath (Join-Path $backupRoot "BACKUP_COMPLETE") `
   -Value $backupManifest.createdAt -Encoding ASCII
-[void](Write-AsukaBackupIntegrity -BackupPath $backupRoot)
-$frozen = Read-AsukaFrozenBackup -Path $backupRoot -AppRoot $AppRoot `
-  -GatewayTaskName $GatewayTaskName -SyncTaskName $SyncTaskName -VerifyCurrentHashes
+$sealedIntegrity = Write-AsukaBackupIntegrity -BackupPath $backupRoot
+$frozen = Test-AsukaFrozenBackupSemantics -Path $backupRoot -AppRoot $AppRoot `
+  -GatewayTaskName $GatewayTaskName -SyncTaskName $SyncTaskName `
+  -BackupIntegrity $sealedIntegrity -VerifyCurrentHashes
 
 if ($null -ne $lockStream) {
   Exit-AsukaDeploymentLock -Lease $lockStream

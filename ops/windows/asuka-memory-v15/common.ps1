@@ -363,20 +363,16 @@ function Sort-AsukaRecordsOrdinal {
     [Parameter(Mandatory = $true)][string]$Property
   )
 
-  $sorted = New-Object System.Collections.ArrayList
-  foreach ($record in @($Records)) {
-    $insertAt = $sorted.Count
-    while (
-      $insertAt -gt 0 -and
-      [StringComparer]::Ordinal.Compare(
-        [string]$sorted[$insertAt - 1].$Property,
-        [string]$record.$Property
-      ) -gt 0
-    ) {
-      $insertAt -= 1
-    }
-    $sorted.Insert($insertAt, $record)
+  $sorted = [object[]]@($Records)
+  $keys = New-Object "string[]" $sorted.Count
+  for ($index = 0; $index -lt $sorted.Count; $index += 1) {
+    $keys[$index] = [string]$sorted[$index].$Property
   }
+  [Array]::Sort(
+    [Array]$keys,
+    [Array]$sorted,
+    [Collections.IComparer][StringComparer]::Ordinal
+  )
   return @($sorted)
 }
 
@@ -438,7 +434,6 @@ function Test-AsukaRuntimeDependencyTree {
 
   $dependencyRoot = Resolve-AsukaChildPath -Root $PluginRoot `
     -Relative ([string]$Manifest.runtimeDependencyTree.path)
-  Assert-AsukaNoReparsePointsInTree -Path $dependencyRoot
   $integrity = Get-AsukaDirectoryIntegrity -Path $dependencyRoot
   if (
     [int]$integrity.fileCount -ne
@@ -601,7 +596,6 @@ function Test-AsukaBackupIntegrity {
 
   $backupRoot = [IO.Path]::GetFullPath($BackupPath).TrimEnd("\")
   [void](Assert-AsukaNoReparsePointPath -Root $backupRoot -Path $backupRoot)
-  Assert-AsukaNoReparsePointsInTree -Path $backupRoot
   $manifestPath = Join-Path $backupRoot "backup-files.json"
   $finalMarkerPath = Join-Path $backupRoot "backup-complete.marker"
   $markerPath = if ($PendingMarker) {
@@ -618,6 +612,7 @@ function Test-AsukaBackupIntegrity {
     @("backup-files.json", "backup-complete.marker")
   }
   foreach ($path in @($manifestPath, $markerPath)) {
+    [void](Assert-AsukaNoReparsePointPath -Root $backupRoot -Path $path)
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
       throw "Backup integrity artifact is missing: $path"
     }
@@ -1698,12 +1693,13 @@ function Test-AsukaFrozenCopyIntegrity {
   return $verified
 }
 
-function Read-AsukaFrozenBackup {
+function Test-AsukaFrozenBackupSemantics {
   param(
     [Parameter(Mandatory = $true)][string]$Path,
     [Parameter(Mandatory = $true)][string]$AppRoot,
     [Parameter(Mandatory = $true)][string]$GatewayTaskName,
     [Parameter(Mandatory = $true)][string]$SyncTaskName,
+    [Parameter(Mandatory = $true)][object]$BackupIntegrity,
     [switch]$VerifyCurrentHashes
   )
 
@@ -1715,7 +1711,6 @@ function Read-AsukaFrozenBackup {
   }
   [void](Assert-AsukaNoReparsePointPath -Root $backupsRoot -Path $backupFull)
 
-  $backupIntegrity = Test-AsukaBackupIntegrity -BackupPath $backupFull
   $manifestPath = Join-Path $backupFull "backup-manifest.json"
   $completeMarker = Join-Path $backupFull "BACKUP_COMPLETE"
   foreach ($required in @($manifestPath, $completeMarker)) {
@@ -1860,8 +1855,23 @@ function Read-AsukaFrozenBackup {
     gatewayTask = $gatewayBefore[0]
     syncTask = $syncBefore[0]
     verifiedCriticalHashes = $verifiedHashes
-    backupIntegrity = $backupIntegrity
+    backupIntegrity = $BackupIntegrity
   }
+}
+
+function Read-AsukaFrozenBackup {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$AppRoot,
+    [Parameter(Mandatory = $true)][string]$GatewayTaskName,
+    [Parameter(Mandatory = $true)][string]$SyncTaskName,
+    [switch]$VerifyCurrentHashes
+  )
+
+  $backupIntegrity = Test-AsukaBackupIntegrity -BackupPath $Path
+  return Test-AsukaFrozenBackupSemantics -Path $Path -AppRoot $AppRoot `
+    -GatewayTaskName $GatewayTaskName -SyncTaskName $SyncTaskName `
+    -BackupIntegrity $backupIntegrity -VerifyCurrentHashes:$VerifyCurrentHashes
 }
 
 function Test-AsukaReleaseFiles {

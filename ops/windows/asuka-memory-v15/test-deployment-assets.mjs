@@ -850,7 +850,7 @@ try {
   assert.match(common, /function Test-AsukaFrozenCopyIntegrity/);
   assert.match(
     common,
-    /Read-AsukaFrozenBackup[\s\S]*Test-AsukaBackupIntegrity -BackupPath \$backupFull/,
+    /Read-AsukaFrozenBackup[\s\S]*Test-AsukaBackupIntegrity -BackupPath \$Path/,
   );
   assert.match(common, /source provenance must be git/);
   assert.match(common, /source branch is empty/);
@@ -858,8 +858,16 @@ try {
   assert.match(common, /source worktree must be clean/);
   assert.match(
     common,
-    /function Sort-AsukaRecordsOrdinal[\s\S]*?\[StringComparer\]::Ordinal\.Compare/,
+    /function Sort-AsukaRecordsOrdinal[\s\S]*?\[StringComparer\]::Ordinal/,
   );
+  const ordinalSorter = common.match(
+    /function Sort-AsukaRecordsOrdinal[\s\S]*?function Get-AsukaDeploymentRunRoot/,
+  )?.[0] ?? "";
+  assert.match(
+    ordinalSorter,
+    /\[Array\]::Sort\([\s\S]*?\[Collections\.IComparer\]\[StringComparer\]::Ordinal/,
+  );
+  assert.doesNotMatch(ordinalSorter, /\.Insert\(/);
   assert.match(
     common,
     /function Get-AsukaDirectoryIntegrity[\s\S]*?\$files = @\(Sort-AsukaRecordsOrdinal -Records @\(\$records\) -Property "path"\)[\s\S]*?function Write-AsukaBackupIntegrity/,
@@ -867,6 +875,13 @@ try {
   assert.match(
     common,
     /function Get-AsukaDirectoryIntegrity[\s\S]*?Get-ChildItem -LiteralPath \$directory -Force -ErrorAction Stop[\s\S]*?\$item\.Attributes -band \[IO\.FileAttributes\]::ReparsePoint[\s\S]*?if \(\$ExcludeReparsePoints\)[\s\S]*?continue[\s\S]*?Directory tree contains an unsupported reparse point/,
+  );
+  const dependencyVerifier = common.match(
+    /function Test-AsukaRuntimeDependencyTree[\s\S]*?function Resolve-AsukaChildPath/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(
+    dependencyVerifier,
+    /Assert-AsukaNoReparsePointsInTree/,
   );
   assert.match(
     common,
@@ -886,6 +901,11 @@ try {
   const backupVerifier = common.match(
     /function Test-AsukaBackupIntegrity[\s\S]*?function Read-AsukaManifest/,
   )?.[0] ?? "";
+  assert.doesNotMatch(backupVerifier, /Assert-AsukaNoReparsePointsInTree/);
+  assert.match(
+    backupVerifier,
+    /foreach \(\$path in @\(\$manifestPath, \$markerPath\)\) \{[\s\S]*?Assert-AsukaNoReparsePointPath -Root \$backupRoot -Path \$path[\s\S]*?Get-Content -LiteralPath \$markerPath/,
+  );
   assert.doesNotMatch(backupVerifier, /Get-AsukaSha256 -Path \$file/);
   assert.doesNotMatch(backupVerifier, /\$records \+=/);
   assert.match(backupVerifier, /\$actualPaths\[\$pathKey\] = \$entry/);
@@ -895,6 +915,22 @@ try {
   assert.match(
     common,
     /Test-AsukaBackupIntegrity -BackupPath \$backupRoot -PendingMarker[\s\S]*?Move-Item -LiteralPath \$pendingMarkerPath -Destination \$markerPath/,
+  );
+  assert.match(
+    freeze,
+    /Frozen backup requires a running, enabled baseline/,
+  );
+  assert.match(
+    freeze,
+    /\$sealedIntegrity = Write-AsukaBackupIntegrity -BackupPath \$backupRoot/,
+  );
+  assert.match(
+    freeze,
+    /Write-AsukaBackupIntegrity -BackupPath \$backupRoot[\s\S]*?Test-AsukaFrozenBackupSemantics[\s\S]*?-BackupIntegrity \$sealedIntegrity -VerifyCurrentHashes/,
+  );
+  assert.doesNotMatch(
+    freeze,
+    /Write-AsukaBackupIntegrity -BackupPath \$backupRoot[\s\S]*?Read-AsukaFrozenBackup/,
   );
   assert.doesNotMatch(
     deploy,
@@ -1517,6 +1553,13 @@ try {
         "    }",
         "  }",
         "}",
+        "$ordinalRecords = @(Sort-AsukaRecordsOrdinal -Records @(",
+        "  [pscustomobject]@{ path = 'a' },",
+        "  [pscustomobject]@{ path = 'B' },",
+        "  [pscustomobject]@{ path = 'A' },",
+        "  [pscustomobject]@{ path = 'b' }",
+        ") -Property 'path')",
+        "if (($ordinalRecords.path -join ',') -cne 'A,B,a,b') { throw 'Ordinal record sorting failed.' }",
         `Assert-AsukaFailure { Read-AsukaManifest -Path '${unknownManifest}' | Out-Null } 'source provenance must be git' 'unknown provenance'`,
         `Assert-AsukaFailure { Read-AsukaManifest -Path '${dirtyManifestPowerShell}' | Out-Null } 'source worktree must be clean' 'dirty provenance'`,
         "$integrityRoot = Join-Path ([IO.Path]::GetTempPath()) ('asuka-backup-integrity-' + [guid]::NewGuid().ToString('N'))",
@@ -1547,6 +1590,11 @@ try {
         "  $extra = Copy-IntegrityFixture -Name 'extra'",
         "  Set-Content -LiteralPath (Join-Path $extra 'payload\\extra.txt') -Value 'extra' -Encoding ASCII",
         "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $extra | Out-Null } 'unmanifested protected file' 'extra protected file'",
+        "  $junctionTarget = Join-Path $integrityRoot 'junction-target'",
+        "  New-Item -ItemType Directory -Force -Path $junctionTarget | Out-Null",
+        "  $junction = Copy-IntegrityFixture -Name 'junction'",
+        "  New-Item -ItemType Junction -Path (Join-Path $junction 'payload\\linked') -Target $junctionTarget | Out-Null",
+        "  Assert-AsukaFailure { Test-AsukaBackupIntegrity -BackupPath $junction | Out-Null } 'unsupported reparse point' 'nested reparse point'",
         "  $sameSize = Copy-IntegrityFixture -Name 'same-size-hash'",
         "  $sameSizeFile = Join-Path $sameSize 'payload\\data.bin'",
         "  $sameSizeBytes = [IO.File]::ReadAllBytes($sameSizeFile)",
