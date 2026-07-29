@@ -9,6 +9,7 @@ import { AsukaMemoryEngine } from "../dist/src/asuka-memory-kernel/engine.js";
 import { AsukaMemoryLedger } from "../dist/src/asuka-memory-kernel/ledger.js";
 import { migrateLegacyRecords } from "../dist/src/asuka-memory-kernel/legacy-migration.js";
 import {
+  parseLegacyExtraction,
   parseMemoryJudgement,
   parseReflectionResult,
 } from "../dist/src/asuka-memory-kernel/model-tasks.js";
@@ -3148,6 +3149,36 @@ await verifyIntegrityInvariant("adjudication parser rejects malformed semantic d
         parserLedger.getEvent(source.eventId),
       ),
       /invalid noMemoryReason/i,
+    );
+    const legacy = parseLegacyExtraction(
+      JSON.stringify({
+        proposals: [{
+          subjectId: "user",
+          predicate: "residence.current_city",
+          value: "杭州",
+          canonicalText: "用户目前住在杭州",
+          topLevelType: "fact",
+          epistemicStatus: "explicit",
+          sourceKind: "statement",
+          confidence: 1,
+          topic: "居住状态",
+          entityIds: ["user"],
+          lifecycle: "bounded",
+        }],
+        noMemoryReason: null,
+      }),
+      parserLedger.getEvent(source.eventId),
+      10,
+    );
+    assert.equal(legacy.proposals.length, 1);
+    assert.equal(legacy.noMemoryReason, undefined);
+    assert.throws(
+      () => parseLegacyExtraction(
+        JSON.stringify({ proposals: [], noMemoryReason: null }),
+        parserLedger.getEvent(source.eventId),
+        10,
+      ),
+      /requires noMemoryReason/i,
     );
 
     const reflectionBase = {

@@ -1199,7 +1199,7 @@ try {
   assert.equal(configuredKernel.migration.consolidationMaxTokens, 9_000);
   assert.equal(configuredKernel.worker.enabled, true);
   assert.equal(configuredKernel.worker.maxJobs, 10);
-  assert.equal(configuredKernel.worker.intervalMs, 1_000);
+  assert.equal(configuredKernel.worker.intervalMs, 30_000);
   assert.equal(configuredKernel.wiki.enabled, true);
   assert.equal(
     configuredKernel.wiki.memoryRoot,

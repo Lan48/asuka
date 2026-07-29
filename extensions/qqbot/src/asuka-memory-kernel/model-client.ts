@@ -237,6 +237,7 @@ function validateTaskOutput(text: string, task: MemoryModelRequest["task"]): voi
     if (
       task === "legacy_extract"
       && parsed.noMemoryReason !== undefined
+      && parsed.noMemoryReason !== null
       && typeof parsed.noMemoryReason !== "string"
     ) {
       throw new Error("legacy extraction contains an invalid noMemoryReason");

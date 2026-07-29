@@ -155,8 +155,8 @@ const memoryKernel = {
   worker: {
     ...currentWorker,
     ...defaults(currentWorker, {
-      intervalMs: 1_000,
-      maxJobs: 25,
+      intervalMs: 30_000,
+      maxJobs: 1,
     }),
     enabled: true,
   },

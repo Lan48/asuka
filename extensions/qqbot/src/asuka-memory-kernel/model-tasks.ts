@@ -476,7 +476,7 @@ export function parseLegacyExtraction(
     );
   }
   const noMemoryReason = strictOptionalModelString(
-    result.noMemoryReason,
+    result.noMemoryReason === null ? undefined : result.noMemoryReason,
     500,
     "legacy extraction has an invalid noMemoryReason",
   );

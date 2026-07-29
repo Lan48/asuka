@@ -136,6 +136,29 @@ for (const invalidContent of ["not JSON", "{}"]) {
   );
 }
 
+{
+  const client = createOpenAICompatibleMemoryModelClient({
+    fallback,
+    fetchImpl: async () => completionResponse(JSON.stringify({
+      proposals: [{
+        subjectId: "user",
+        predicate: "residence.current_city",
+        value: "杭州",
+        canonicalText: "用户目前住在杭州",
+        topLevelType: "fact",
+        epistemicStatus: "explicit",
+        confidence: 1,
+      }],
+      noMemoryReason: null,
+    })),
+  });
+  assert.match(
+    await client.complete(request("legacy_extract")),
+    /"noMemoryReason":null/,
+    "a null optional reason must not discard an otherwise valid extraction",
+  );
+}
+
 for (const [requested, expected] of [[5_000, 5_000], [99_999, 16_000]]) {
   let body;
   const client = createOpenAICompatibleMemoryModelClient({
