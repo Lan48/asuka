@@ -156,9 +156,10 @@ function parseReviewResponse(raw: string, originalText: string): ImmersiveReview
     if (action !== "pass" && action !== "rewrite" && action !== "drop") return null;
     const confidence = Number(parsed.confidence);
     if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
-    const issues = Array.isArray(parsed.issues)
+    let issues = Array.isArray(parsed.issues)
       ? parsed.issues.map(normalizeIssue).filter((item): item is ImmersiveReviewIssue => Boolean(item))
       : [];
+    if (issues.length === 0 && action === "pass") issues = ["none"];
     if (issues.length === 0) return null;
     if (action === "pass") {
       return {

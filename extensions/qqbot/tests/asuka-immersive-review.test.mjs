@@ -64,6 +64,19 @@ function reviewJson(action, visibleText, issues = ["none"], confidence = 0.98) {
 }
 
 {
+  const original = "（揉揉眼睛站起来）饿了？";
+  const result = await reviewImmersiveText(config, {
+    candidateText: original,
+    userText: "我饿了",
+  }, {
+    fetchImpl: async () => ollamaResponse(reviewJson("pass", "模型改过的版本", [])),
+  });
+  assert.equal(result.action, "pass");
+  assert.equal(result.visibleText, original);
+  assert.deepEqual(result.issues, ["none"]);
+}
+
+{
   const leaked = [
     "看上下文，这是从昨晚亲密入睡后直接跳到今天中午了。",
     "",
