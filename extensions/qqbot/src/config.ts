@@ -446,6 +446,8 @@ export function resolveQQBotAccount(
       markdownSupport: qqbot?.markdownSupport ?? true,
       proactiveQuietHours: qqbot?.proactiveQuietHours,
       sceneInference: qqbot?.sceneInference,
+      promiseInference: qqbot?.promiseInference,
+      immersiveReview: qqbot?.immersiveReview,
       messageBufferMs: qqbot?.messageBufferMs,
       messageBufferMaxMs: qqbot?.messageBufferMaxMs,
     };
@@ -467,6 +469,13 @@ export function resolveQQBotAccount(
             ...account?.sceneInference,
           }
         : undefined;
+    const inheritedImmersiveReview =
+      qqbot?.immersiveReview || account?.immersiveReview
+        ? {
+            ...qqbot?.immersiveReview,
+            ...account?.immersiveReview,
+          }
+        : undefined;
     const inheritedMessageBufferMs = account?.messageBufferMs ?? qqbot?.messageBufferMs;
     const inheritedMessageBufferMaxMs = account?.messageBufferMaxMs ?? qqbot?.messageBufferMaxMs;
     accountConfig = {
@@ -475,6 +484,7 @@ export function resolveQQBotAccount(
       productionGateway: account?.productionGateway ?? qqbot?.productionGateway,
       ...(inheritedQuietHours ? { proactiveQuietHours: inheritedQuietHours } : {}),
       ...(inheritedSceneInference ? { sceneInference: inheritedSceneInference } : {}),
+      ...(inheritedImmersiveReview ? { immersiveReview: inheritedImmersiveReview } : {}),
       ...(inheritedMessageBufferMs !== undefined ? { messageBufferMs: inheritedMessageBufferMs } : {}),
       ...(inheritedMessageBufferMaxMs !== undefined ? { messageBufferMaxMs: inheritedMessageBufferMaxMs } : {}),
     };

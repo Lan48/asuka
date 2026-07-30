@@ -23,7 +23,7 @@ import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
 import { formatImageUnderstandingForPrompt, resolveMiniMaxVisionConfig, summarizeImagesForPrompt } from "./utils/minimax-vision.js";
 import { analyzeMiniMaxSearchIntent, formatSearchSummaryForPrompt, queryMiniMaxSearch, resolveMiniMaxSearchConfig } from "./utils/minimax-search.js";
 import { setRefIndex, getRefIndex, getRecentEntriesForPeer, getEntriesForPeerSince, formatRefEntryForAgent, flushRefIndex, type RefAttachmentSummary } from "./ref-index-store.js";
-import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, clearAmbientScheduledJobs, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
+import { appendPromiseFollowUpJob, buildAsukaStatePrompt, cancelPromisesFromUserMessage, clearAmbientScheduledJobs, getSceneSnapshot, markPromiseScheduled, markPromiseScheduleFailed, recordAssistantReply, recordInboundInteraction, refreshSceneState, type AsukaPeerContext } from "./asuka-state.js";
 import { buildAsukaLongTermMemoryPrompt, handleAsukaMemoryControlMessage } from "./asuka-memory.js";
 import {
   captureAsukaAssistantMemory,
@@ -41,6 +41,13 @@ import { removeScheduledDeliveryJobsForPeer } from "./scheduled-delivery-store.j
 import { execOpenClaw, removeCronJobDirect, removeCronJobLive, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { formatZonedDateTimeForPrompt } from "./utils/time-context.js";
 import { resolveBearerTokenFromApiKeyOrProfile } from "./utils/oauth-profile.js";
+import {
+  generateLocalImmersiveFallback,
+  prewarmImmersiveModel,
+  resolveImmersiveReviewConfig,
+  reviewImmersiveEnvelope,
+  type ImmersiveReviewResult,
+} from "./immersive-review.js";
 import {
   generateOfficialOpenClawImageDataUrl,
   hasOfficialOpenClawImageGenerationConfig,
@@ -2123,6 +2130,7 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
     throw new Error(formatQQBotProductionSendGuardError(productionGuard));
   }
   initializeQQBotAsukaMemory(cfg, account.accountId, log);
+  const immersiveReviewConfig = resolveImmersiveReviewConfig(account);
 
   // 启动环境诊断（首次连接时执行）
   const diag = await runDiagnostics();
@@ -2208,6 +2216,17 @@ export async function startGateway(ctx: GatewayContext): Promise<void> {
   abortSignal?.addEventListener("abort", stopDailyDigestScheduler, { once: true });
   const stopScheduledDeliveryRunner = startScheduledDeliveryRunner(account, { log, abortSignal });
   abortSignal?.addEventListener("abort", stopScheduledDeliveryRunner, { once: true });
+  if (immersiveReviewConfig.enabled) {
+    setImmediate(() => {
+      void prewarmImmersiveModel(immersiveReviewConfig).then((ready) => {
+        if (ready) {
+          log?.info(`[qqbot:${account.accountId}] Immersive review model prewarmed: ${immersiveReviewConfig.model}`);
+        } else {
+          log?.error(`[qqbot:${account.accountId}] Immersive review model prewarm failed`);
+        }
+      });
+    });
+  }
 
   let reconnectAttempts = 0;
   let isAborted = false;
@@ -3531,12 +3550,53 @@ ${ttsHint}${sttHint}`;
         const resolveTimeSafeVisibleReplyText = (text: string, _options?: { forceImage?: boolean }): string => {
           return cleanOutgoingTextSegment(text);
         };
+        let hasResponse = false;
+        let hasBlockResponse = false;
+        let userFacingDeliverClaimed = false;
+        const claimUserFacingDeliver = (kind: string, preview: string): boolean => {
+          if (userFacingDeliverClaimed) {
+            log?.info(`[qqbot:${account.accountId}] Skipping duplicate user-facing deliver, kind=${kind}, text=${preview.slice(0, 80)}`);
+            return false;
+          }
+          userFacingDeliverClaimed = true;
+          return true;
+        };
+        const immersiveTechnicalMode = event.type !== "c2c" || /^\/sudo(?:\s|$)/i.test(userContent.trim());
+        const immersiveSceneSnapshot = getSceneSnapshot(asukaPeerContext);
+        const immersiveSceneContext = immersiveSceneSnapshot
+          ? JSON.stringify(immersiveSceneSnapshot)
+          : "当前没有可靠的结构化物理场景";
+        const immersiveReviewCache = new Map<string, Promise<ImmersiveReviewResult>>();
+        const reviewCurrentTurnEnvelope = (candidateText: string): Promise<ImmersiveReviewResult> => {
+          const cached = immersiveReviewCache.get(candidateText);
+          if (cached) return cached;
+          const pending = reviewImmersiveEnvelope(immersiveReviewConfig, {
+            candidateText,
+            userText: userContent,
+            sceneContext: immersiveSceneContext,
+            technicalMode: immersiveTechnicalMode,
+          });
+          immersiveReviewCache.set(candidateText, pending);
+          return pending;
+        };
 
         const sendVisibleReplyTextAndReturn = async (
           text: string,
           options?: { forceImage?: boolean },
         ): Promise<string | null> => {
-          const visibleText = resolveTimeSafeVisibleReplyText(text, options);
+          const reviewed = await reviewCurrentTurnEnvelope(text);
+          if (reviewed.action === "unavailable" || reviewed.action === "drop") {
+            log?.error(
+              `[qqbot:${account.accountId}] Immersive review blocked visible reply: action=${reviewed.action}, error=${reviewed.error ?? "none"}`
+            );
+            return null;
+          }
+          if (reviewed.action === "rewrite") {
+            log?.info(
+              `[qqbot:${account.accountId}] Immersive review rewrote visible reply: issues=${reviewed.issues.join("|")}, confidence=${reviewed.confidence}`
+            );
+          }
+          const visibleText = resolveTimeSafeVisibleReplyText(reviewed.visibleText, options);
           if (!visibleText) {
             return null;
           }
@@ -3563,6 +3623,53 @@ ${ttsHint}${sttHint}`;
 
         const sendVisibleReplyText = async (text: string): Promise<boolean> => {
           return Boolean(await sendVisibleReplyTextAndReturn(text));
+        };
+        const persistReviewedLocalFallback = (text: string): void => {
+          setImmediate(() => {
+            try {
+              captureAsukaAssistantMemory(asukaPeerContext, {
+                text,
+                sourceId: `qqbot-local-fallback:${event.messageId}`,
+                sourceMessageId: `qqbot-local-fallback-delivery:${account.accountId}:${event.messageId}`,
+                dedupeKey: `qqbot-local-fallback:${account.accountId}:${event.messageId}`,
+                metadata: {
+                  source: "qqbot_gateway_local_fallback",
+                  replyToMessageId: event.messageId,
+                  deliveryKind: "local_model_fallback",
+                },
+              }, log);
+              recordAssistantReply(asukaPeerContext, text, []);
+              void refreshSceneState(asukaPeerContext, {
+                trigger: "assistant",
+                text,
+              });
+            } catch (error) {
+              log?.error(`[qqbot:${account.accountId}] Failed to persist reviewed local fallback: ${error}`);
+            }
+          });
+        };
+        const sendLocalModelFallback = async (reason: string): Promise<boolean> => {
+          const candidate = await generateLocalImmersiveFallback(immersiveReviewConfig, {
+            userText: userContent,
+            sceneContext: immersiveSceneContext,
+            recentContext: recentChatTranscript,
+            technicalMode: immersiveTechnicalMode,
+          });
+          if (!candidate) {
+            log?.error(`[qqbot:${account.accountId}] Local model fallback unavailable: ${reason}`);
+            return false;
+          }
+          const sentText = await sendVisibleReplyTextAndReturn(candidate);
+          if (!sentText) {
+            log?.error(`[qqbot:${account.accountId}] Local model fallback failed immersive review: ${reason}`);
+            return false;
+          }
+          persistReviewedLocalFallback(sentText);
+          hasResponse = true;
+          hasBlockResponse = true;
+          userFacingDeliverClaimed = true;
+          log?.info(`[qqbot:${account.accountId}] Sent reviewed local model fallback: ${reason}`);
+          return true;
         };
 
         if (memoryControl.handled) {
@@ -3706,8 +3813,6 @@ ${ttsHint}${sttHint}`;
           const messagesConfig = pluginRuntime.channel.reply.resolveEffectiveMessagesConfig(cfgForCompanionThinking, route.agentId);
 
           // 追踪是否有响应
-          let hasResponse = false;
-          let hasBlockResponse = false; // 是否收到了面向用户的 block 回复
           let toolDeliverCount = 0; // tool deliver 计数
           const toolTexts: string[] = []; // 收集所有 tool deliver 文本（用于格式化展示）
           let toolFallbackSent = false; // 兜底消息是否已发送（只发一次）
@@ -3836,15 +3941,6 @@ ${ttsHint}${sttHint}`;
 
           const dispatchStartedAt = Date.now();
           let dispatchCompleted = false;
-          let userFacingDeliverClaimed = false;
-          const claimUserFacingDeliver = (kind: string, preview: string): boolean => {
-            if (userFacingDeliverClaimed) {
-              log?.info(`[qqbot:${account.accountId}] Skipping duplicate user-facing deliver, kind=${kind}, text=${preview.slice(0, 80)}`);
-              return false;
-            }
-            userFacingDeliverClaimed = true;
-            return true;
-          };
           log?.info(
             `[qqbot:${account.accountId}] Dispatch starting: sessionKey=${route.sessionKey}, agentId=${route.agentId ?? "default"}, bodyLength=${agentBody.length}, images=${imageUrls.length}, localMedia=${localMediaPaths.length}`
           );
@@ -3945,7 +4041,9 @@ ${ttsHint}${sttHint}`;
                 if (payload.isError || looksLikeModelProviderError(replyText)) {
                   log?.error(`[qqbot:${account.accountId}] Suppressed model/provider error in user-facing reply: ${replyText.slice(0, 240)}`);
                   if (!claimUserFacingDeliver(info.kind, replyText)) return;
-                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                  if (!await sendLocalModelFallback("provider_error_deliver")) {
+                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                  }
                   return;
                 }
 
@@ -3974,10 +4072,31 @@ ${ttsHint}${sttHint}`;
                     replyText = rewrittenReply;
                   } else {
                     if (!claimUserFacingDeliver(info.kind, replyText)) return;
-                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                    if (!await sendLocalModelFallback("internal_leak_rewrite_failed")) {
+                      await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                    }
                     return;
                   }
                 }
+
+                const immersiveReviewed = await reviewCurrentTurnEnvelope(payloadSourceText ?? replyText);
+                if (immersiveReviewed.action === "unavailable" || immersiveReviewed.action === "drop") {
+                  log?.error(
+                    `[qqbot:${account.accountId}] Immersive review blocked agent reply: action=${immersiveReviewed.action}, error=${immersiveReviewed.error ?? "none"}`
+                  );
+                  if (!claimUserFacingDeliver(info.kind, replyText)) return;
+                  if (!await sendLocalModelFallback(`immersive_review_${immersiveReviewed.action}`)) {
+                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                  }
+                  return;
+                }
+                if (immersiveReviewed.action === "rewrite") {
+                  log?.info(
+                    `[qqbot:${account.accountId}] Immersive review rewrote agent reply: issues=${immersiveReviewed.issues.join("|")}, confidence=${immersiveReviewed.confidence}`
+                  );
+                }
+                replyText = immersiveReviewed.visibleText;
+                payloadSourceText = null;
 
                 if (!claimUserFacingDeliver(info.kind, replyText)) {
                   return;
@@ -5259,7 +5378,9 @@ ${ttsHint}${sttHint}`;
                   const formatted = formatGatewayDiagnosticValue(err);
                   appendGatewayDiagnosticLine(account.accountId, `deliver caught kind=${info.kind}: ${formatted}`);
                   log?.error(`[qqbot:${account.accountId}] Deliver handler failed: ${formatted}`);
-                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                  if (!await sendLocalModelFallback("deliver_handler_failed")) {
+                    await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                  }
                 }
               },
               onError: async (err: unknown) => {
@@ -5270,13 +5391,7 @@ ${ttsHint}${sttHint}`;
                   timeoutId = null;
                 }
                 
-                // 面向用户只发温和兜底，完整错误留在日志里。
-                const errMsg = String(err);
-                if (errMsg.includes("401") || errMsg.includes("key") || errMsg.includes("auth")) {
-                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
-                } else if (looksLikeModelProviderError(errMsg)) {
-                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
-                } else {
+                if (!await sendLocalModelFallback("dispatch_error")) {
                   await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
                 }
               },
@@ -5323,7 +5438,9 @@ ${ttsHint}${sttHint}`;
                   return;
                 }
               }
-              await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+              if (!await sendLocalModelFallback("response_timeout")) {
+                await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+              }
             }
           } finally {
             // 清理 tool-only 兜底定时器
@@ -5353,13 +5470,17 @@ ${ttsHint}${sttHint}`;
                 }
               }
               if (!hasResponse) {
-                await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                if (!await sendLocalModelFallback("missing_deliver")) {
+                  await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+                }
               }
             }
           }
         } catch (err) {
           log?.error(`[qqbot:${account.accountId}] Message processing failed: ${err}`);
-          await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+          if (!await sendLocalModelFallback("message_processing_failed")) {
+            await sendErrorMessage(buildNaturalTimeoutFallbackText(userContent));
+          }
         }
         } finally {
           clearPendingDispatches(account.accountId, pendingIdsForEvent, "message processing completed", log);

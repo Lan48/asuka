@@ -28,7 +28,7 @@ import { isAudioFile, audioFileToSilkBase64, waitForFile, resolveTTSConfig, appl
 import { normalizeMediaTags } from "./utils/media-tags.js";
 import { checkFileSize, readFileAsync, fileExistsAsync, isLargeFile, formatFileSize } from "./utils/file-utils.js";
 import { isLocalPath as isLocalFilePath, normalizePath, sanitizeFileName, getQQBotDataDir } from "./utils/platform.js";
-import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, formatSceneContinuityVerdictForPrompt, getPromiseRenderContext, getSceneContinuityTextViolation, judgeProactiveDeliveryFreshness, judgeProactiveSceneContinuity, markPromiseDelivered, markPromiseDuplicateSuppressed, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, recordProactiveBeatSuppressed, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext, type AsukaSceneContinuityVerdict } from "./asuka-state.js";
+import { buildAsukaStatePrompt, confirmProactiveDedupDelivery, formatSceneContinuityVerdictForPrompt, getPromiseRenderContext, getSceneContinuityTextViolation, getSceneSnapshot, judgeProactiveDeliveryFreshness, judgeProactiveSceneContinuity, markPromiseDelivered, markPromiseDuplicateSuppressed, markPromiseDeliveryFailed, markPromiseDeliveryFallback, shouldSendAmbient, shouldSendPromiseDelivery, shouldSendPromiseFollowUp, markProactiveDelivered, prepareRepairDelivery, recordProactiveBeatSuppressed, refreshSceneState, releaseProactiveDedupLock, tryAcquireProactiveDedupLock, type AsukaPeerContext, type AsukaSceneContinuityVerdict } from "./asuka-state.js";
 import { buildAsukaProactiveMemoryPrompt } from "./asuka-memory.js";
 import {
   captureAsukaProactiveMemory,
@@ -50,6 +50,11 @@ import {
   generateOfficialOpenClawImageDataUrl,
   hasOfficialOpenClawImageGenerationConfig,
 } from "./utils/openclaw-image-generation.js";
+import {
+  generateLocalImmersiveFallback,
+  resolveImmersiveReviewConfig,
+  reviewImmersiveText,
+} from "./immersive-review.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -3024,21 +3029,31 @@ async function renderPromiseDeliveryText(
   await hydrateProactiveMemoryContext(account, payload, renderContext);
   const transcriptAnchoredFallback = buildTranscriptAnchoredFallbackText(account, payload, renderContext);
   const fallbackText = resolveCronDeliveryFallbackText(payload, transcriptAnchoredFallback);
+  const localFallback = async (): Promise<string> => {
+    const config = resolveImmersiveReviewConfig(account);
+    if (!config.enabled || !config.fallbackGeneration || payload.targetType !== "c2c") return fallbackText;
+    const peerContext = buildPeerContextFromCronPayload(account, payload);
+    return await generateLocalImmersiveFallback(config, {
+      userText: payload.content,
+      sceneContext: JSON.stringify(peerContext ? getSceneSnapshot(peerContext) : null),
+      recentContext: buildRecentConversationTranscript(payload.targetAddress),
+    }) || fallbackText;
+  };
   const sharedSessionText = await renderDeliveryTextFromSharedSession(account, payload, renderContext);
   if (sharedSessionText) {
     console.log(`[qqbot] renderPromiseDeliveryText: using shared session text "${sharedSessionText.slice(0, 160)}"`);
     return sharedSessionText;
   }
   console.warn("[qqbot] renderPromiseDeliveryText: shared session path unavailable, falling back");
-  if (payload.quietBatch) return "";
+  if (payload.quietBatch) return await localFallback();
   if (transcriptAnchoredFallback) {
     console.log(`[qqbot] renderPromiseDeliveryText: transcript-anchored fallback is available if secondary rendering also fails "${transcriptAnchoredFallback.slice(0, 160)}"`);
   }
   const prompt = buildPromiseDeliveryPrompt(account, payload, renderContext);
-  if (!prompt) return fallbackText;
+  if (!prompt) return await localFallback();
 
   const generationConfig = resolvePromiseTextGenerationConfig();
-  if (!generationConfig) return fallbackText;
+  if (!generationConfig) return await localFallback();
   const promptTimeZone = getPromptTimeZone(account);
   const contextText = buildCronDeliveryContextText(account, payload, renderContext);
 
@@ -3068,7 +3083,7 @@ async function renderPromiseDeliveryText(
       const detail = await response.text();
       if (!response.ok) {
         console.warn(`[qqbot] renderPromiseDeliveryText: HTTP ${response.status} ${response.statusText}: ${detail.slice(0, 240)}`);
-        return fallbackText;
+        return await localFallback();
       }
 
       const parsed = JSON.parse(detail);
@@ -3086,10 +3101,10 @@ async function renderPromiseDeliveryText(
       return rendered;
     }
     console.warn(`[qqbot] renderPromiseDeliveryText: exhausted retries after filtered generated fallback reason=${lastRejectReason || "unknown"}`);
-    return fallbackText;
+    return await localFallback();
   } catch (error) {
     console.warn(`[qqbot] renderPromiseDeliveryText: ${error instanceof Error ? error.message : String(error)}`);
-    return fallbackText;
+    return await localFallback();
   }
 }
 
@@ -3851,7 +3866,7 @@ export async function sendProactiveMessage(
   account: ResolvedQQBotAccount,
   to: string,
   text: string,
-  options?: { skipContextRender?: boolean; memoryClaimIds?: string[] },
+  options?: { skipContextRender?: boolean; skipImmersiveReview?: boolean; memoryClaimIds?: string[] },
 ): Promise<OutboundResult> {
   const timestamp = new Date().toISOString();
 
@@ -3928,6 +3943,24 @@ export async function sendProactiveMessage(
       console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed incomplete rendered text: ${deliveryText.slice(0, 160)}`);
       return { channel: "qqbot", skipped: true, skipReason: "incomplete_rendered_text" };
     }
+    if (!cronProbe.isCronPayload && !options?.skipImmersiveReview) {
+      const peerContext = buildOutboundMemoryPeerContext(account, target);
+      const review = await reviewImmersiveText(resolveImmersiveReviewConfig(account), {
+        candidateText: deliveryText,
+        userText: text,
+        sceneContext: JSON.stringify(peerContext ? getSceneSnapshot(peerContext) : null),
+        technicalMode: target.type !== "c2c",
+      });
+      if (review.action === "drop" || review.action === "unavailable") {
+        return {
+          channel: "qqbot",
+          skipped: true,
+          skipReason: review.action === "drop" ? "immersive_review_drop" : "immersive_review_unavailable",
+          retryAfterMs: review.action === "unavailable" ? 60_000 : undefined,
+        };
+      }
+      deliveryText = review.visibleText;
+    }
 
     const textSegments = splitAsukaNarrationSegments(deliveryText);
     if (textSegments.length > 1) {
@@ -3935,6 +3968,7 @@ export async function sendProactiveMessage(
       for (const segment of textSegments) {
         const result = await sendProactiveMessage(account, to, segment, {
           skipContextRender: true,
+          skipImmersiveReview: true,
           memoryClaimIds: generatedFromClaimIds,
         });
         if (result.error || result.skipped) return result;
@@ -4660,7 +4694,7 @@ export async function sendCronMessage(
         };
       }
       const deliverySelection = await selectSafeCronDeliveryText(account, payload, deliveryText, deliveryRenderContext);
-      const safeDeliveryText = deliverySelection.text;
+      let safeDeliveryText = deliverySelection.text;
       if (!safeDeliveryText) {
         const isSemanticDuplicate = Boolean(deliverySelection.rejectReason?.startsWith("proactive_semantic_duplicate"));
         const reason = deliverySelection.rejectReason?.startsWith("scene_continuity_") || isSemanticDuplicate
@@ -4690,6 +4724,25 @@ export async function sendCronMessage(
           retryAfterMs: finalReason.includes("scene_continuity") ? 10 * 60 * 1000 : undefined,
         };
       }
+      const immersiveReview = await reviewImmersiveText(resolveImmersiveReviewConfig(account), {
+        candidateText: safeDeliveryText,
+        userText: payload.content,
+        sceneContext: JSON.stringify(peerContext ? getSceneSnapshot(peerContext) : null),
+        technicalMode: payload.targetType !== "c2c",
+      });
+      if (immersiveReview.action === "drop" || immersiveReview.action === "unavailable") {
+        const reason = immersiveReview.action === "drop"
+          ? "immersive_review_drop"
+          : "immersive_review_unavailable";
+        markCronDeliveryPromisesFailed(payload, reason);
+        return {
+          channel: "qqbot",
+          skipped: true,
+          skipReason: reason,
+          retryAfterMs: immersiveReview.action === "unavailable" ? 60_000 : undefined,
+        };
+      }
+      safeDeliveryText = immersiveReview.visibleText;
       if (!payload.quietBatch) {
         await maybeSendRepairBeforeProactive(account, payload, targetTo, timestamp, runContext, deliveryRenderContext);
       }

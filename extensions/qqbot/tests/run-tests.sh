@@ -26,6 +26,7 @@ node --check dist/src/utils/time-contradiction.js
 echo "[qqbot:test] behavior fixtures"
 node tests/asuka-media-caption.test.mjs
 node tests/asuka-narration.test.mjs
+node tests/asuka-immersive-review.test.mjs
 node tests/asuka-memory.test.mjs
 node tests/asuka-memory-kernel.test.mjs
 node tests/asuka-memory-validity.test.mjs
