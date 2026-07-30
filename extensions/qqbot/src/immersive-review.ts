@@ -326,6 +326,18 @@ export async function reviewImmersiveEnvelope(
         payloadChanged = true;
       }
     }
+    if (isMediaPayload(payload) && payload.caption) {
+      const mediaPayload = payload as MediaPayload;
+      const captionResult = await reviewImmersiveText(config, {
+        ...input,
+        candidateText: mediaPayload.caption ?? "",
+      }, options);
+      if (captionResult.action === "unavailable" || captionResult.action === "drop") return captionResult;
+      if (captionResult.action === "rewrite") {
+        mediaPayload.caption = captionResult.visibleText;
+        payloadChanged = true;
+      }
+    }
     if (isSelfiePayload(payload) && payload.caption) {
       const originalCaption = payload.caption;
       const selfiePayload = payload as SelfiePayload;

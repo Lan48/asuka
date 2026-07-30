@@ -53,6 +53,7 @@ import {
 import {
   generateLocalImmersiveFallback,
   resolveImmersiveReviewConfig,
+  reviewImmersiveEnvelope,
   reviewImmersiveText,
 } from "./immersive-review.js";
 
@@ -3875,18 +3876,35 @@ export async function sendProactiveMessage(
 
   const cronProbe = typeof text === "string" ? decodeCronPayload(text) : { isCronPayload: false as const };
   if (!cronProbe.isCronPayload && containsStructuredPayloadPrefix(text)) {
+    const target = parseTarget(to);
+    const peerContext = buildOutboundMemoryPeerContext(account, target);
+    const reviewed = await reviewImmersiveEnvelope(resolveImmersiveReviewConfig(account), {
+      candidateText: text,
+      userText: text,
+      sceneContext: JSON.stringify(peerContext ? getSceneSnapshot(peerContext) : null),
+      technicalMode: target.type !== "c2c",
+    });
+    if (reviewed.action === "drop" || reviewed.action === "unavailable") {
+      return {
+        channel: "qqbot",
+        skipped: true,
+        skipReason: reviewed.action === "drop" ? "immersive_review_drop" : "immersive_review_unavailable",
+        retryAfterMs: reviewed.action === "unavailable" ? 60_000 : undefined,
+      };
+    }
     return await sendText({
       account,
       accountId: account.accountId,
       to,
-      text,
+      text: reviewed.visibleText,
       replyToId: null,
       skipContextRender: true,
       memoryClaimIds: options?.memoryClaimIds,
     });
   }
 
-  if (!cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
+  const immersiveReviewEnabled = resolveImmersiveReviewConfig(account).enabled;
+  if (!immersiveReviewEnabled && !cronProbe.isCronPayload && looksLikeInternalDeliveryLeak(text)) {
     console.warn(`[${timestamp}] [qqbot] sendProactiveMessage: suppressed internal delivery leak: ${text.slice(0, 160)}`);
     return { channel: "qqbot", skipped: true, skipReason: "internal_delivery_leak" };
   }

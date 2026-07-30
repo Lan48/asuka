@@ -4052,12 +4052,12 @@ ${ttsHint}${sttHint}`;
                   return;
                 }
 
-                if (looksLikeMemoryMaintenanceLeak(replyText)) {
+                if (!immersiveReviewConfig.enabled && looksLikeMemoryMaintenanceLeak(replyText)) {
                   log?.info(`[qqbot:${account.accountId}] Suppressed memory maintenance leak in user-facing block reply: ${replyText.slice(0, 160)}`);
                   return;
                 }
 
-                if (event.type === "c2c" && looksLikeInternalProcessLeak(replyText)) {
+                if (!immersiveReviewConfig.enabled && event.type === "c2c" && looksLikeInternalProcessLeak(replyText)) {
                   log?.info(`[qqbot:${account.accountId}] Suppressed internal process leak in user-facing block reply: ${replyText.slice(0, 160)}`);
                   if (hasStructuredPayloadPrefix(replyText)) {
                     payloadSourceText = replyText;

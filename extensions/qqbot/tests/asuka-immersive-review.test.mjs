@@ -124,6 +124,7 @@ function reviewJson(action, visibleText, issues = ["none"], confidence = 0.98) {
   const responses = [
     reviewJson("rewrite", "（牵住你的手）我先给你弄点吃的。", ["meta_reasoning"]),
     reviewJson("rewrite", "饿了？我陪你去吃饭。", ["transcript_framing"]),
+    reviewJson("pass", "这段不会替换原 caption"),
   ];
   const result = await reviewImmersiveEnvelope(config, {
     candidateText: raw,
@@ -137,6 +138,22 @@ function reviewJson(action, visibleText, issues = ["none"], confidence = 0.98) {
   assert.equal(parsed.isPayload, true);
   assert.equal(parsed.leadingText, "（牵住你的手）我先给你弄点吃的。");
   assert.equal(parsed.payload.path, "饿了？我陪你去吃饭。");
+  assert.equal(parsed.payload.caption, "给你听。");
+}
+
+{
+  const raw = 'QQBOT_PAYLOAD: {"type":"media","mediaType":"image","source":"url","path":"https://example.test/a.jpg","caption":"分析上下文后，我决定发这张图。"}';
+  const result = await reviewImmersiveEnvelope(config, {
+    candidateText: raw,
+    userText: "给我看看",
+  }, {
+    fetchImpl: async () => ollamaResponse(
+      reviewJson("rewrite", "给你看。", ["meta_reasoning"]),
+    ),
+  });
+  const parsed = parseQQBotPayload(result.visibleText);
+  assert.equal(result.action, "rewrite");
+  assert.equal(parsed.payload.caption, "给你看。");
 }
 
 {
