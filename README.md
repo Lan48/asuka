@@ -9,6 +9,7 @@ The repository focuses on:
 - stable Asuka identity and relationship behavior in `workspace/`
 - QQ bot integration in `extensions/qqbot/`
 - selfie generation prompts and scripts in `skills/asuka-selfie/`
+- image prompt quality guidance in `skills/imagegen/`
 - local browser/canvas experiments in `canvas/`
 
 ## Character Direction
@@ -31,7 +32,8 @@ posture without stage exaggeration.
 - `workspace/IDENTITY.md` - stable identity, background, appearance, and notes
 - `workspace/SOUL.md` - runtime behavior, relationship tone, and selfie rules
 - `workspace/AGENTS.md` - workspace startup and operating instructions
-- `skills/asuka-selfie/` - local DashScope / `wan2.6-image` selfie skill
+- `skills/asuka-selfie/` - local Studio OpenAI-compatible media selfie skill
+- `skills/imagegen/` - prompt-quality guidance layered on top of `asuka-selfie`
 - `extensions/qqbot/` - QQ bot extension source and runtime integration
 
 ## Local Configuration
@@ -42,8 +44,9 @@ machine-specific state.
 
 Create or keep `openclaw.json` locally with the required values, including:
 
-- `DASHSCOPE_API_KEY`
-- `DASHSCOPE_MODEL=wan2.6-image`
+- `STUDIO_API_KEY`
+- `STUDIO_API_BASE_URL=https://api.awnjkankwik.asia/studio/v1`
+- `STUDIO_IMAGE_MODEL=third_party_media:gemini-3-pro-image-preview`
 - QQ bot `appId` / `clientSecret`
 - local gateway settings
 
@@ -54,6 +57,7 @@ Useful checks from this workspace:
 ```bash
 node -e "JSON.parse(require('fs').readFileSync('openclaw.json','utf8'))"
 node --check skills/asuka-selfie/bin/cli.js
+test -f skills/imagegen/SKILL.md
 bash -n skills/asuka-selfie/scripts/asuka-selfie.sh
 bash -n skills/asuka-selfie/skill/scripts/asuka-selfie.sh
 cd extensions/qqbot && ./node_modules/.bin/tsc --pretty false
@@ -136,6 +140,34 @@ without QQ credentials, live `openclaw cron` side effects, or image generation:
 |---------|----------|
 | `asuka-runtime.test.mjs` | cron patch validation for vendored/installed runtime files, local runtime health status, missing config/patch reporting, and secret-redaction checks |
 | `asuka-scheduling.test.mjs` | promise cron job counts, delivery failure state, selfie/media failure kind, and fallback sent/skipped/failed metadata |
+| `asuka-tts.test.mjs` | MiniMax `speech-2.8-hd` TTS request shape, dynamic voice settings, length limits, provider failure fallback, and secret redaction |
+| `asuka-vision.test.mjs` | MiniMax image understanding validation, provider failure handling, current-turn-only image summaries, and memory-boundary wording |
+| `asuka-search.test.mjs` | MiniMax web search triggers, intimate-chat non-trigger, query redaction, provider result handling, and current-turn-only search context |
+
+### MiniMax Multimodal Runtime
+
+`openclaw.json` configures MiniMax text, selfie image generation, HD voice,
+image understanding, and web search from the same provider key. Runtime health
+prints only readiness booleans and model IDs:
+
+```text
+minimax: provider=yes, text=yes:MiniMax-M2.7, image=yes:image-01, voice=yes:speech-2.8-hd, vision=yes:MiniMax-VLM, search=yes:MiniMax-M2.7
+```
+
+Relevant config paths:
+
+- `models.providers.minimax` - shared MiniMax `baseUrl`, `apiKey`, and text model.
+- `skills.entries.asuka-selfie.env` - `image-01` generation for Asuka images.
+- `skills.entries.imagegen` - prompt-quality guidance for image requests.
+- `channels.qqbot.tts` - MiniMax `speech-2.8-hd`; default voice is `Chinese (Mandarin)_Laid_BackGirl`.
+- `channels.qqbot.minimax.vision` - inbound image understanding limits and supported types.
+- `channels.qqbot.minimax.search` - freshness-gated web search limits.
+
+Voice replies use `QQBOT_PAYLOAD` audio payloads. Per-turn payloads may override
+`voice`, `speed`, `vol`, `pitch`, `languageBoost`, and `voiceModify`; pauses
+should be placed in the spoken text with MiniMax pause markers such as
+`<#0.4#>`. Image understanding and search results are injected into the current
+reply context only and are not automatically written to long-term memory.
 
 ### Runtime and Media Diagnostics
 

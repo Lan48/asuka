@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "bin",
+    "scripts",
     "src",
     "skills",
     "index.ts",
@@ -30,12 +31,13 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "scripts": {
     "build": "tsc || true",
     "dev": "tsc --watch",
+    "postinstall": "node scripts/patch-runtime-cron.mjs",
     "test": "bash tests/run-tests.sh",
     "test:local": "bash tests/run-tests.sh",
     "prepack": "npm install --omit=dev"
@@ -43,15 +45,19 @@
   "dependencies": {
     "mpg123-decoder": "^1.0.3",
     "silk-wasm": "^3.7.1",
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "undici": "^7.26.0",
     "ws": "^8.18.0"
   },
   "bundledDependencies": [
     "mpg123-decoder",
     "silk-wasm",
+    "sqlite-vec",
+    "undici",
     "ws"
   ],
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.13.3",
     "@types/ws": "^8.5.0",
     "typescript": "^5.9.3"
   },
@@ -64,6 +70,8 @@
   "bundleDependencies": [
     "mpg123-decoder",
     "silk-wasm",
+    "sqlite-vec",
+    "undici",
     "ws"
   ]
 }

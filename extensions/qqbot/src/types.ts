@@ -40,11 +40,31 @@ export interface SceneInferenceConfig {
   enabledOnProactive?: boolean;
 }
 
+export interface PromiseInferenceConfig {
+  enabled?: boolean;
+  primaryModel?: string;
+  fallbackModel?: string;
+}
+
+export interface ImmersiveReviewConfig {
+  enabled?: boolean;
+  endpoint?: string;
+  model?: string;
+  timeoutMs?: number;
+  keepAlive?: string;
+  contextTokens?: number;
+  fallbackGeneration?: boolean;
+}
+
 /**
  * QQ Bot 账户配置
  */
 export interface QQBotAccountConfig {
   enabled?: boolean;
+  /** Must be true, or enabled by env, before this process may connect/send to the production QQ account. */
+  allowProductionSend?: boolean;
+  /** Backward-compatible alias for allowProductionSend. */
+  productionGateway?: boolean;
   name?: string;
   appId?: string;
   clientSecret?: string;
@@ -61,6 +81,14 @@ export interface QQBotAccountConfig {
   proactiveQuietHours?: QQBotProactiveQuietHours;
   /** Asuka 场景推断配置 */
   sceneInference?: SceneInferenceConfig;
+  /** Asuka 承诺识别配置；未配置时复用 sceneInference 的模型选择 */
+  promiseInference?: PromiseInferenceConfig;
+  /** 用户可见正文的本地 LLM 沉浸审校及外部 API 故障回退 */
+  immersiveReview?: ImmersiveReviewConfig;
+  /** 入站普通消息缓冲窗口，单位毫秒；窗口内同一用户的新消息会合并为一次 agent 输入 */
+  messageBufferMs?: number;
+  /** 入站普通消息最长缓冲时间，单位毫秒；防止连续输入导致 agent 永不处理 */
+  messageBufferMaxMs?: number;
   /**
    * @deprecated 请使用 audioFormatPolicy.uploadDirectFormats
    * 可直接上传的音频格式（不转换为 SILK），向后兼容

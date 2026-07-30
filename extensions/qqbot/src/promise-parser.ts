@@ -1,3 +1,9 @@
+import {
+  getOpenAICompletionsThinkingParams,
+  resolveQQBotPromiseInferenceConfig,
+  type OpenAICompletionsModelConfig,
+} from "./config.js";
+
 export type PromiseTriggerKind = "hard" | "soft";
 
 export interface ParsedPromiseScheduleAt {
@@ -30,8 +36,14 @@ interface PromiseParseOptions {
   now?: Date;
   timeZone?: string;
   userText?: string;
+  accountId?: string | null;
+  modelConfig?: OpenAICompletionsModelConfig | null;
+  fetchImpl?: typeof fetch;
+  log?: { warn?: (message: string) => void; info?: (message: string) => void };
+  timeoutMs?: number;
 }
 
+const PROMISE_INFERENCE_TIMEOUT_MS = 5_000;
 const HARD_TRIGGERS = ["拉钩", "约定", "约好了", "发誓"] as const;
 const SOFT_TRIGGER_PATTERNS: Array<{ phrase: string; regex: RegExp }> = [
   { phrase: "我会记得", regex: /我会记得/ },
@@ -49,7 +61,7 @@ const SOFT_TRIGGER_PATTERNS: Array<{ phrase: string; regex: RegExp }> = [
 
 function stripPayloadArtifacts(text: string): string {
   return text
-    .replace(/QQBOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
+    .replace(/Q{1,2}BOT_(?:PAYLOAD|CRON):[\s\S]*$/gi, "")
     .replace(/<qq(?:img|voice|video|file)>[\s\S]*?<\/(?:qqimg|qqvoice|qqvideo|qqfile|img)>/gi, "")
     .replace(/!\[[^\]]*]\([^)]+\)/g, "")
     .replace(/https?:\/\/\S+/g, "")
@@ -57,11 +69,71 @@ function stripPayloadArtifacts(text: string): string {
     .trim();
 }
 
+function trimModelField(value: unknown, limit: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = stripPayloadArtifacts(value)
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > limit ? cleaned.slice(0, limit).trimEnd() : cleaned;
+}
+
 function splitIntoSentences(text: string): string[] {
   return text
     .split(/[\n。！？!?]+/)
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function extractFirstJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < raw.length; index++) {
+    const char = raw[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth++;
+      continue;
+    }
+    if (char === "}") {
+      depth--;
+      if (depth === 0) return raw.slice(start, index + 1);
+    }
+  }
+  return null;
+}
+
+function extractTextFromCompletionPayload(raw: any): string {
+  const messageContent = raw?.choices?.[0]?.message?.content;
+  if (typeof messageContent === "string") return messageContent.trim();
+  if (Array.isArray(messageContent)) {
+    return messageContent
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (typeof item?.text === "string") return item.text;
+        if (typeof item?.content === "string") return item.content;
+        return "";
+      })
+      .join("")
+      .trim();
+  }
+  return "";
 }
 
 function isStandaloneTriggerSentence(sentence: string): boolean {
@@ -358,6 +430,155 @@ function buildRelationNote(sentence: string, triggerKind: PromiseTriggerKind, co
     return "这是一次未完话题的延续承诺。";
   }
   return "这是一次轻度承诺，最好在后续自然接上。";
+}
+
+function resolvePromiseInferenceModels(options?: PromiseParseOptions): OpenAICompletionsModelConfig[] {
+  if (Object.prototype.hasOwnProperty.call(options ?? {}, "modelConfig")) {
+    return options?.modelConfig ? [options.modelConfig] : [];
+  }
+  const resolved = resolveQQBotPromiseInferenceConfig(options?.accountId);
+  if (!resolved.enabled) return [];
+  const models = [resolved.primary, resolved.fallback].filter((item): item is OpenAICompletionsModelConfig => Boolean(item));
+  const seen = new Set<string>();
+  return models.filter((item) => {
+    const key = `${item.baseUrl}\n${item.model}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildPromiseInferencePrompt(replyText: string, userText: string | undefined, now: Date, timeZone?: string): string {
+  return [
+    "你是 Asuka 的承诺判断器，只能输出一个 JSON 对象，不要解释。",
+    "任务: 判断 Asuka 这次回复里是否亲自承诺了未来要对用户做某件可兑现的事。",
+    "承诺必须满足: 说话者是 Asuka/我；动作发生在未来；用户能合理期待她之后主动兑现。",
+    "不要把安慰、态度、愿望、提议、询问、条件句、角色设定、已经完成的动作、只是复述用户的话当承诺。",
+    "可以借助用户上一句补全省略对象，例如用户在要自拍，Asuka 说“晚点发给你”，可以理解为发自拍。",
+    "如果只是“如果你想/可以吗/要不要/我可以”这类未确认提议，输出空数组。",
+    "triggerKind: 出现拉钩/约定/约好了/发誓等强约束时为 hard，否则为 soft。",
+    "deliveryKind: 承诺发自拍、照片、图片时为 selfie，否则为 text。",
+    "promiseText 要是简短中文句子，保留时间和动作；可以补全明确省略的对象，但不要编造新时间或新动作。",
+    "输出格式: {\"promises\":[{\"promiseText\":\"一会儿我来陪你继续聊。\",\"triggerKind\":\"soft\",\"triggerPhrase\":\"LLM语义判断\",\"deliveryKind\":\"text\",\"followUpIntent\":\"主动回来陪对方把话接上。\",\"relationNote\":\"这是一次明确的未来联系承诺。\",\"confidence\":0.86}]}",
+    "最多输出 3 条，按最需要兑现的顺序排列。",
+    `当前时间: ${now.toISOString()}`,
+    `时区: ${resolveTimeZone(timeZone)}`,
+    userText?.trim() ? `用户上一句:\n${stripPayloadArtifacts(userText).slice(0, 800)}` : "用户上一句: none",
+    `Asuka 回复:\n${stripPayloadArtifacts(replyText).slice(0, 1600)}`,
+  ].join("\n");
+}
+
+function parseLlmPromiseOutput(rawText: string, options?: PromiseParseOptions): ParsedPromise[] | null {
+  const jsonText = extractFirstJsonObject(rawText) ?? rawText.trim();
+  if (!jsonText) return null;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+
+  const items = Array.isArray(parsed?.promises) ? parsed.promises : [];
+  const now = options?.now ?? new Date();
+  const contextHint = inferContextHint([options?.userText, items.map((item: any) => item?.promiseText).join(" ")]);
+  const seen = new Set<string>();
+  const results: ParsedPromise[] = [];
+
+  for (const item of items) {
+    const confidence = typeof item?.confidence === "number" ? item.confidence : undefined;
+    if (confidence !== undefined && confidence < 0.55) continue;
+    const promiseText = trimModelField(item?.promiseText, 180);
+    if (!promiseText) continue;
+    const normalizedText = promiseText.replace(/\s+/g, " ").trim();
+    if (!normalizedText || seen.has(normalizedText)) continue;
+
+    const triggerKind: PromiseTriggerKind = item?.triggerKind === "hard" ? "hard" : "soft";
+    const triggerPhrase = trimModelField(item?.triggerPhrase, 40) ?? "LLM语义判断";
+    const detectionText = enrichSentenceWithContext(promiseText, contextHint);
+    const deliveryKind = item?.deliveryKind === "selfie" || item?.deliveryKind === "text"
+      ? item.deliveryKind
+      : deriveDeliveryKind(detectionText, contextHint);
+    const relationNote = trimModelField(item?.relationNote, 120) ?? buildRelationNote(detectionText, triggerKind, contextHint);
+    const followUpIntent = trimModelField(item?.followUpIntent, 160) ?? deriveFollowUpIntent(detectionText, contextHint);
+
+    seen.add(normalizedText);
+    results.push({
+      triggerKind,
+      triggerPhrase,
+      promiseText,
+      normalizedText,
+      relationNote,
+      deliveryKind,
+      schedule: deriveSchedule(detectionText, now, options?.timeZone),
+      followUpIntent,
+    });
+    if (results.length >= 3) break;
+  }
+
+  return results;
+}
+
+async function requestPromiseInference(
+  replyText: string,
+  modelConfig: OpenAICompletionsModelConfig,
+  options?: PromiseParseOptions,
+): Promise<ParsedPromise[] | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options?.timeoutMs ?? PROMISE_INFERENCE_TIMEOUT_MS);
+  try {
+    const fetchImpl = options?.fetchImpl ?? fetch;
+    const now = options?.now ?? new Date();
+    const response = await fetchImpl(`${modelConfig.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${modelConfig.apiKey}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: modelConfig.model,
+        ...getOpenAICompletionsThinkingParams(modelConfig.model, "off"),
+        temperature: 0.1,
+        max_tokens: 420,
+        messages: [
+          {
+            role: "system",
+            content: "你只负责判断 Asuka 回复中的未来承诺，必须只输出 JSON 对象。",
+          },
+          {
+            role: "user",
+            content: buildPromiseInferencePrompt(replyText, options?.userText, now, options?.timeZone),
+          },
+        ],
+      }),
+    });
+    const detail = await response.text();
+    if (!response.ok) {
+      options?.log?.warn?.(`[asuka-promise] LLM promise inference failed: HTTP ${response.status}`);
+      return null;
+    }
+    return parseLlmPromiseOutput(extractTextFromCompletionPayload(JSON.parse(detail)), options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options?.log?.warn?.(`[asuka-promise] LLM promise inference unavailable: ${message}`);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function parseAssistantPromisesWithLlm(replyText: string, options?: PromiseParseOptions): Promise<ParsedPromise[]> {
+  const cleaned = stripPayloadArtifacts(replyText);
+  if (!cleaned) return [];
+
+  const models = resolvePromiseInferenceModels(options);
+  for (const modelConfig of models) {
+    const parsed = await requestPromiseInference(replyText, modelConfig, options);
+    if (parsed) return parsed;
+  }
+
+  return parseAssistantPromises(replyText, options);
 }
 
 export function parseAssistantPromises(replyText: string, options?: PromiseParseOptions): ParsedPromise[] {

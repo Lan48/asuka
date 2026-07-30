@@ -33,7 +33,7 @@ metadata: {"openclaw":{"emoji":"📸","requires":{"config":["channels.qqbot"]}}}
 - 如果你决定这轮不发图，就正常回复文字，不要输出 `QQBOT_PAYLOAD`。
 - 禁止使用 `picsum.photos`、随机网图、占位图、素材图、搜索结果图或任意无关外链冒充 Asuka 自拍。
 - 如果自拍暂时不可用，可以坦白说明当前不能生成自拍，但不要用随机图片兜底。
-- 不要把内部执行过程告诉用户。禁止在对用户的回复里出现“需要调用 asuka-selfie”“让我检查进程/脚本/API 状态”“工具正在执行”这类内部说明。
+- 不要把内部执行过程告诉用户。禁止在对用户的回复里出现“需要调用 asuka-selfie”“根据 imagegen skill”“读取 skill 文件”“让我检查进程/脚本/API 状态”“工具正在执行”这类内部说明。
 - 自拍或发图场景里，用户应看到自然的人设化回复，而不是操作步骤、调试信息或技能名。
 
 ---
@@ -87,6 +87,16 @@ metadata: {"openclaw":{"emoji":"📸","requires":{"config":["channels.qqbot"]}}}
 ```
 
 注意：语音发送需要有可用的音频文件（通常由 TTS 工具生成）。**如果会话上下文中的【语音消息说明】提示 TTS 未配置，则不要使用 `<qqvoice>` 标签。**
+
+当 QQBot 会话提示插件 TTS 已启用时，可以输出 `QQBOT_PAYLOAD` 的 `audio` 载荷，由插件把 `path` 文本转成 QQ 语音。MiniMax TTS 支持在朗读文本内插入停顿和少量语气词控制标签，例如：
+
+```text
+QQBOT_PAYLOAD: {"type":"media","mediaType":"audio","source":"file","path":"(sighs)我在呢。<#0.4#>轻轻抱你一下。","caption":"我用语音说给你听。","tts":{"emotion":"soft","pause":"normal","speed":0.95,"languageBoost":"Chinese"}}
+```
+
+- 停顿标签写作 `<#0.4#>` 这类形式，只放在 `path` 朗读文本里
+- 可少量使用 `(laughs)`、`(sighs)`、`(emm)`、`(breath)` 等 MiniMax 语气词标签，只放在 `path` 朗读文本里
+- `caption` 写用户可见补充，不要重复完整朗读文本，也不要放 TTS 控制标签
 
 ## 发送视频
 

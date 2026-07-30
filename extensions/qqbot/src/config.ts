@@ -1,18 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ResolvedQQBotAccount, QQBotAccountConfig, SceneInferenceConfig } from "./types.js";
+import type { ResolvedQQBotAccount, QQBotAccountConfig, PromiseInferenceConfig, SceneInferenceConfig } from "./types.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 
 export const DEFAULT_ACCOUNT_ID = "default";
 const FALLBACK_CRON_MODEL = "deepseek/deepseek-v4-flash";
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LIGHTWEIGHT_MODEL_HINT_RE = /(mini|small|lite|flash|nano|tiny)/i;
+const PRODUCTION_SEND_ENV_KEYS = [
+  "QQBOT_ALLOW_PRODUCTION_SEND",
+  "QQBOT_ALLOW_SEND",
+  "ASUKA_PRODUCTION_GATEWAY",
+];
 let localOpenClawConfigCache: any | undefined;
 
 export type QQBotDeepSeekThinkingLevel = "off" | "high";
 
-interface OpenAICompletionsModelConfig {
+export interface OpenAICompletionsModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -26,14 +31,74 @@ export interface ResolvedSceneInferenceConfig {
   raw: SceneInferenceConfig;
 }
 
+export interface ResolvedPromiseInferenceConfig {
+  enabled: boolean;
+  primary: OpenAICompletionsModelConfig | null;
+  fallback: OpenAICompletionsModelConfig | null;
+  raw: PromiseInferenceConfig;
+}
+
 interface QQBotChannelConfig extends QQBotAccountConfig {
   accounts?: Record<string, QQBotAccountConfig>;
+}
+
+export interface QQBotProductionSendGuard {
+  allowed: boolean;
+  source?: string;
+  reason?: string;
+}
+
+function isTruthyFlag(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== "string") return false;
+  return /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+export function resolveQQBotProductionSendGuard(
+  account?: Pick<ResolvedQQBotAccount, "accountId" | "config"> | null,
+  env: Record<string, string | undefined> = process.env
+): QQBotProductionSendGuard {
+  if (isTruthyFlag(account?.config?.allowProductionSend)) {
+    return { allowed: true, source: "config:allowProductionSend" };
+  }
+  if (isTruthyFlag(account?.config?.productionGateway)) {
+    return { allowed: true, source: "config:productionGateway" };
+  }
+
+  for (const key of PRODUCTION_SEND_ENV_KEYS) {
+    if (isTruthyFlag(env[key])) {
+      return { allowed: true, source: `env:${key}` };
+    }
+  }
+
+  return {
+    allowed: false,
+    reason:
+      "QQBot production delivery is disabled for this process. Set QQBOT_ALLOW_PRODUCTION_SEND=1 only on the single production gateway host, or set channels.qqbot.allowProductionSend=true for that host.",
+  };
+}
+
+export function formatQQBotProductionSendGuardError(guard: QQBotProductionSendGuard): string {
+  return guard.allowed ? "" : guard.reason ?? "QQBot production delivery is disabled for this process.";
 }
 
 function resolveLocalOpenClawConfigPath(): string {
   const explicit = process.env.OPENCLAW_CONFIG_PATH?.trim();
   if (explicit) return explicit;
   return path.resolve(MODULE_DIR, "../../../../openclaw.json");
+}
+
+function resolveLocalOpenClawScript(stateDir: string): string | undefined {
+  const explicit = process.env.OPENCLAW_SCRIPT?.trim();
+  if (explicit) return explicit;
+  const candidates = [
+    path.resolve(stateDir, "lib", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(stateDir, "..", "..", "tools", "node_modules", "openclaw", "openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+    path.resolve(MODULE_DIR, "../../../../../../tools/node_modules/openclaw/openclaw.mjs"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
 function loadLocalOpenClawConfig(): any {
@@ -53,7 +118,7 @@ function loadLocalOpenClawConfig(): any {
   for (const configPath of candidatePaths) {
     if (!fs.existsSync(configPath)) continue;
     try {
-      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      localOpenClawConfigCache = JSON.parse(fs.readFileSync(configPath, "utf-8").replace(/^\uFEFF/, ""));
       return localOpenClawConfigCache;
     } catch {
       // ignore malformed optional config path and keep searching
@@ -67,11 +132,14 @@ function loadLocalOpenClawConfig(): any {
 export function getQQBotLocalOpenClawEnv(extraEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const configPath = resolveLocalOpenClawConfigPath();
   const stateDir = process.env.OPENCLAW_STATE_DIR?.trim() || path.dirname(configPath);
+  const explicitWrapper = process.env.OPENCLAW_WRAPPER?.trim();
+  const openClawScript = explicitWrapper ? undefined : resolveLocalOpenClawScript(stateDir);
   return {
     ...process.env,
     ...extraEnv,
     OPENCLAW_CONFIG_PATH: configPath,
     OPENCLAW_STATE_DIR: stateDir,
+    ...(openClawScript ? { OPENCLAW_SCRIPT: openClawScript } : {}),
   };
 }
 
@@ -129,6 +197,17 @@ function getInheritedSceneInferenceConfig(qqbot: QQBotChannelConfig | undefined,
   return {
     ...(qqbot.sceneInference ?? {}),
     ...(qqbot.accounts?.[accountId]?.sceneInference ?? {}),
+  };
+}
+
+function getInheritedPromiseInferenceConfig(qqbot: QQBotChannelConfig | undefined, accountId?: string | null): PromiseInferenceConfig {
+  if (!qqbot) return {};
+  const account = accountId && accountId !== DEFAULT_ACCOUNT_ID ? qqbot.accounts?.[accountId] : undefined;
+  return {
+    ...(qqbot.sceneInference ?? {}),
+    ...(account?.sceneInference ?? {}),
+    ...(qqbot.promiseInference ?? {}),
+    ...(account?.promiseInference ?? {}),
   };
 }
 
@@ -263,6 +342,31 @@ export function resolveQQBotSceneInferenceConfig(accountId?: string | null): Res
   };
 }
 
+export function resolveQQBotPromiseInferenceConfig(accountId?: string | null): ResolvedPromiseInferenceConfig {
+  const root = loadLocalOpenClawConfig();
+  if (!root) {
+    return {
+      enabled: true,
+      primary: null,
+      fallback: null,
+      raw: {},
+    };
+  }
+
+  const qqbot = getQQBotChannelConfigFromRoot(root);
+  const raw = getInheritedPromiseInferenceConfig(qqbot, accountId);
+  const fallbackRef = String(raw.fallbackModel || getQQBotLocalPrimaryModel()).trim();
+  const primaryRef = String(raw.primaryModel || pickScenePrimaryModelRef(root, fallbackRef)).trim();
+  const [fallbackProviderId] = fallbackRef.split("/");
+
+  return {
+    enabled: raw.enabled !== false,
+    primary: resolveOpenAICompletionsModel(root, primaryRef, fallbackProviderId),
+    fallback: resolveOpenAICompletionsModel(root, fallbackRef, fallbackProviderId),
+    raw,
+  };
+}
+
 function normalizeAppId(raw: unknown): string {
   if (raw === null || raw === undefined) return "";
   return String(raw).trim();
@@ -329,6 +433,8 @@ export function resolveQQBotAccount(
     // 默认账户从顶层读取
     accountConfig = {
       enabled: qqbot?.enabled,
+      allowProductionSend: qqbot?.allowProductionSend,
+      productionGateway: qqbot?.productionGateway,
       name: qqbot?.name,
       appId: qqbot?.appId,
       clientSecret: qqbot?.clientSecret,
@@ -340,6 +446,10 @@ export function resolveQQBotAccount(
       markdownSupport: qqbot?.markdownSupport ?? true,
       proactiveQuietHours: qqbot?.proactiveQuietHours,
       sceneInference: qqbot?.sceneInference,
+      promiseInference: qqbot?.promiseInference,
+      immersiveReview: qqbot?.immersiveReview,
+      messageBufferMs: qqbot?.messageBufferMs,
+      messageBufferMaxMs: qqbot?.messageBufferMaxMs,
     };
     appId = normalizeAppId(qqbot?.appId);
   } else {
@@ -359,10 +469,24 @@ export function resolveQQBotAccount(
             ...account?.sceneInference,
           }
         : undefined;
+    const inheritedImmersiveReview =
+      qqbot?.immersiveReview || account?.immersiveReview
+        ? {
+            ...qqbot?.immersiveReview,
+            ...account?.immersiveReview,
+          }
+        : undefined;
+    const inheritedMessageBufferMs = account?.messageBufferMs ?? qqbot?.messageBufferMs;
+    const inheritedMessageBufferMaxMs = account?.messageBufferMaxMs ?? qqbot?.messageBufferMaxMs;
     accountConfig = {
       ...(account ?? {}),
+      allowProductionSend: account?.allowProductionSend ?? qqbot?.allowProductionSend,
+      productionGateway: account?.productionGateway ?? qqbot?.productionGateway,
       ...(inheritedQuietHours ? { proactiveQuietHours: inheritedQuietHours } : {}),
       ...(inheritedSceneInference ? { sceneInference: inheritedSceneInference } : {}),
+      ...(inheritedImmersiveReview ? { immersiveReview: inheritedImmersiveReview } : {}),
+      ...(inheritedMessageBufferMs !== undefined ? { messageBufferMs: inheritedMessageBufferMs } : {}),
+      ...(inheritedMessageBufferMaxMs !== undefined ? { messageBufferMaxMs: inheritedMessageBufferMaxMs } : {}),
     };
     appId = normalizeAppId(account?.appId);
   }

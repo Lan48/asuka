@@ -10,13 +10,20 @@ process.env.USERPROFILE = tmpHome;
 const {
   buildLocalRuntimeHealthReport,
   formatLocalRuntimeHealthReport,
+  getDefaultInstalledOpenClawCronTargets,
   validateCronPatchText,
   validateRuntimeCronPatch,
 } = await import("../dist/src/runtime-diagnostics.js");
+const {
+  formatQQBotProductionSendGuardError,
+  resolveQQBotAccount,
+  resolveQQBotProductionSendGuard,
+} = await import("../dist/src/config.js");
 
 const goodPatch = `
 const EXACT_FORWARD_HEADER_LINES = ["这是一次纯转发任务。"];
 const CRON_PAYLOAD_PREFIX = "QQBOT_CRON:";
+const CRON_EXACT_FORWARD_PROMPT_PREFIX_RE = /^\\[cron:[^\\]]+\\]\\s*/;
 function validateCronPayloadText(text) { return text.includes(CRON_PAYLOAD_PREFIX) ? null : "bad"; }
 function extractExactForwardMessage(message) { return { matched: true, text: message }; }
 async function runCronIsolatedAgentTurn(params) {
@@ -91,8 +98,103 @@ assert.ok(
   "bad installed bundle should include missing snippet reasons"
 );
 
+const discoveredStateDir = path.join(fixtureDir, "discovered-state");
+const homeLibPackageRoot = path.join(discoveredStateDir, "lib", "node_modules", "openclaw");
+const toolsPackageRoot = path.join(discoveredStateDir, "tools", "node-v22.22.0", "lib", "node_modules", "openclaw");
+for (const packageRoot of [homeLibPackageRoot, toolsPackageRoot]) {
+  fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "openclaw", version: "2026.7.1-2" }));
+}
+fs.writeFileSync(path.join(homeLibPackageRoot, "dist", "gateway-cli-home.js"), goodPatch);
+fs.writeFileSync(path.join(toolsPackageRoot, "dist", "isolated-agent-tools.js"), goodPatch);
+fs.writeFileSync(
+  path.join(toolsPackageRoot, "dist", "isolated-agent-wrapper.js"),
+  'export { runCronIsolatedAgentTurn } from "./isolated-agent-tools.js";\n'
+);
+
+const discoveredTargets = getDefaultInstalledOpenClawCronTargets(
+  tmpHome,
+  { OPENCLAW_STATE_DIR: discoveredStateDir },
+  path.join(fixtureDir, "unrelated-bin", "node")
+);
+assert.deepEqual(
+  discoveredTargets.map((target) => target.kind).sort(),
+  ["home_lib_openclaw", "tools_openclaw"],
+  "runtime discovery should include both compatibility home and actual tools OpenClaw packages"
+);
+assert.equal(
+  discoveredTargets.find((target) => target.kind === "tools_openclaw")?.bundlePaths.length,
+  1,
+  "runtime discovery should select the cron implementation bundle and ignore re-export wrappers"
+);
+
+const discoveredReport = validateRuntimeCronPatch({
+  vendoredRunnerPath: vendoredGood,
+  includeInstalled: true,
+  homeDir: tmpHome,
+  env: { OPENCLAW_STATE_DIR: discoveredStateDir },
+  execPath: path.join(fixtureDir, "unrelated-bin", "node"),
+});
+assert.equal(discoveredReport.status, "pass", "discovered home and tools runtime bundles should both validate");
+assert.equal(discoveredReport.targets.length, 3, "report should include vendored, home, and tools cron implementations");
+
+const unsupportedPackageRoot = path.join(fixtureDir, "unsupported-openclaw");
+fs.mkdirSync(path.join(unsupportedPackageRoot, "dist"), { recursive: true });
+fs.writeFileSync(path.join(unsupportedPackageRoot, "package.json"), JSON.stringify({ name: "openclaw", version: "future" }));
+fs.writeFileSync(path.join(unsupportedPackageRoot, "dist", "gateway-cli-future.js"), "export const unrelated = true;\n");
+const unsupportedDiscovery = validateRuntimeCronPatch({
+  vendoredRunnerPath: vendoredGood,
+  includeInstalled: true,
+  installedRequired: false,
+  homeDir: tmpHome,
+  env: { OPENCLAW_RUNTIME_ROOTS: unsupportedPackageRoot },
+  execPath: path.join(fixtureDir, "unrelated-bin", "node"),
+});
+assert.equal(unsupportedDiscovery.status, "fail", "a discovered OpenClaw package with unknown bundle anchors must fail closed");
+assert.ok(
+  unsupportedDiscovery.targets.some((target) => target.reasons.includes("cron-implementation-bundle-not-found")),
+  "unknown OpenClaw bundle layout should include an actionable discovery reason"
+);
+
 const realVendored = validateRuntimeCronPatch({ includeInstalled: false });
 assert.equal(realVendored.status, "pass", "current vendored clawdbot cron runner should preserve QQBOT_CRON patch");
+
+const guardedAccount = resolveQQBotAccount({
+  channels: {
+    qqbot: {
+      appId: "app-id",
+      clientSecret: "super-secret-client-secret",
+      enabled: true,
+    },
+  },
+});
+const blockedGuard = resolveQQBotProductionSendGuard(guardedAccount, {});
+assert.equal(blockedGuard.allowed, false, "QQBot production delivery should be blocked unless explicitly allowed");
+assert.match(
+  formatQQBotProductionSendGuardError(blockedGuard),
+  /QQBot production delivery is disabled/,
+  "blocked production guard should explain the missing explicit allow flag",
+);
+assert.equal(
+  resolveQQBotProductionSendGuard(guardedAccount, { QQBOT_ALLOW_PRODUCTION_SEND: "1" }).allowed,
+  true,
+  "QQBot production delivery should allow the explicit production env flag",
+);
+const configAllowedAccount = resolveQQBotAccount({
+  channels: {
+    qqbot: {
+      appId: "app-id",
+      clientSecret: "super-secret-client-secret",
+      enabled: true,
+      allowProductionSend: true,
+    },
+  },
+});
+assert.equal(
+  resolveQQBotProductionSendGuard(configAllowedAccount, {}).allowed,
+  true,
+  "QQBot production delivery should allow an explicit host-local config flag",
+);
 
 const configPath = path.join(fixtureDir, "openclaw.json");
 const qqbotDataDir = path.join(fixtureDir, "qqbot");
@@ -101,19 +203,55 @@ const selfieScriptPath = path.join(fixtureDir, "asuka-selfie.sh");
 fs.mkdirSync(promiseStateDir, { recursive: true });
 fs.writeFileSync(selfieScriptPath, "#!/usr/bin/env bash\n");
 fs.writeFileSync(configPath, JSON.stringify({
+  models: {
+    providers: {
+      minimax: {
+        baseUrl: "https://api.minimaxi.com/v1",
+        apiKey: "super-secret-minimax-key",
+        api: "openai-completions",
+        models: [
+          { id: "MiniMax-M2.7", name: "MiniMax M2.7" },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: {
+        primary: "minimax/MiniMax-M2.7",
+      },
+    },
+  },
   channels: {
     qqbot: {
       appId: "app-id",
       clientSecret: "super-secret-client-secret",
       imageServerBaseUrl: "https://images.example.test",
+      tts: {
+        enabled: true,
+        provider: "minimax",
+        model: "speech-2.8-hd",
+        voice: "Chinese (Mandarin)_Laid_BackGirl",
+      },
+      minimax: {
+        vision: {
+          enabled: true,
+          model: "MiniMax-M2.7",
+        },
+        search: {
+          enabled: true,
+          model: "MiniMax-M2.7",
+        },
+      },
     },
   },
   skills: {
     entries: {
       "asuka-selfie": {
         env: {
-          DASHSCOPE_API_KEY: "super-secret-dashscope-key",
-          DASHSCOPE_MODEL: "wan2.6-image",
+          STUDIO_API_KEY: "super-secret-studio-key",
+          STUDIO_API_BASE_URL: "https://api.minimaxi.com/v1",
+          STUDIO_IMAGE_MODEL: "image-01",
         },
       },
     },
@@ -143,9 +281,23 @@ assert.equal(health.promiseState.total, 3, "runtime health should count promises
 assert.equal(health.promiseState.cronJobIds, 2, "runtime health should count primary and follow-up cron job ids");
 assert.equal(health.promiseState.fallbackTracked, 1, "runtime health should count fallback metadata");
 assert.equal(health.media.selfieScript.exists, true, "runtime health should report selfie script presence");
-assert.equal(health.media.dashscopeApiKeyConfigured, true, "runtime health should report DashScope key presence as a boolean");
+assert.equal(health.media.studioApiKeyConfigured, true, "runtime health should report Studio key presence as a boolean");
+assert.equal(health.minimax.providerConfigured, true, "runtime health should report MiniMax provider readiness");
+assert.equal(health.minimax.capabilities.text.configured, true, "runtime health should report MiniMax text readiness");
+assert.equal(health.minimax.capabilities.text.implemented, true, "MiniMax text should be marked implemented");
+assert.equal(health.minimax.capabilities.image.configured, true, "runtime health should report MiniMax image readiness");
+assert.equal(health.minimax.capabilities.image.implemented, true, "MiniMax image should be marked implemented");
+assert.equal(health.minimax.capabilities.voice.configured, true, "runtime health should report MiniMax voice config readiness");
+assert.equal(health.minimax.capabilities.voice.implemented, true, "MiniMax voice should be marked implemented after Phase 18");
+assert.equal(health.minimax.capabilities.vision.configured, true, "runtime health should report MiniMax vision config readiness");
+assert.equal(health.minimax.capabilities.vision.implemented, true, "MiniMax vision should be marked implemented after Phase 19");
+assert.equal(health.minimax.capabilities.search.configured, true, "runtime health should report MiniMax search config readiness");
+assert.equal(health.minimax.capabilities.search.implemented, true, "MiniMax search should be marked implemented after Phase 20");
 const healthText = formatLocalRuntimeHealthReport(health);
 assert.ok(healthText.includes("QQBot runtime health: pass"), "formatted health should include overall status");
+assert.ok(healthText.includes("minimax:"), "formatted health should include MiniMax readiness");
+assert.ok(healthText.includes("text=yes:MiniMax-M2.7"), "formatted health should include MiniMax text model");
+assert.ok(healthText.includes("image=yes:image-01"), "formatted health should include MiniMax image model");
 assert.equal(healthText.includes("super-secret"), false, "formatted health should not leak secret values");
 assert.equal(JSON.stringify(health).includes("super-secret"), false, "structured health should not leak secret values");
 
@@ -161,5 +313,7 @@ assert.equal(missingHealth.status, "fail", "missing required cron patch should f
 assert.equal(missingHealth.qqDelivery.configExists, false, "missing config should be reported clearly");
 assert.equal(missingHealth.cronPatch.targets[0].status, "missing", "missing vendored runner should be reported clearly");
 assert.equal(missingHealth.media.selfieScript.exists, false, "missing selfie script should be reported clearly");
+assert.equal(missingHealth.minimax.providerConfigured, false, "missing config should report MiniMax provider missing");
+assert.equal(missingHealth.minimax.capabilities.voice.configured, false, "missing optional MiniMax voice config should not be configured");
 
 console.log("asuka-runtime tests passed");

@@ -1,12 +1,13 @@
 /**
- * Wan 2.6 image edit to OpenClaw integration.
+ * Studio Media image edit to OpenClaw integration.
  *
- * Edits Asuka's bundled selfie reference set with Alibaba Cloud Bailian / DashScope
- * wan2.6-image and sends the result through OpenClaw.
+ * Edits Asuka's bundled selfie reference with a Studio OpenAI-compatible
+ * image API and sends the result through OpenClaw.
  */
 
 import { execFile } from "child_process";
-import { existsSync, readFileSync } from "fs";
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "fs";
+import os from "os";
 import path from "path";
 import { promisify } from "util";
 
@@ -14,31 +15,30 @@ const execFileAsync = promisify(execFile);
 
 const DEFAULT_REFERENCE_IMAGE =
   "https://cdn.jsdelivr.net/gh/SumeLabs/asuka@main/assets/asuka.png";
-const DEFAULT_DASHSCOPE_URL =
-  "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
-const DEFAULT_MODEL = "wan2.6-image";
+const DEFAULT_STUDIO_BASE_URL = "https://api.awnjkankwik.asia/studio/v1";
+const DEFAULT_MODEL = "third_party_media:gemini-3-pro-image-preview";
+const DEFAULT_SIZE = "1024x1024";
+const DEFAULT_QUALITY = "standard";
+const SELFIE_IDENTITY_LOCK_PROMPT = [
+  "必须严格以提供的单张参考图 identity.jpg 作为唯一人物身份锚点。",
+  "优先保持参考图里的脸型、五官比例、眼睛形状、鼻梁、嘴唇、肤色、发色发量、发际线、年龄感和整体气质。",
+  "可以改变场景、构图、姿势、服装和光线，但不要换脸、不要欧美化、不要网红化、不要二次元化、不要改变种族或年龄。",
+  "身份和外貌一致性优先级高于场景创意；生成结果应像同一个人在当前语境里的真实自拍或近照。",
+].join(" ");
 
-interface WanImageContent {
-  type?: string;
-  text?: string;
-  image?: string;
+interface StudioMediaItem {
+  url?: string;
+  b64_json?: string;
 }
 
-interface WanImageResponse {
-  request_id?: string;
-  output?: {
-    choices?: Array<{
-      finish_reason?: string;
-      message?: {
-        role?: string;
-        content?: WanImageContent[];
-      };
-    }>;
-    finished?: boolean;
-  };
-  usage?: {
-    image_count?: number;
-    size?: string;
+interface StudioImageResponse {
+  id?: string;
+  data?: StudioMediaItem[];
+  result_urls?: string[];
+  error?: {
+    code?: string;
+    type?: string;
+    message?: string;
   };
 }
 
@@ -71,6 +71,22 @@ interface Result {
 }
 
 function getBundledReferenceImagePath(): string | null {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH;
+  const identityCandidates = [
+    process.env.ASUKA_REFERENCE_IMAGE_PATH,
+    process.env.OPENCLAW_STATE_DIR ? path.resolve(process.env.OPENCLAW_STATE_DIR, "identity.jpg") : undefined,
+    configPath ? path.resolve(path.dirname(configPath), "identity.jpg") : undefined,
+    path.resolve(process.cwd(), "identity.jpg"),
+    path.resolve(__dirname, "../../../../identity.jpg"),
+    path.resolve(__dirname, "../../../identity.jpg"),
+  ].filter((candidate): candidate is string => Boolean(candidate));
+
+  for (const candidate of identityCandidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
   const candidates = [
     path.resolve(__dirname, "../assets/1.jpg"),
     path.resolve(__dirname, "../assets/1.jpeg"),
@@ -91,6 +107,10 @@ function getBundledReferenceImagePath(): string | null {
   }
 
   return null;
+}
+
+function buildStudioSelfiePrompt(prompt: string): string {
+  return [SELFIE_IDENTITY_LOCK_PROMPT, prompt].filter(Boolean).join("\n");
 }
 
 function getBundledExtraReferenceImagePaths(): string[] {
@@ -142,8 +162,7 @@ function getPrimaryReferenceImageInput(opts?: {
   const localPath = explicitPath || getBundledReferenceImagePath();
 
   if (localPath && existsSync(localPath)) {
-    const base64 = readFileSync(localPath).toString("base64");
-    return `data:image/png;base64,${base64}`;
+    return localPath;
   }
 
   return (
@@ -180,8 +199,7 @@ function getReferenceImageInputs(opts?: {
       continue;
     }
 
-    const base64 = readFileSync(extraPath).toString("base64");
-    references.push(`data:image/png;base64,${base64}`);
+    references.push(extraPath);
   }
 
   const extraUrls = [
@@ -196,34 +214,214 @@ function getReferenceImageInputs(opts?: {
 
   if (deduped.length > limited.length) {
     console.warn(
-      `[WARN] Wan image edit supports up to 4 reference images, truncating ${deduped.length} inputs to 4`
+      `[WARN] Studio image edit currently uses the first 4 reference candidates only, truncating ${deduped.length} inputs to 4`
     );
   }
 
   return limited;
 }
 
-function getDashScopeUrl(): string {
-  return process.env.DASHSCOPE_API_URL || DEFAULT_DASHSCOPE_URL;
+function getStudioBaseUrl(): string {
+  return (process.env.STUDIO_API_BASE_URL || DEFAULT_STUDIO_BASE_URL).replace(/\/+$/, "");
+}
+
+function getStudioApiKey(): string {
+  return process.env.STUDIO_API_KEY || process.env.DASHSCOPE_API_KEY || "";
+}
+
+function getStudioAuthProfile(): string {
+  return process.env.STUDIO_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || "";
+}
+
+function resolveAuthProfilesPath(): string {
+  if (process.env.OPENCLAW_AUTH_PROFILES_PATH) return path.resolve(process.env.OPENCLAW_AUTH_PROFILES_PATH);
+  if (process.env.OPENCLAW_AGENT_DIR) return path.resolve(process.env.OPENCLAW_AGENT_DIR, "auth-profiles.json");
+  const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), ".openclaw");
+  const agentId = process.env.OPENCLAW_AGENT_ID || "main";
+  return path.join(stateDir, "agents", agentId, "agent", "auth-profiles.json");
+}
+
+function getAccountId(accessToken: string): string | undefined {
+  try {
+    const payload = accessToken.split(".")[1];
+    if (!payload) return undefined;
+    const decoded = Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const auth = JSON.parse(decoded)?.["https://api.openai.com/auth"];
+    return typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function refreshOpenAICodexProfile(credential: Record<string, any>): Promise<Record<string, any>> {
+  if (!credential.refresh) throw new Error("OAuth profile is missing refresh token");
+  const response = await fetch("https://auth.openai.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: String(credential.refresh),
+      client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+    }),
+  });
+  if (!response.ok) throw new Error(`OpenAI Codex OAuth refresh failed: HTTP ${response.status}`);
+  const json = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number };
+  if (!json.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
+    throw new Error("OpenAI Codex OAuth refresh response missing token fields");
+  }
+  return {
+    ...credential,
+    type: "oauth",
+    provider: "openai-codex",
+    access: json.access_token,
+    refresh: json.refresh_token,
+    expires: Date.now() + json.expires_in * 1000,
+    accountId: getAccountId(json.access_token) || credential.accountId,
+  };
+}
+
+async function resolveStudioBearerToken(): Promise<string> {
+  const authProfile = getStudioAuthProfile().trim();
+  if (!authProfile) return getStudioApiKey();
+
+  const authProfilesPath = resolveAuthProfilesPath();
+  if (!existsSync(authProfilesPath)) throw new Error(`OAuth profile store not found: ${authProfilesPath}`);
+  const store = JSON.parse(readFileSync(authProfilesPath, "utf8"));
+  const credential = store?.profiles?.[authProfile];
+  if (!credential) throw new Error(`OAuth profile not found: ${authProfile}`);
+  if (credential.type !== "oauth") throw new Error(`Auth profile ${authProfile} is not OAuth`);
+  if (!credential.access) throw new Error(`OAuth profile ${authProfile} is missing access token`);
+
+  if (typeof credential.expires === "number" && credential.expires > Date.now() + 60_000) {
+    return credential.access;
+  }
+  if (credential.provider !== "openai-codex") {
+    throw new Error(`OAuth refresh is not supported for provider ${credential.provider || "(missing)"}`);
+  }
+
+  const refreshed = await refreshOpenAICodexProfile(credential);
+  store.profiles[authProfile] = refreshed;
+  const tmpPath = `${authProfilesPath}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmpPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  renameSync(tmpPath, authProfilesPath);
+  try {
+    chmodSync(authProfilesPath, 0o600);
+  } catch {
+    // Best effort on Windows filesystems.
+  }
+  return refreshed.access;
 }
 
 function getModelId(): string {
-  return process.env.DASHSCOPE_MODEL || DEFAULT_MODEL;
+  return process.env.STUDIO_IMAGE_EDIT_MODEL
+    || process.env.STUDIO_IMAGE_MODEL
+    || process.env.STUDIO_MODEL
+    || process.env.DASHSCOPE_MODEL
+    || DEFAULT_MODEL;
 }
 
-function extractImageUrl(response: WanImageResponse): string {
-  const choices = response.output?.choices || [];
-  for (const choice of choices) {
-    const content = choice.message?.content || [];
-    for (const item of content) {
-      if (item.image) {
-        return item.image;
-      }
-    }
+function getQuality(): string {
+  return process.env.STUDIO_IMAGE_QUALITY || DEFAULT_QUALITY;
+}
+
+function normalizeStudioSize(size?: string): string {
+  const raw = (size || DEFAULT_SIZE).trim();
+  if (/^1k$/i.test(raw)) return "1024x1024";
+  if (/^2k$/i.test(raw)) return "2048x2048";
+  return raw;
+}
+
+function getMimeType(input: string): string {
+  const ext = path.extname(input.split("?")[0] || "").toLowerCase();
+  switch (ext) {
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".png":
+    default:
+      return "image/png";
   }
+}
+
+function dataUrlToImagePart(dataUrl: string): { blob: Blob; filename: string } {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) {
+    throw new Error("Invalid data URL reference image");
+  }
+  const mimeType = match[1] || "image/png";
+  const extension = mimeType.split("/")[1] || "png";
+  const buffer = Buffer.from(match[2] || "", "base64");
+  return {
+    blob: new Blob([buffer], { type: mimeType }),
+    filename: `reference.${extension}`,
+  };
+}
+
+async function resolveImagePart(input: string): Promise<{ blob: Blob; filename: string }> {
+  if (input.startsWith("data:")) {
+    return dataUrlToImagePart(input);
+  }
+
+  if (/^https?:\/\//i.test(input)) {
+    const response = await fetch(input);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch reference image: HTTP ${response.status}`);
+    }
+    const contentType = response.headers.get("content-type") || getMimeType(input);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const filename = path.basename(new URL(input).pathname) || "reference.png";
+    return {
+      blob: new Blob([buffer], { type: contentType }),
+      filename,
+    };
+  }
+
+  if (!existsSync(input)) {
+    throw new Error(`Reference image file does not exist: ${input}`);
+  }
+
+  return {
+    blob: new Blob([readFileSync(input)], { type: getMimeType(input) }),
+    filename: path.basename(input),
+  };
+}
+
+function extractImageUrl(response: StudioImageResponse): string {
+  for (const item of response.data || []) {
+    if (item?.url) return item.url;
+    if (item?.b64_json) return `data:image/png;base64,${item.b64_json}`;
+  }
+
+  for (const url of response.result_urls || []) {
+    if (url) return url;
+  }
+
   throw new Error(
-    `Failed to extract image URL from DashScope response: ${JSON.stringify(response)}`
+    `Failed to extract image URL from Studio response: ${JSON.stringify(response)}`
   );
+}
+
+async function parseStudioResponse(response: Awaited<ReturnType<typeof fetch>>): Promise<StudioImageResponse> {
+  let data: StudioImageResponse;
+  try {
+    data = (await response.json()) as StudioImageResponse;
+  } catch (error) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Studio image edit failed: HTTP ${response.status}: ${body.slice(0, 500)}`);
+  }
+
+  if (!response.ok) {
+    const error = data.error;
+    const code = error?.code || error?.type || "api_error";
+    const message = error?.message || JSON.stringify(data);
+    throw new Error(`Studio image edit failed: HTTP ${response.status} ${code}: ${message}`);
+  }
+
+  return data;
 }
 
 async function generateImageEdit(input: {
@@ -233,12 +431,12 @@ async function generateImageEdit(input: {
   referenceImagePath?: string;
   extraReferenceImageUrls?: string[];
   extraReferenceImagePaths?: string[];
-}): Promise<WanImageResponse> {
-  const apiKey = process.env.DASHSCOPE_API_KEY;
+}): Promise<StudioImageResponse> {
+  const apiKey = await resolveStudioBearerToken();
 
   if (!apiKey) {
     throw new Error(
-      "DASHSCOPE_API_KEY environment variable not set. Configure your Bailian / DashScope API key first."
+      "STUDIO_API_KEY or STUDIO_AUTH_PROFILE environment variable not set. Configure your Studio media API key or OpenClaw OAuth profile first."
     );
   }
 
@@ -249,45 +447,31 @@ async function generateImageEdit(input: {
     extraReferenceImagePaths: input.extraReferenceImagePaths,
   });
 
-  const response = await fetch(getDashScopeUrl(), {
+  if (referenceImages.length > 1) {
+    console.warn(
+      `[WARN] Studio image edit API accepts a single multipart image; using primary reference and ignoring ${referenceImages.length - 1} extra reference(s)`
+    );
+  }
+
+  const image = await resolveImagePart(referenceImages[0] || DEFAULT_REFERENCE_IMAGE);
+  const form = new FormData();
+  form.append("model", getModelId());
+  form.append("prompt", buildStudioSelfiePrompt(input.prompt));
+  form.append("size", normalizeStudioSize(input.size));
+  form.append("n", "1");
+  form.append("quality", getQuality());
+  form.append("response_format", "url");
+  form.append("image", image.blob, image.filename);
+
+  const response = await fetch(`${getStudioBaseUrl()}/images/edits`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: getModelId(),
-      input: {
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                text: input.prompt,
-              },
-              ...referenceImages.map((image) => ({
-                image,
-              })),
-            ],
-          },
-        ],
-      },
-      parameters: {
-        prompt_extend: true,
-        watermark: false,
-        n: 1,
-        enable_interleave: false,
-        size: input.size || "1K",
-      },
-    }),
+    body: form,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`DashScope image edit failed: ${errorText}`);
-  }
-
-  return (await response.json()) as WanImageResponse;
+  return parseStudioResponse(response);
 }
 
 async function sendViaOpenClaw(
@@ -347,7 +531,7 @@ async function generateAndSend(options: GenerateAndSendOptions): Promise<Result>
     prompt,
     channel,
     caption = "",
-    size = "1K",
+    size = DEFAULT_SIZE,
     useOpenClawCLI = true,
     referenceImageUrl,
     referenceImagePath,
@@ -355,9 +539,10 @@ async function generateAndSend(options: GenerateAndSendOptions): Promise<Result>
     extraReferenceImagePaths,
   } = options;
 
-  console.log("[INFO] Editing Asuka reference image with wan2.6-image...");
+  console.log("[INFO] Editing Asuka reference image with Studio media API...");
   console.log(`[INFO] Prompt: ${prompt}`);
-  console.log(`[INFO] Size: ${size}`);
+  console.log(`[INFO] Model: ${getModelId()}`);
+  console.log(`[INFO] Size: ${normalizeStudioSize(size)}`);
 
   const imageResult = await generateImageEdit({
     prompt,
@@ -388,8 +573,8 @@ async function generateAndSend(options: GenerateAndSendOptions): Promise<Result>
     imageUrl,
     channel,
     prompt,
-    requestId: imageResult.request_id,
-    size: imageResult.usage?.size,
+    requestId: imageResult.id,
+    size: normalizeStudioSize(size),
   };
 }
 
@@ -404,18 +589,20 @@ Arguments:
   prompt   - Edit prompt for Asuka's reference image
   channel  - Target channel (e.g. qqbot:c2c:<id>, #general, @user)
   caption  - Optional message caption
-  size     - Output size (default: 1K; also supports 2K or WxH)
+  size     - Output size (default: 1024x1024; legacy 1K maps to 1024x1024)
 
 Environment:
-  DASHSCOPE_API_KEY  - Alibaba Cloud Bailian / DashScope API key
-  DASHSCOPE_API_URL  - Optional full endpoint override
-  DASHSCOPE_MODEL    - Optional model override, default wan2.6-image
+  STUDIO_API_KEY       - Studio media API key
+  STUDIO_AUTH_PROFILE  - Optional OpenClaw OAuth profile id, for example openai-codex:zhueshun@gmail.com
+  STUDIO_API_BASE_URL  - Optional base URL, default ${DEFAULT_STUDIO_BASE_URL}
+  STUDIO_IMAGE_MODEL   - Optional image edit model override, default ${DEFAULT_MODEL}
+  STUDIO_IMAGE_QUALITY - Optional quality, default ${DEFAULT_QUALITY}
   OPENCLAW_PROFILE   - Optional OpenClaw profile used for CLI sends
   ASUKA_EXTRA_REFERENCE_IMAGE_PATHS - Optional comma-separated extra local reference image paths
   ASUKA_EXTRA_REFERENCE_IMAGE_URLS  - Optional comma-separated extra reference image URLs
 
 Example:
-  DASHSCOPE_API_KEY=sk-xxx OPENCLAW_PROFILE=asuka \\
+  STUDIO_API_KEY=sk-xxx OPENCLAW_PROFILE=asuka \\
     npx ts-node asuka-selfie.ts "给她加一顶牛仔帽，镜子自拍，真实自然" "qqbot:c2c:12345"
 `);
     process.exit(1);

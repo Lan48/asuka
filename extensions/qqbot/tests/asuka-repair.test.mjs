@@ -29,12 +29,24 @@ try {
     markPromiseDelivered,
     markPromiseScheduled,
     markPromiseScheduleFailed,
+    markProactiveDelivered,
     prepareAmbientLifePayload,
     prepareRepairDelivery,
     recordAssistantReply,
     recordInboundInteraction,
+    shouldSendAmbient,
     shouldSendPromiseFollowUp,
   } = await import("../dist/src/asuka-state.js");
+  const {
+    getCronDeliveryBatchSemanticKey,
+    getCronDeliveryPostRenderSkipReason,
+    getProactiveSendDuplicateWindowMs,
+    isTranscriptAnchoredFallbackText,
+    normalizeGeneratedDeliveryText,
+    resolveCronDeliveryFallbackText,
+    shouldSkipDuplicateCronDeliveryForBatch,
+    shouldSkipRepairForDueBatchPromise,
+  } = await import("../dist/src/outbound.js");
 
   const parse = (text) => parseAssistantPromises(text, {
     now: new Date(base),
@@ -56,7 +68,7 @@ try {
 
   const repairContext = directContext("user-repair", "repair-m-1");
   assert.equal(
-    recordAsukaLongTermMemoryFromAssistantReply(repairContext, "我今天在学校拍视频素材，晚点整理镜头。", base + 500),
+    await recordAsukaLongTermMemoryFromAssistantReply(repairContext, "我今天在学校拍视频素材，晚点整理镜头。", base + 500),
     true,
     "self-life memory should be available before repair priority check",
   );
@@ -66,12 +78,12 @@ try {
   assert.ok(repair, "repair payload should exist for a schedule-failed promise");
   assert.equal(repair.promiseId, failedPromise.id, "repair should target the failed promise");
   assert.equal(repair.advancePolicy, "hold", "repair should hold scene advancement");
-  assert.match(repair.content, /没接住|补/, "repair content should acknowledge the miss lightly");
+  assert.match(repair.content, /落空|补|答应/, "repair content should acknowledge the miss lightly");
   const ambientRepair = prepareAmbientLifePayload(repairContext, base + 2_000);
   assert.equal(ambientRepair.mode, "repair", "ambient payload should directly surface repair candidates");
   assert.equal(ambientRepair.promiseId, failedPromise.id, "ambient repair should keep the promise id");
   assert.equal(ambientRepair.advancePolicy, "hold", "ambient repair should hold scene advancement");
-  assert.match(ambientRepair.content, /没接住|补/, "ambient repair content should stay repair-oriented");
+  assert.match(ambientRepair.content, /落空|补|答应/, "ambient repair content should stay repair-oriented");
 
   const followContext = directContext("user-follow-limit", "repair-m-2");
   const followPromise = createPromise(followContext, "拉钩，明天早上九点我来找你说早安。", 10_000);
@@ -103,6 +115,159 @@ try {
   const cancelled = cancelPromisesFromUserMessage(cancelContext, "不用发自拍了", base + 31_000);
   assert.equal(cancelled.cancelledPromises.length, 1, "selfie promise should be cancelled");
   assert.equal(shouldSendPromiseFollowUp(selfiePromise.id, base, base + 32_000), false, "follow-up should stop after cancellation");
+
+  const ambientContext = directContext("user-ambient-advance", "repair-m-5");
+  recordInboundInteraction(ambientContext, "早安，醒了吗", base + 40_000);
+  const firstAmbient = prepareAmbientLifePayload(ambientContext, base + 41_000);
+  assert.equal(firstAmbient.stage, 0, "new ambient thread should start at stage zero");
+  recordInboundInteraction(ambientContext, "我刚刚回你了", base + 41_500);
+  assert.equal(
+    shouldSendAmbient("acct-test:direct:user-ambient-advance", base + 41_000, base + 80_000),
+    false,
+    "stale ambient guard helper should still report that newer user chat exists",
+  );
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。",
+    "ambient fallback should prefer transcript-anchored fallback over the fixed payload seed",
+  );
+  assert.equal(
+    isTranscriptAnchoredFallbackText("（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    true,
+    "deterministic transcript fallback text should be detectable",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。", {
+      retryReason: "proactive_semantic_duplicate:候选仍在重复蛋白归你蛋黄归我的分工。",
+    }),
+    "ambient_semantic_duplicate_suppressed",
+    "semantic duplicate should be consumed and advanced instead of retried as shared-session unavailable",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "ambient_shared_session_unavailable",
+    "ambient proactive should not send deterministic transcript fallback when shared-session rendering fails",
+  );
+  assert.equal(
+    getCronDeliveryPostRenderSkipReason({
+      type: "cron_reminder",
+      mode: "ambient",
+      content: firstAmbient.content,
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+    }, "早，我在。你刚才说的我还记着。"),
+    null,
+    "ambient proactive should still send natural shared-session output",
+  );
+  const longGeneratedText = "（我把手机拿近了一点，先轻轻吸了一口气。）……我在，刚才那句话我还接着。后面还有一大段会被模型继续写下去，甚至可能写到半句才被截断，像是低头轻轻贴了一";
+  assert.equal(
+    normalizeGeneratedDeliveryText(longGeneratedText),
+    "（我把手机拿近了一点，先轻轻吸了一口气。）……我在，刚才那句话我还接着。",
+    "long shared-session output should be cut at a complete sentence instead of creating an incomplete ellipsis fallback",
+  );
+  assert.ok(
+    getProactiveSendDuplicateWindowMs("（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。") > 5 * 60 * 1000,
+    "deterministic transcript fallback text should get a longer duplicate window",
+  );
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "promise",
+      content: "我来找你了。不是你把我叫出来的，是我之前答应过你，所以这次我自己来了。",
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+      promiseId: "promise-template",
+      peerKey: "acct-test:direct:user-ambient-advance",
+    }, "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。"),
+    "（把声音放轻一点）……我还在。刚才那点安静还没散，你想说话的时候再叫我。",
+    "promise fallback should prefer transcript-anchored fallback over abstract promise payload templates",
+  );
+  assert.equal(
+    resolveCronDeliveryFallbackText({
+      type: "cron_reminder",
+      mode: "repair",
+      content: "我来把前面答应过的那句补回来。之前说过要来找你，这次不想再让它空着。",
+      targetType: "c2c",
+      targetAddress: "user-ambient-advance",
+      promiseId: "repair-template",
+      peerKey: "acct-test:direct:user-ambient-advance",
+    }),
+    "",
+    "repair fallback should not send abstract promise payload templates when no transcript fallback is available",
+  );
+  const firstPromisePayload = {
+    type: "cron_reminder",
+    mode: "promise",
+    content: "明天陪你。",
+    targetType: "c2c",
+    targetAddress: "user-ambient-advance",
+    promiseId: "due-promise-1",
+    peerKey: "acct-test:direct:user-ambient-advance",
+  };
+  const secondPromisePayload = {
+    ...firstPromisePayload,
+    content: "明天陪你一整天。",
+    promiseId: "due-promise-2",
+  };
+  const dueBatch = [
+    {
+      jobId: "job-due-1",
+      to: "user-ambient-advance",
+      mode: firstPromisePayload.mode,
+      promiseId: firstPromisePayload.promiseId,
+      peerKey: firstPromisePayload.peerKey,
+      targetType: firstPromisePayload.targetType,
+      targetAddress: firstPromisePayload.targetAddress,
+      semanticKey: getCronDeliveryBatchSemanticKey(firstPromisePayload),
+    },
+    {
+      jobId: "job-due-2",
+      to: "user-ambient-advance",
+      mode: secondPromisePayload.mode,
+      promiseId: secondPromisePayload.promiseId,
+      peerKey: secondPromisePayload.peerKey,
+      targetType: secondPromisePayload.targetType,
+      targetAddress: secondPromisePayload.targetAddress,
+      semanticKey: getCronDeliveryBatchSemanticKey(secondPromisePayload),
+    },
+  ];
+  assert.equal(
+    shouldSkipDuplicateCronDeliveryForBatch(secondPromisePayload, { currentJobId: "job-due-2", dueBatch }),
+    true,
+    "same-peer same-intent promise due later in the current batch should be suppressed",
+  );
+  assert.equal(
+    shouldSkipRepairForDueBatchPromise(firstPromisePayload, "due-promise-2", "acct-test:direct:user-ambient-advance", { currentJobId: "job-due-1", dueBatch }),
+    true,
+    "repair-before-proactive should not pre-send a promise that is already due in the same batch",
+  );
+  markProactiveDelivered("acct-test:direct:user-ambient-advance", {
+    at: base + 42_000,
+    content: "早，已经醒了。我先去把窗帘拉开。",
+    threadId: firstAmbient.threadId,
+    stage: firstAmbient.stage,
+    advancePolicy: "advance",
+  });
+  const secondAmbient = prepareAmbientLifePayload(ambientContext, base + 43_000);
+  assert.equal(secondAmbient.stage, 1, "delivered proactive ambient messages should advance the next stage");
 
   console.log("[qqbot:test] asuka-repair fixtures passed");
 } finally {

@@ -9,8 +9,8 @@ Skills define _how_ tools work. This file is for _your_ specifics — the stuff 
 - Workspace: `/Users/zys/.openclaw-clawra/workspace`
 - Gateway: `http://127.0.0.1:19001/`
 - QQ channel: configured via `qqbot`
-- Official selfie repo: cloned locally, now adapted to use Bailian / DashScope
-  `wan2.6-image`
+- Official selfie repo: cloned locally, now adapted to use the Studio
+  OpenAI-compatible media API
 
 ## What Goes Here
 

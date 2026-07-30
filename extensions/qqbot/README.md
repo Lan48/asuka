@@ -342,8 +342,41 @@ STT supports two-level configuration with priority fallback:
 
 - `provider` — references a key in `models.providers` to inherit `baseUrl` and `apiKey`
 - `voice` — voice variant
+- MiniMax can use `speech-2.8-hd`; audio payload `tts` can override `voice`, `speed`, `vol`, `pitch`, `languageBoost`, and `voiceModify` per turn
+- MiniMax pauses should be placed in spoken text, for example `I'm here.<#0.4#>Stay close.`
 - Set `enabled: false` to disable (default: `true`)
-- When configured, AI can use `<qqvoice>` tags to generate and send voice messages
+- When configured, AI can use `QQBOT_PAYLOAD` audio payloads to synthesize and send voice messages; `<qqvoice>` remains for existing local audio files
+
+### MiniMax Vision and Web Search
+
+Enable under `channels.qqbot.minimax`:
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "minimax": {
+        "vision": {
+          "enabled": true,
+          "model": "MiniMax-VLM",
+          "maxInputBytes": 20971520,
+          "maxImagesPerMessage": 3
+        },
+        "search": {
+          "enabled": true,
+          "model": "MiniMax-M2.7",
+          "queryMaxChars": 160,
+          "maxResults": 4
+        }
+      }
+    }
+  }
+}
+```
+
+- Vision supports JPEG, PNG, GIF, and WebP after type, size, and source validation.
+- Search triggers only for explicit search requests or clearly fresh/current external information.
+- Vision summaries and search results are current-turn context only and are not automatically written to long-term memory.
 
 ---
 
@@ -424,4 +457,3 @@ openclaw gateway restart
 - [Rich Media Guide](docs/qqbot-media-guide.md) — images, voice, video, files
 - [Command Reference](docs/commands.md) — OpenClaw CLI commands
 - [Changelog](docs/changelog/) — release notes ([latest: 1.5.4](docs/changelog/1.5.4.md))
-

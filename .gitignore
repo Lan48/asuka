@@ -31,3 +31,9 @@ dist/
 # Local tool/project metadata.
 .serena/
 **/.serena/
+
+# Local remote-deploy helpers (contain SSH credentials — never commit).
+.remote/
+.ssh-helper.exp
+.probe.ps1
+.asuka-remote.env

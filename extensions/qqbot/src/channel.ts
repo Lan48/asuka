@@ -7,7 +7,7 @@ import {
 } from "openclaw/plugin-sdk";
 
 import type { ResolvedQQBotAccount } from "./types.js";
-import { DEFAULT_ACCOUNT_ID, listQQBotAccountIds, resolveQQBotAccount, applyQQBotAccountConfig, resolveDefaultQQBotAccountId } from "./config.js";
+import { DEFAULT_ACCOUNT_ID, formatQQBotProductionSendGuardError, listQQBotAccountIds, resolveQQBotAccount, applyQQBotAccountConfig, resolveDefaultQQBotAccountId, resolveQQBotProductionSendGuard } from "./config.js";
 import { sendText, sendMedia } from "./outbound.js";
 import { startGateway } from "./gateway.js";
 import { qqbotOnboardingAdapter } from "./onboarding.js";
@@ -266,6 +266,26 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
       log?.info(`[qqbot:${account.accountId}] Starting gateway — appId=${account.appId}, enabled=${account.enabled}, name=${account.name ?? "unnamed"}`);
       console.log(`[qqbot:channel] startAccount: accountId=${account.accountId}, appId=${account.appId}, secretSource=${account.secretSource}`);
 
+      const updateRuntimeStatus = (patch: Record<string, unknown>) => {
+        ctx.setStatus({
+          ...ctx.getStatus(),
+          ...patch,
+        });
+      };
+
+      const productionGuard = resolveQQBotProductionSendGuard(account);
+      if (!productionGuard.allowed) {
+        const message = formatQQBotProductionSendGuardError(productionGuard);
+        log?.warn?.(`[qqbot:${account.accountId}] Gateway start blocked by production send guard: ${message}`);
+        updateRuntimeStatus({
+          running: false,
+          connected: false,
+          blockedByProductionSendGuard: true,
+          lastError: message,
+        });
+        return;
+      }
+
       await startGateway({
         account,
         abortSignal,
@@ -273,8 +293,7 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
         log,
         onReady: () => {
           log?.info(`[qqbot:${account.accountId}] Gateway ready`);
-          ctx.setStatus({
-            ...ctx.getStatus(),
+          updateRuntimeStatus({
             running: true,
             connected: true,
             lastConnectedAt: Date.now(),
@@ -282,11 +301,11 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
         },
         onError: (error) => {
           log?.error(`[qqbot:${account.accountId}] Gateway error: ${error.message}`);
-          ctx.setStatus({
-            ...ctx.getStatus(),
+          updateRuntimeStatus({
             lastError: error.message,
           });
         },
+        onStatus: updateRuntimeStatus,
       });
     },
     // 新增：登出账户（清除配置中的凭证）
@@ -341,6 +360,11 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
       lastError: null,
       lastInboundAt: null,
       lastOutboundAt: null,
+      lastActivityAt: null,
+      busy: false,
+      bufferedMessages: 0,
+      queuedMessages: 0,
+      activeRuns: 0,
     },
     // 新增：构建通道摘要
     buildChannelSummary: ({ snapshot }: { snapshot: Record<string, unknown> }) => ({
@@ -350,6 +374,11 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
       connected: snapshot.connected ?? false,
       lastConnectedAt: snapshot.lastConnectedAt ?? null,
       lastError: snapshot.lastError ?? null,
+      lastActivityAt: snapshot.lastActivityAt ?? null,
+      busy: snapshot.busy ?? false,
+      bufferedMessages: snapshot.bufferedMessages ?? 0,
+      queuedMessages: snapshot.queuedMessages ?? 0,
+      activeRuns: snapshot.activeRuns ?? 0,
     }),
     buildAccountSnapshot: ({ account, runtime }: { account?: ResolvedQQBotAccount; runtime?: Record<string, unknown> }) => ({
       accountId: account?.accountId ?? DEFAULT_ACCOUNT_ID,
@@ -363,6 +392,11 @@ export const qqbotPlugin: ChannelPlugin<ResolvedQQBotAccount> = {
       lastError: runtime?.lastError ?? null,
       lastInboundAt: runtime?.lastInboundAt ?? null,
       lastOutboundAt: runtime?.lastOutboundAt ?? null,
+      lastActivityAt: runtime?.lastActivityAt ?? null,
+      busy: runtime?.busy ?? false,
+      bufferedMessages: runtime?.bufferedMessages ?? 0,
+      queuedMessages: runtime?.queuedMessages ?? 0,
+      activeRuns: runtime?.activeRuns ?? 0,
     }),
   },
 };

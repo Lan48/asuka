@@ -338,8 +338,42 @@ STT 支持两级配置，按优先级查找：
 
 - `provider` — 引用 `models.providers` 中的 key，自动继承 `baseUrl` 和 `apiKey`
 - `voice` — 语音音色
+- MiniMax 可使用 `speech-2.8-hd`，并通过 audio payload 的 `tts` 字段按轮次覆盖 `voice`、`speed`、`vol`、`pitch`、`languageBoost`、`voiceModify`
+- MiniMax 停顿写在朗读文本内，例如 `我在呢。<#0.4#>轻轻抱你一下。`；`speech-2.8-hd` / `speech-2.8-turbo` 可在朗读文本内少量加入语气词标签，例如 `(sighs)`、`(laughs)`、`(emm)`、`(breath)`
+- 插件会在保存引用摘要或文本兜底时移除这些 TTS 控制标签，避免它们作为可见文字发给用户
 - 设置 `enabled: false` 可禁用（默认：`true`）
-- 配置后，AI 可使用 `<qqvoice>` 标签生成并发送语音消息
+- 配置后，AI 可使用 `QQBOT_PAYLOAD` audio 载荷生成并发送语音消息；`<qqvoice>` 仍用于发送已有本地音频文件
+
+### MiniMax 图片理解与网络搜索
+
+可在 `channels.qqbot.minimax` 下启用：
+
+```json
+{
+  "channels": {
+    "qqbot": {
+      "minimax": {
+        "vision": {
+          "enabled": true,
+          "model": "MiniMax-VLM",
+          "maxInputBytes": 20971520,
+          "maxImagesPerMessage": 3
+        },
+        "search": {
+          "enabled": true,
+          "model": "MiniMax-M2.7",
+          "queryMaxChars": 160,
+          "maxResults": 4
+        }
+      }
+    }
+  }
+}
+```
+
+- 图片理解支持 JPEG、PNG、GIF、WebP，并在类型、大小、来源验证后才发送给 MiniMax。
+- 网络搜索只在用户明确要求搜索，或问题明显依赖最新/当前外部信息时触发。
+- 图片摘要和搜索结果默认只进入当前轮回复上下文，不会自动写入长期记忆。
 
 ---
 
@@ -420,4 +454,3 @@ openclaw gateway restart
 - [富媒体指南](docs/qqbot-media-guide.md) — 图片、语音、视频、文件
 - [命令参考](docs/commands.md) — OpenClaw CLI 常用命令
 - [更新日志](docs/changelog/) — 各版本变更记录（[最新: 1.5.4](docs/changelog/1.5.4.md)）
-

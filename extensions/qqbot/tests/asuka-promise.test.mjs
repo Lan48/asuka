@@ -28,7 +28,7 @@ function assertNoPayloadArtifacts(value, label) {
 }
 
 try {
-  const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
+  const { parseAssistantPromises, parseAssistantPromisesWithLlm } = await import("../dist/src/promise-parser.js");
   const {
     appendPromiseFollowUpJob,
     buildAsukaStatePrompt,
@@ -41,6 +41,20 @@ try {
     now: new Date(base),
     timeZone: "Asia/Shanghai",
   });
+  const fakeModelConfig = {
+    baseUrl: "https://llm.example.invalid",
+    apiKey: "test-key",
+    model: "test-model",
+  };
+  const llmResponse = (promises) => new Response(JSON.stringify({
+    choices: [
+      {
+        message: {
+          content: JSON.stringify({ promises }),
+        },
+      },
+    ],
+  }), { status: 200 });
 
   const hardText = "拉钩，明天早上九点我来找你说早安。";
   const hardParsed = parse(hardText);
@@ -67,7 +81,45 @@ try {
     "tentative soft phrasing should not create promises",
   );
 
+  assert.equal(parse("我一会儿回来陪你把这件事说完。").length, 0, "rule parser should not own implicit promise judgment");
+  const llmImplicitParsed = await parseAssistantPromisesWithLlm("我一会儿回来陪你把这件事说完。", {
+    now: new Date(base),
+    timeZone: "Asia/Shanghai",
+    modelConfig: fakeModelConfig,
+    fetchImpl: async () => llmResponse([
+      {
+        promiseText: "一会儿我回来陪你把这件事说完。",
+        triggerKind: "soft",
+        triggerPhrase: "LLM语义判断",
+        deliveryKind: "text",
+        followUpIntent: "主动回来陪对方把话接上。",
+        relationNote: "这是一次明确的未来联系承诺。",
+        confidence: 0.91,
+      },
+    ]),
+  });
+  assert.equal(llmImplicitParsed.length, 1, "LLM promise inference should recognize implicit future commitments");
+  assert.equal(llmImplicitParsed[0].triggerPhrase, "LLM语义判断", "LLM promise inference should keep semantic trigger metadata");
+  assert.equal(llmImplicitParsed[0].schedule?.kind, "at", "LLM promise inference should still derive a schedulable time");
+
   const duplicateText = "约定，明天早上九点我来找你说早安。";
+  const llmEmptyParsed = await parseAssistantPromisesWithLlm(duplicateText, {
+    now: new Date(base),
+    timeZone: "Asia/Shanghai",
+    modelConfig: fakeModelConfig,
+    fetchImpl: async () => llmResponse([]),
+  });
+  assert.equal(llmEmptyParsed.length, 0, "successful LLM no-promise judgment should not fall back to keyword parsing");
+  const llmFallbackParsed = await parseAssistantPromisesWithLlm(duplicateText, {
+    now: new Date(base),
+    timeZone: "Asia/Shanghai",
+    modelConfig: fakeModelConfig,
+    fetchImpl: async () => {
+      throw new Error("model unavailable");
+    },
+  });
+  assert.equal(llmFallbackParsed.length, 1, "rule parser should remain only as an unavailable-model fallback");
+
   const duplicateParsed = parse(duplicateText);
   assert.equal(duplicateParsed.length, 1, "semantic duplicate text should still parse");
   const duplicateCreated = recordAssistantReply(direct, duplicateText, duplicateParsed, base + 60_000);

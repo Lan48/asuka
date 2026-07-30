@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "ollama": {
+    "version": "0.32.5",
+    "signerOrganization": "Ollama Inc.",
+    "executableBytes": 36512648,
+    "executableSha256": "82e3b496c059720fa1c40a09af7803778f4bb40f32fb459a1d799c822a217843"
+  },
+  "task": {
+    "name": "AsukaEmbedding"
+  },
+  "api": {
+    "endpoint": "http://127.0.0.1:11434/v1/embeddings",
+    "apiKey": "ollama-local"
+  },
+  "model": {
+    "name": "asuka-jina-v5-text-small:2026-02-25-q4km",
+    "family": "jina-embeddings-v5-text-small",
+    "task": "retrieval",
+    "quantization": "Q4_K_M",
+    "dimensions": 1024,
+    "license": "CC-BY-NC-4.0",
+    "sourceRepository": "jinaai/jina-embeddings-v5-text-small-retrieval-GGUF",
+    "sourceRevision": "78b0ebcb4c870fdfef409e578b65288b49a4fa90",
+    "sourceFile": "v5-small-retrieval-Q4_K_M.gguf",
+    "sourcePath": "models/jina-v5-text-small/v5-small-retrieval-Q4_K_M.gguf",
+    "sourceUrl": "https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval-GGUF/resolve/78b0ebcb4c870fdfef409e578b65288b49a4fa90/v5-small-retrieval-Q4_K_M.gguf?download=true",
+    "sourceBytes": 396705152,
+    "sourceSha256": "9440cf89f3e8a7a31a42e11b87e106dd5b344af4e0e3b6b21a96136cc8686e21",
+    "ollamaManifest": "manifests/registry.ollama.ai/library/asuka-jina-v5-text-small/2026-02-25-q4km",
+    "runtime": {
+      "manifestBytes": 415,
+      "manifestSha256": "434bad391068826cb0565d7b96cf0456886149f7ae60a00eab590f01beac6945",
+      "config": {
+        "mediaType": "application/vnd.docker.container.image.v1+json",
+        "digest": "sha256:f1922a92413bac87dda32999c8808fd16d68b16acae46db14a1581a951167f3c",
+        "size": 268
+      },
+      "layers": [
+        {
+          "mediaType": "application/vnd.ollama.image.model",
+          "digest": "sha256:741faa04ffc97e4c2ebe124c4e7fc4092170c3ebdb5957f7ab9088bea25c02ee",
+          "size": 396705152
+        }
+      ]
+    }
+  },
+  "paths": {
+    "ollamaModels": "models/ollama",
+    "contract": "embedding/local-embedding-contract.json",
+    "startScript": "embedding/start-local-embedding.ps1",
+    "state": "embedding/install-state.json",
+    "modelfile": "models/jina-v5-text-small/Modelfile"
+  }
+}
