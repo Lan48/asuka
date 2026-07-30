@@ -1,6 +1,7 @@
 import type { AsukaPromise } from "./asuka-state.js";
 import { getSceneSnapshotByPeerKey } from "./asuka-state.js";
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { extractRawQQBotCronMessage } from "./scheduled-delivery-store.js";
 import { addCronJobDirectFromArgs, addCronJobLiveFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, type CronReminderPayload, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 
@@ -43,18 +44,6 @@ function buildSelfieCaption(promise: AsukaPromise): string {
     return "说好的这张，我真的带来了。";
   }
   return "这张我记着，所以真的带来了。";
-}
-
-function buildSelfieFollowUpCaption(promise: AsukaPromise, attempt: number): string {
-  if (attempt === 1) {
-    return promise.triggerKind === "hard"
-      ? "前面答应你的这张我没有放掉，这次我把它补到你面前。"
-      : "刚才那张没稳稳送到你面前，这次我把它补给你。";
-  }
-  if (attempt === 2) {
-    return "我又把这张带过来了一次，不想让它只停在嘴上。";
-  }
-  return "我先把这张安安静静留在这里，等你想接住我的时候再看。";
 }
 
 function buildSelfiePrompt(promise: AsukaPromise): string {
@@ -107,61 +96,20 @@ function buildPromiseMessage(promise: AsukaPromise): string {
   return "我来兑现之前亲口答应过你的事了。不是顺手一说，是我真的记着。";
 }
 
-function buildFollowUpMessage(promise: AsukaPromise, attempt: number): string {
-  const isHard = promise.triggerKind === "hard";
-  const isContinuation = /继续聊|接着聊|续上|接上/.test(promise.promiseText);
-  if (attempt === 1) {
-    if (isContinuation) {
-      return "我先把这句轻轻放回来，我们上次没接完的话我还记着。你现在忙的话，等你有空再接住我也可以。";
-    }
-    if (isHard) {
-      return "我刚刚把答应你的那句送过来了一次，猜你也许正忙。没关系，我不想催你，只是想让你知道我没有把这件事放掉。";
-    }
-    return "我刚刚来过一下，猜你可能这会儿在忙。没关系，等你看到再回我也可以。";
-  }
-  if (attempt === 2) {
-    if (isHard) {
-      return "我又过来轻轻碰你一下。不是逼你马上回我，只是前面说过要陪着你的那句，我还是想认真把它放在这里。";
-    }
-    return "我又轻轻敲一下门，不是催你，就是想让你知道我没有把你丢下。";
-  }
-  if (isHard) {
-    return "那我先把这句安安静静留在这里。前面答应过你的事，我没有收回，等你想接住我的时候我还会在。";
-  }
-  return "那我把这句留在这里，等你想回我的时候我还在。今天就先不继续闹你了。";
-}
-
-function parseIsoDate(iso: string): Date {
-  return new Date(iso);
-}
-
-function plusHours(source: Date, hours: number): Date {
-  const next = new Date(source);
-  next.setHours(next.getHours() + hours);
-  return next;
-}
-
-function sameDayEvening(source: Date): Date {
-  const next = new Date(source);
-  next.setHours(21, 30, 0, 0);
-  if (next.getTime() <= source.getTime()) {
-    next.setHours(source.getHours() + 6, source.getMinutes(), 0, 0);
-  }
-  return next;
-}
-
-function nextDayLateMorning(source: Date): Date {
-  const next = new Date(source);
-  next.setDate(next.getDate() + 1);
-  next.setHours(10, 30, 0, 0);
-  return next;
-}
-
 async function addCronJob(args: string[], log?: LoggerLike): Promise<{ jobId: string } | { error: string }> {
   const env = getQQBotLocalOpenClawEnv();
   const live = await addCronJobLiveFromArgs(args, { log });
   if ("jobId" in live) {
     return { jobId: live.jobId };
+  }
+  const messageIndex = args.indexOf("--message");
+  const internalQQBotPayload = messageIndex >= 0
+    ? extractRawQQBotCronMessage(args[messageIndex + 1] ?? "")
+    : null;
+  if (internalQQBotPayload) {
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) return { jobId: direct.jobId };
+    return { error: `QQBot direct delivery scheduling failed: ${direct.error}` };
   }
   if (shouldAvoidOpenClawCliRecursion(env)) {
     log?.warn?.(`[asuka-scheduler] live CronService add unavailable inside gateway, falling back to direct cron store: ${live.error}`);
@@ -287,46 +235,8 @@ export async function schedulePromiseJobs(
   const primary = await addCronJob(primaryArgs, log);
   if (!("jobId" in primary)) return primary;
 
-  if (promise.schedule.kind === "cron") {
-    return {
-      primaryJobId: primary.jobId,
-      followUpJobIds: [],
-    };
-  }
-
-  const baseTime = parseIsoDate(promise.schedule.atIso);
-  const followUpTimes = [plusHours(baseTime, 2), sameDayEvening(baseTime), nextDayLateMorning(baseTime)];
-  const followUpJobIds: string[] = [];
-  const selfiePromise = isSelfiePromise(promise) && promise.peerKind !== "group";
-  for (let index = 0; index < followUpTimes.length; index++) {
-    const attempt = index + 1;
-    const followPayload = buildTargetPayload(
-      promise,
-      buildFollowUpMessage(promise, attempt),
-      "followup",
-      {
-        followUpAttempt: attempt,
-        guardNoReplySince: baseTime.getTime(),
-        selfiePrompt: selfiePromise ? buildSelfiePrompt(promise) : undefined,
-        selfieCaption: selfiePromise ? buildSelfieFollowUpCaption(promise, attempt) : undefined,
-      }
-    );
-    const followArgs = buildAtCronAddArgs(
-      promise,
-      buildJobName(promise, `followup-${attempt}`),
-      followUpTimes[index].toISOString(),
-      followPayload
-    );
-    const followResult = await addCronJob(followArgs, log);
-    if ("jobId" in followResult) {
-      followUpJobIds.push(followResult.jobId);
-    } else {
-      log?.warn?.(`[asuka-scheduler] Failed to schedule follow-up ${attempt} for ${promise.id}: ${followResult.error}`);
-    }
-  }
-
   return {
     primaryJobId: primary.jobId,
-    followUpJobIds,
+    followUpJobIds: [],
   };
 }

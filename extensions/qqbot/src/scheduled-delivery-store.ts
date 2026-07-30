@@ -26,6 +26,8 @@ export interface ScheduledDeliveryJob {
   accountId?: string;
   to: string;
   message: string;
+  quietBatchKey?: string;
+  deferredAtMs?: number;
   schedule: ScheduledDeliverySchedule;
   state: {
     nextRunAtMs?: number;
@@ -42,6 +44,8 @@ export interface ScheduledDeliveryCreateInput {
   accountId?: string;
   to: string;
   message: string;
+  quietBatchKey?: string;
+  deferredAtMs?: number;
   schedule: ScheduledDeliverySchedule;
   deleteAfterRun?: boolean;
   nowMs?: number;
@@ -321,6 +325,8 @@ export async function addScheduledDeliveryJob(
       ...(input.accountId ? { accountId: input.accountId } : {}),
       to: input.to,
       message: rawMessage,
+      ...(input.quietBatchKey ? { quietBatchKey: input.quietBatchKey } : {}),
+      ...(typeof input.deferredAtMs === "number" ? { deferredAtMs: input.deferredAtMs } : {}),
       schedule: input.schedule,
       state: { nextRunAtMs, updatedAtMs: nowMs },
     };
@@ -398,6 +404,37 @@ export async function removeScheduledDeliveryJobsForPeer(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     options.log?.warn?.(`[scheduled-delivery] failed to remove peer jobs ${peerKey}: ${message}`);
+    return { error: message };
+  }
+}
+
+export async function removeScheduledDeliveryJobsByMode(
+  input: {
+    accountId?: string;
+    modes: string[];
+  },
+  options: { env?: NodeJS.ProcessEnv; log?: LoggerLike } = {},
+): Promise<{ removedCount: number; jobIds: string[]; storePath: string } | { error: string }> {
+  const modes = new Set(input.modes.map((mode) => mode.trim()).filter(Boolean));
+  if (modes.size === 0) return { error: "missing scheduled delivery modes" };
+  try {
+    let removedCount = 0;
+    const jobIds: string[] = [];
+    const storePath = await mutateStore(options.env ?? process.env, (store, currentStorePath) => {
+      store.jobs = store.jobs.filter((job) => {
+        if (input.accountId && job.accountId && job.accountId !== input.accountId) return true;
+        const mode = decodeCronPayload(job.message).payload?.mode;
+        if (!mode || !modes.has(mode)) return true;
+        removedCount += 1;
+        jobIds.push(job.id);
+        return false;
+      });
+      return currentStorePath;
+    });
+    return { removedCount, jobIds, storePath };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    options.log?.warn?.(`[scheduled-delivery] failed to remove modes ${[...modes].join(",")}: ${message}`);
     return { error: message };
   }
 }

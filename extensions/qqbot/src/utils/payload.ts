@@ -37,6 +37,10 @@ export interface CronReminderPayload {
   deleteAfterRun?: boolean;
   /** 承诺 ID（Asuka 连续状态内部使用） */
   promiseId?: string;
+  /** Quiet Inbox 合并投递时一并兑现的承诺 ID */
+  mergedPromiseIds?: string[];
+  /** 当前载荷由 Quiet Inbox 聚合，渲染失败时不得发送静态兜底 */
+  quietBatch?: boolean;
   /** peerKey（Asuka 连续状态内部使用） */
   peerKey?: string;
   /** 追发轮次 */

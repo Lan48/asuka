@@ -1,4 +1,5 @@
 import { getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel } from "./config.js";
+import { extractRawQQBotCronMessage } from "./scheduled-delivery-store.js";
 import { addCronJobDirectFromArgs, addCronJobLiveFromArgs, execOpenClaw, shouldAvoidOpenClawCliRecursion } from "./utils/openclaw-command.js";
 import { encodePayloadForCron, wrapExactMessageForAgentTurn } from "./utils/payload.js";
 import type { AsukaPeerContext } from "./asuka-state.js";
@@ -24,6 +25,16 @@ async function addAmbientJob(args: string[], log?: LoggerLike): Promise<string |
   if ("jobId" in live) {
     log?.info?.(`[asuka-ambient] Added ambient job through live CronService: ${live.jobId}`);
     return live.jobId;
+  }
+  const messageIndex = args.indexOf("--message");
+  const internalQQBotPayload = messageIndex >= 0
+    ? extractRawQQBotCronMessage(args[messageIndex + 1] ?? "")
+    : null;
+  if (internalQQBotPayload) {
+    const direct = await addCronJobDirectFromArgs(args, { env, log });
+    if ("jobId" in direct) return direct.jobId;
+    log?.warn?.(`[asuka-ambient] QQBot direct delivery scheduling failed: ${direct.error}`);
+    return null;
   }
   if (shouldAvoidOpenClawCliRecursion(env)) {
     log?.warn?.(`[asuka-ambient] Live CronService add unavailable inside gateway, falling back to direct cron store: ${live.error}`);

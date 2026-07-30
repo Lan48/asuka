@@ -7,7 +7,7 @@ import * as net from "node:net";
 import * as path from "path";
 import { fileURLToPath } from "node:url";
 import type { ResolvedQQBotAccount } from "./types.js";
-import { decodeCronPayload, parseQQBotPayload, isMediaPayload, isSelfiePayload, wrapExactMessageForAgentTurn, type MediaPayload } from "./utils/payload.js";
+import { decodeCronPayload, encodePayloadForCron, parseQQBotPayload, isMediaPayload, isSelfiePayload, type MediaPayload } from "./utils/payload.js";
 import {
   getAccessToken, 
   sendC2CMessage, 
@@ -38,10 +38,10 @@ import { buildConversationDigestPrompt } from "./asuka-conversation-digest.js";
 import { scheduleAmbientLifeJobs, schedulePlannedAmbientDelivery } from "./ambient-scheduler.js";
 import { getRecentEntriesForPeer } from "./ref-index-store.js";
 import { getQQBotRuntime } from "./runtime.js";
-import { formatQQBotProductionSendGuardError, getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, getQQBotLocalPrimaryModel, resolveQQBotProductionSendGuard } from "./config.js";
+import { formatQQBotProductionSendGuardError, getOpenAICompletionsThinkingParams, getQQBotLocalOpenClawEnv, resolveQQBotProductionSendGuard } from "./config.js";
 import type { QQBotProactiveQuietHours } from "./types.js";
 import { isAsukaNarrationSegment, splitAsukaNarrationSegments, splitAsukaSpokenSegments } from "./utils/narration-segments.js";
-import { execOpenClaw } from "./utils/openclaw-command.js";
+import { addScheduledDeliveryJob } from "./scheduled-delivery-store.js";
 import { formatZonedDateTimeForPrompt, getZonedDateParts, normalizePromptHour } from "./utils/time-context.js";
 import { isTimeContradictoryDeliveryText } from "./utils/time-contradiction.js";
 import { mergeVisibleTextAndCaption } from "./utils/media-caption.js";
@@ -673,7 +673,20 @@ function buildQuietRescheduleJobName(payload?: DecodedCronPayload): string {
   return `asuka-quiet-resume-${suffix}`;
 }
 
-async function deferCronMessageUntilQuietEnds(
+function hashQuietBatchKey(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function getQuietResumeDelayMinutes(batchKey: string): number {
+  return 2 + (hashQuietBatchKey(batchKey) % 7);
+}
+
+export async function deferCronMessageUntilQuietEnds(
   account: ResolvedQQBotAccount,
   to: string,
   rawMessage: string,
@@ -686,46 +699,49 @@ async function deferCronMessageUntilQuietEnds(
   const now = new Date();
   if (!isWithinQuietHours(now, quietHours)) return false;
 
+  const target = payload ? null : parseTarget(to);
+  if (target?.type === "channel") return false;
+  const quietBatchKey = payload?.peerKey
+    || `${account.accountId}:${target?.type === "c2c" ? "direct" : "group"}:${target?.id}`;
   const resumeAt = getNextAllowedTime(now, quietHours);
-  const args = [
-    "cron",
-    "add",
-    "--json",
-    "--account",
-    account.accountId,
-    "--name",
-    buildQuietRescheduleJobName(payload),
-    "--at",
-    resumeAt.toISOString(),
-    "--delete-after-run",
-    "--channel",
-    "qqbot",
-    "--model",
-    getQQBotLocalPrimaryModel(),
-    "--to",
-    to,
-    "--message",
-    wrapExactMessageForAgentTurn(rawMessage),
-  ];
+  resumeAt.setUTCMinutes(
+    resumeAt.getUTCMinutes() + getQuietResumeDelayMinutes(quietBatchKey)
+  );
+  let queuedMessage = rawMessage;
+  if (!payload) {
+    queuedMessage = encodePayloadForCron({
+      type: "cron_reminder",
+      mode: "reminder",
+      content: rawMessage,
+      targetType: target!.type,
+      targetAddress: target!.id,
+      peerKey: quietBatchKey,
+    });
+  }
 
   try {
-    const { stdout, stderr } = await execOpenClaw(args, {
+    const result = await addScheduledDeliveryJob({
+      accountId: account.accountId,
+      name: buildQuietRescheduleJobName(payload),
+      to,
+      message: queuedMessage,
+      schedule: { kind: "at", at: resumeAt.toISOString() },
+      deleteAfterRun: true,
+      quietBatchKey,
+      deferredAtMs: now.getTime(),
+    }, {
       env: getQQBotLocalOpenClawEnv(),
-      maxBuffer: 1024 * 1024,
     });
-    if (stderr?.trim()) {
-      console.warn(`[${timestamp}] [qqbot] sendCronMessage: quiet-hours reschedule stderr: ${stderr.trim()}`);
-    }
-    const parsed = JSON.parse(stdout) as { id?: string };
+    if ("error" in result) throw new Error(result.error);
     console.log(
-      `[${timestamp}] [qqbot] sendCronMessage: deferred proactive message due to quiet hours until ${resumeAt.toISOString()}, jobId=${parsed.id ?? "unknown"}`
+      `[${timestamp}] [qqbot] sendCronMessage: queued quiet inbox delivery until ${resumeAt.toISOString()}, jobId=${result.jobId}, batch=${quietBatchKey}`
     );
     return true;
   } catch (error) {
     console.error(
       `[${timestamp}] [qqbot] sendCronMessage: failed to defer proactive message during quiet hours: ${error instanceof Error ? error.message : String(error)}`
     );
-    return true;
+    return false;
   }
 }
 
@@ -2674,6 +2690,44 @@ export function getCronDeliveryBatchSemanticKey(payload: DecodedCronPayload): st
   return normalized ? `text:${normalized.slice(0, 36)}` : "generic";
 }
 
+function getCronDeliveryPromiseIds(payload: DecodedCronPayload): string[] {
+  return [...new Set([
+    payload.promiseId,
+    ...(payload.mergedPromiseIds ?? []),
+  ].filter((value): value is string => Boolean(value?.trim())))];
+}
+
+function markCronDeliveryPromisesFailed(
+  payload: DecodedCronPayload,
+  reason: string,
+  options?: { failureKind?: "text" | "selfie" },
+): void {
+  for (const promiseId of getCronDeliveryPromiseIds(payload)) {
+    markPromiseDeliveryFailed(promiseId, reason, Date.now(), options);
+  }
+}
+
+function markCronDeliveryPromisesDelivered(
+  payload: DecodedCronPayload,
+  content: string,
+): void {
+  for (const promiseId of getCronDeliveryPromiseIds(payload)) {
+    markPromiseDelivered(promiseId, {
+      isFollowUp: payload.mode === "followup" || payload.mode === "repair",
+      content,
+    });
+  }
+}
+
+function markCronDeliveryPromisesFallback(
+  payload: DecodedCronPayload,
+  fallback: Parameters<typeof markPromiseDeliveryFallback>[1],
+): void {
+  for (const promiseId of getCronDeliveryPromiseIds(payload)) {
+    markPromiseDeliveryFallback(promiseId, fallback);
+  }
+}
+
 function sameCronBatchTarget(left: CronDeliveryBatchJobContext, payload: DecodedCronPayload): boolean {
   if (left.peerKey && payload.peerKey && left.peerKey === payload.peerKey) return true;
   return left.targetType === payload.targetType && left.targetAddress === payload.targetAddress;
@@ -2976,6 +3030,7 @@ async function renderPromiseDeliveryText(
     return sharedSessionText;
   }
   console.warn("[qqbot] renderPromiseDeliveryText: shared session path unavailable, falling back");
+  if (payload.quietBatch) return "";
   if (transcriptAnchoredFallback) {
     console.log(`[qqbot] renderPromiseDeliveryText: transcript-anchored fallback is available if secondary rendering also fails "${transcriptAnchoredFallback.slice(0, 160)}"`);
   }
@@ -4573,6 +4628,14 @@ export async function sendCronMessage(
         : payload.targetAddress;
       console.log("[qqbot] sendCronMessage: entering shared-context render stage");
       const deliveryText = await renderPromiseDeliveryText(account, payload, deliveryRenderContext);
+      if (payload.quietBatch && !deliveryText.trim()) {
+        return {
+          channel: "qqbot",
+          skipped: true,
+          skipReason: "quiet_batch_render_unavailable",
+          retryAfterMs: 60_000,
+        };
+      }
       const postRenderSkipReason = getCronDeliveryPostRenderSkipReason(payload, deliveryText, deliveryRenderContext);
       if (postRenderSkipReason) {
         console.warn(
@@ -4607,9 +4670,7 @@ export async function sendCronMessage(
           ? "ambient_semantic_duplicate_suppressed"
           : reason;
         console.warn(`[${timestamp}] [qqbot] sendCronMessage: suppressed unsafe cron delivery text, reason=${reason}, rawReason=${deliverySelection.rejectReason || "none"}, text="${deliveryText.slice(0, 160)}"`);
-        if (payload.promiseId) {
-          markPromiseDeliveryFailed(payload.promiseId, reason);
-        }
+        markCronDeliveryPromisesFailed(payload, reason);
         if (finalReason === "ambient_semantic_duplicate_suppressed" && payload.peerKey) {
           recordProactiveBeatSuppressed(payload.peerKey, {
             reason: deliverySelection.rejectReason || "semantic duplicate suppressed",
@@ -4629,7 +4690,9 @@ export async function sendCronMessage(
           retryAfterMs: finalReason.includes("scene_continuity") ? 10 * 60 * 1000 : undefined,
         };
       }
-      await maybeSendRepairBeforeProactive(account, payload, targetTo, timestamp, runContext, deliveryRenderContext);
+      if (!payload.quietBatch) {
+        await maybeSendRepairBeforeProactive(account, payload, targetTo, timestamp, runContext, deliveryRenderContext);
+      }
       
       if (payload.selfiePrompt && payload.targetType === "c2c") {
         console.log(`[${timestamp}] [qqbot] sendCronMessage: fulfilling selfie promise directly for target=${payload.targetAddress}`);
@@ -4637,9 +4700,7 @@ export async function sendCronMessage(
         if (result.error || result.skipped) {
           const failureReason = result.error || result.skipReason || "generated selfie send skipped";
           console.error(`[${timestamp}] [qqbot] sendCronMessage: direct selfie flow failed, error=${failureReason}`);
-          if (payload.promiseId) {
-            markPromiseDeliveryFailed(payload.promiseId, failureReason, Date.now(), { failureKind: "selfie" });
-          }
+          markCronDeliveryPromisesFailed(payload, failureReason, { failureKind: "selfie" });
           const fallbackResult = await sendCronSelfieFallbackImage(
             account,
             payload,
@@ -4648,35 +4709,27 @@ export async function sendCronMessage(
             deliveryRenderContext.memoryClaimIds,
           );
           if (fallbackResult.skipped) {
-            if (payload.promiseId) {
-              markPromiseDeliveryFallback(payload.promiseId, {
-                state: "skipped",
-                skipReason: fallbackResult.skipReason ?? "duplicate",
-              });
-            }
+            markCronDeliveryPromisesFallback(payload, {
+              state: "skipped",
+              skipReason: fallbackResult.skipReason ?? "duplicate",
+            });
             console.log(
               `[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback skipped for target=${payload.targetAddress}, skipReason=${fallbackResult.skipReason ?? "duplicate"}`
             );
             return fallbackResult;
           }
-          if (payload.promiseId) {
-            markPromiseDeliveryFallback(payload.promiseId, fallbackResult.error
-              ? { state: "failed", error: fallbackResult.error }
-              : { state: "sent" });
-          }
+          markCronDeliveryPromisesFallback(payload, fallbackResult.error
+            ? { state: "failed", error: fallbackResult.error }
+            : { state: "sent" });
           if (fallbackResult.error) {
             console.error(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback failed for target=${payload.targetAddress}, error=${fallbackResult.error}`);
           } else {
+            markCronDeliveryPromisesDelivered(payload, safeDeliveryText);
             console.log(`[${timestamp}] [qqbot] sendCronMessage: selfie identity fallback sent for target=${payload.targetAddress}`);
           }
           return fallbackResult;
         }
-        if (payload.promiseId) {
-          markPromiseDelivered(payload.promiseId, {
-            isFollowUp: payload.mode === "followup" || payload.mode === "repair",
-            content: safeDeliveryText,
-          });
-        }
+        markCronDeliveryPromisesDelivered(payload, safeDeliveryText);
         if ((payload.mode === "ambient" || payload.mode === "repair") && payload.peerKey) {
           markProactiveDelivered(payload.peerKey, {
             content: safeDeliveryText,
@@ -4721,17 +4774,10 @@ export async function sendCronMessage(
       
       if (result.error) {
         console.error(`[${timestamp}] [qqbot] sendCronMessage: proactive message failed, error=${result.error}`);
-        if (payload.promiseId) {
-          markPromiseDeliveryFailed(payload.promiseId, result.error);
-        }
+        markCronDeliveryPromisesFailed(payload, result.error);
       } else {
         console.log(`[${timestamp}] [qqbot] sendCronMessage: proactive message sent successfully`);
-        if (payload.promiseId) {
-          markPromiseDelivered(payload.promiseId, {
-            isFollowUp: payload.mode === "followup" || payload.mode === "repair",
-            content: safeDeliveryText,
-          });
-        }
+        markCronDeliveryPromisesDelivered(payload, safeDeliveryText);
         if ((payload.mode === "ambient" || payload.mode === "repair") && payload.peerKey) {
           markProactiveDelivered(payload.peerKey, {
             content: safeDeliveryText,

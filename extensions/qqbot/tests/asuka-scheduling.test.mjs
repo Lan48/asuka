@@ -62,10 +62,12 @@ function readScheduledDeliveries() {
 try {
   const { parseAssistantPromises } = await import("../dist/src/promise-parser.js");
   const { scheduleAmbientLifeJobs, schedulePlannedAmbientDelivery } = await import("../dist/src/ambient-scheduler.js");
+  const { deferCronMessageUntilQuietEnds } = await import("../dist/src/outbound.js");
   const { schedulePromiseJobs } = await import("../dist/src/promise-scheduler.js");
-  const { removeScheduledDeliveryJobsForPeer, retryScheduledDeliveryJob } = await import("../dist/src/scheduled-delivery-store.js");
+  const { addScheduledDeliveryJob, removeScheduledDeliveryJobsByMode, removeScheduledDeliveryJobsForPeer, retryScheduledDeliveryJob } = await import("../dist/src/scheduled-delivery-store.js");
+  const { buildScheduledDeliveryExecutions } = await import("../dist/src/scheduled-delivery-runner.js");
   const { setQQBotCronService } = await import("../dist/src/runtime.js");
-  const { decodeCronPayload } = await import("../dist/src/utils/payload.js");
+  const { decodeCronPayload, encodePayloadForCron } = await import("../dist/src/utils/payload.js");
   const { removeCronJobDirect, removeCronJobLive } = await import("../dist/src/utils/openclaw-command.js");
   const {
     appendPromiseFollowUpJob,
@@ -108,7 +110,7 @@ try {
   const atJobs = await schedulePromiseJobs(atPromise);
   assert.ok("primaryJobId" in atJobs, "at scheduling should succeed through QQBot scheduled delivery");
   assert.match(atJobs.primaryJobId, /^[0-9a-f-]{36}$/i, "at scheduling should return an internal scheduled delivery id");
-  assert.equal(atJobs.followUpJobIds.length, 3, "at scheduling should return three follow-up job ids");
+  assert.equal(atJobs.followUpJobIds.length, 0, "one-shot scheduling should not create fixed follow-up jobs");
 
   markPromiseScheduled(atPromise.id, atJobs.primaryJobId, base + 2_000);
   for (const jobId of atJobs.followUpJobIds) {
@@ -117,19 +119,17 @@ try {
   const stateAfterSchedule = readState();
   const persistedAt = stateAfterSchedule.promises[atPromise.id];
   assert.equal(persistedAt.cronJobId, atJobs.primaryJobId, "primary job id should persist separately");
-  assert.equal(persistedAt.followUpJobIds.length, 3, "follow-up job ids should persist separately");
+  assert.equal(persistedAt.followUpJobIds?.length ?? 0, 0, "one-shot promise should persist without follow-up jobs");
   assert.equal(persistedAt.state, "scheduled", "scheduled promise should have scheduled state");
   assert.equal(typeof persistedAt.scheduledAt, "number", "scheduled promise should expose scheduledAt");
 
   const atInvocations = readCronInvocations();
   assert.equal(atInvocations.length, 0, "QQBot cron payloads should not invoke OpenClaw cron");
   let scheduledDeliveries = readScheduledDeliveries();
-  assert.equal(scheduledDeliveries.jobs.length, 4, "at promise should create one primary and three follow-up scheduled deliveries");
+  assert.equal(scheduledDeliveries.jobs.length, 1, "at promise should create only one primary scheduled delivery");
   assert.ok(scheduledDeliveries.jobs.every((job) => job.message.startsWith("QQBOT_CRON:")), "scheduled deliveries should store raw QQBOT_CRON payloads");
   assert.ok(scheduledDeliveries.jobs.every((job) => !job.message.includes("纯转发任务")), "scheduled deliveries should not store agent-turn wrapper prompts");
-  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-1")), "scheduled jobs should include followup-1 job name");
-  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-2")), "scheduled jobs should include followup-2 job name");
-  assert.ok(scheduledDeliveries.jobs.some((job) => job.name.includes("asuka-hard-followup-3")), "scheduled jobs should include followup-3 job name");
+  assert.ok(!scheduledDeliveries.jobs.some((job) => job.name.includes("followup")), "scheduled jobs should contain no fixed follow-up");
 
   const cronPromise = createPromise("我会每天早上九点给你发早安。", 10_000);
   assert.equal(cronPromise.schedule?.kind, "cron", "daily promise should have a cron schedule");
@@ -140,12 +140,138 @@ try {
   const allInvocations = readCronInvocations();
   assert.equal(allInvocations.length, 0, "cron promise should not invoke OpenClaw cron");
   scheduledDeliveries = readScheduledDeliveries();
-  assert.equal(scheduledDeliveries.jobs.length, 5, "cron promise should add one more scheduled delivery");
+  assert.equal(scheduledDeliveries.jobs.length, 2, "cron promise should add one more scheduled delivery");
   assert.equal(
     scheduledDeliveries.jobs.find((job) => job.id === cronJobs.primaryJobId)?.schedule?.kind,
     "cron",
     "cron scheduling should persist a recurring scheduled delivery",
   );
+
+  const quietPayloadA = encodePayloadForCron({
+    type: "cron_reminder",
+    mode: "promise",
+    content: "早上来找你说早安",
+    targetType: "c2c",
+    targetAddress: direct.senderId,
+    promiseId: atPromise.id,
+    peerKey: `${direct.accountId}:${direct.peerKind}:${direct.peerId}`,
+  });
+  const quietPromiseB = createPromise("约定，明天早上我给你发一张自拍。", 12_000);
+  const quietPayloadB = encodePayloadForCron({
+    type: "cron_reminder",
+    mode: "promise",
+    content: "兑现答应的自拍",
+    targetType: "c2c",
+    targetAddress: direct.senderId,
+    promiseId: quietPromiseB.id,
+    peerKey: `${direct.accountId}:${direct.peerKind}:${direct.peerId}`,
+    selfiePrompt: "生成符合当前上下文的自拍",
+    selfieCaption: "答应你的这张，我带来了。",
+  });
+  const quietBatchKey = `${direct.accountId}:${direct.accountId}:${direct.peerKind}:${direct.peerId}`;
+  const quietJobA = await addScheduledDeliveryJob({
+    name: "asuka-quiet-a",
+    accountId: direct.accountId,
+    to: direct.target,
+    message: quietPayloadA,
+    schedule: { kind: "at", at: new Date(base + 60_000).toISOString() },
+    quietBatchKey,
+    deferredAtMs: base,
+  });
+  const quietJobB = await addScheduledDeliveryJob({
+    name: "asuka-quiet-b",
+    accountId: direct.accountId,
+    to: direct.target,
+    message: quietPayloadB,
+    schedule: { kind: "at", at: new Date(base + 60_000).toISOString() },
+    quietBatchKey,
+    deferredAtMs: base,
+  });
+  assert.ok("job" in quietJobA && "job" in quietJobB, "quiet inbox jobs should persist directly");
+  const quietExecutions = buildScheduledDeliveryExecutions([quietJobA.job, quietJobB.job]);
+  assert.equal(quietExecutions.length, 1, "same-peer quiet inbox jobs should produce one flush");
+  const mergedQuietPayload = decodeCronPayload(quietExecutions[0].message).payload;
+  assert.equal(mergedQuietPayload.quietBatch, true, "quiet flush should identify its no-static-fallback policy");
+  assert.deepEqual(
+    new Set(mergedQuietPayload.mergedPromiseIds),
+    new Set([atPromise.id, quietPromiseB.id]),
+    "quiet flush should retain every included promise id",
+  );
+  assert.match(mergedQuietPayload.content, /早安/);
+  assert.match(mergedQuietPayload.content, /自拍/);
+  markPromiseDelivered(quietPromiseB.id, { at: base + 13_000, content: "答应你的自拍已经带来了" });
+
+  const currentUtcHour = new Date().getUTCHours();
+  const directQuietDeferred = await deferCronMessageUntilQuietEnds(
+    {
+      accountId: direct.accountId,
+      config: {
+        proactiveQuietHours: {
+          enabled: true,
+          startHour: currentUtcHour,
+          endHour: (currentUtcHour + 1) % 24,
+          timezone: "UTC",
+        },
+      },
+    },
+    direct.target,
+    quietPayloadA,
+    new Date().toISOString(),
+    decodeCronPayload(quietPayloadA).payload,
+  );
+  assert.equal(directQuietDeferred, true, "quiet deferral should enqueue instead of sending");
+  const quietDeferredStore = readScheduledDeliveries();
+  const deferredJob = quietDeferredStore.jobs.find((job) => job.name.startsWith("asuka-quiet-promise-"));
+  assert.ok(deferredJob, "quiet deferral should persist a named Quiet Inbox job");
+  assert.equal(deferredJob.message, quietPayloadA, "quiet deferral should persist the raw payload without an agent wrapper");
+  assert.equal(typeof deferredJob.quietBatchKey, "string", "quiet deferral should persist its per-peer batch key");
+  assert.equal(readCronInvocations().length, 0, "quiet deferral should never invoke the OpenClaw CLI");
+
+  const plainQuietDeferred = await deferCronMessageUntilQuietEnds(
+    {
+      accountId: direct.accountId,
+      config: {
+        proactiveQuietHours: {
+          enabled: true,
+          startHour: currentUtcHour,
+          endHour: (currentUtcHour + 1) % 24,
+          timezone: "UTC",
+        },
+      },
+    },
+    direct.target,
+    "普通静默消息",
+    new Date().toISOString(),
+  );
+  assert.equal(plainQuietDeferred, true, "plain quiet messages should also enter the direct queue");
+  const plainDeferredJob = readScheduledDeliveries().jobs.find((job) => job.name.startsWith("asuka-quiet-resume-"));
+  assert.ok(plainDeferredJob, "plain quiet deferral should persist a resume job");
+  assert.equal(decodeCronPayload(plainDeferredJob.message).payload.content, "普通静默消息");
+  assert.equal(plainDeferredJob.quietBatchKey, deferredJob.quietBatchKey, "plain and structured messages for one peer should merge");
+  assert.equal(readCronInvocations().length, 0, "plain quiet deferral should not invoke the OpenClaw CLI");
+
+  const legacyFollowUp = await addScheduledDeliveryJob({
+    name: "asuka-soft-followup-legacy",
+    accountId: direct.accountId,
+    to: direct.target,
+    message: encodePayloadForCron({
+      type: "cron_reminder",
+      mode: "followup",
+      content: "旧固定追发",
+      targetType: "c2c",
+      targetAddress: direct.senderId,
+      promiseId: atPromise.id,
+      peerKey: `${direct.accountId}:${direct.peerKind}:${direct.peerId}`,
+    }),
+    schedule: { kind: "at", at: new Date(base + 120_000).toISOString() },
+  });
+  assert.ok("job" in legacyFollowUp, "legacy follow-up fixture should persist");
+  const removedLegacyFollowUps = await removeScheduledDeliveryJobsByMode({
+    accountId: direct.accountId,
+    modes: ["followup"],
+  });
+  assert.ok("removedCount" in removedLegacyFollowUps);
+  assert.equal(removedLegacyFollowUps.removedCount, 1, "startup cleanup should remove legacy fixed follow-ups");
 
   const directCliLog = path.join(tmpHome, "direct-cli-should-not-run.log");
   const failingOpenClawScript = path.join(tmpBin, "openclaw-fail.cjs");
@@ -183,7 +309,7 @@ process.exit(42);
     const liveCronJobs = await schedulePromiseJobs(liveCronPromise);
     assert.ok("primaryJobId" in liveCronJobs, "gateway scheduling should use QQBot scheduled delivery before live CronService");
     assert.match(liveCronJobs.primaryJobId, /^[0-9a-f-]{36}$/i, "gateway scheduling should return an internal scheduled delivery id");
-    assert.equal(liveCronJobs.followUpJobIds.length, 3, "gateway scheduling should schedule follow-up jobs too");
+    assert.equal(liveCronJobs.followUpJobIds.length, 0, "gateway scheduling should not create fixed follow-up jobs");
     assert.equal(liveCronAdds.length, 0, "QQBot internal cron payloads should not enter live CronService agentTurn routing");
     assert.equal(readCronInvocations().length, 0, "live gateway scheduling should not invoke openclaw CLI");
     assert.equal(fs.existsSync(directCliLog), false, "live CronService scheduling should not run OPENCLAW_SCRIPT");
